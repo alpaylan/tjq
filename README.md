@@ -35,7 +35,7 @@ jq: error (at <unknown>): Cannot index number with string "a"
 Using tjq, we can get a much better global error message:
 
 ```text
-Shape mistmatch detected!
+Shape mismatch detected!
         at [0].age
         Expected: {a: <>}
         Got: 25
