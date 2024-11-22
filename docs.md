@@ -7,58 +7,85 @@ $ jq -nc '[1, 2, 3] | map(select(. % 2 == 1))'
 > [1, 3]
 ```
 
-JQ has a problem though, it's errors are kind of hard to decipher. When you start creating some
-internal data as part of some larger transformation, it might be hard to pinpoint the source
-of an error.
+A major shortcoming of jq, often mentioned by practitioners, is its error messages and debugging
+capabilities. A jq program typically takes a large set of json inputs, transforms and processes
+these inputs through a set of filters(programs), and produces a set of resulting values. jq interpreter
+does not keep track of the dataflow through the program, resulting in **local errors**. Such local errors
+give us a micro picture of the problem, but fails to inform us of the *why*. Below is a simple demonstration.
 
 ```bash
-$ jq -nc '[{"a": 1}, {"a": "b"}] | map(select(.a)) |   map(select(. % 2 == 1))'
-> jq: error (at <unknown>): object ({"a":1}) and number (2) cannot be divided (remainder)
+$  jq -nc '[{"name": "John", "age": 25}, {"name": "Jane", "age": 30}] | .[] | .age, .name | {v: .a}'
+> jq: error (at <unknown>): Cannot index number with string "a"
 ```
 
-Here, the reason of the error is that `[{"a": 1}, {"a": "b"}] | map(select(.a))` evaluates to `[{"a":1},{"a":"b"}]`,
-while I was trying to apply `.a`, which means I should've done `[{"a": 1}, {"a": "b"}] | map(.a)` in the first place.
+The local error `Cannot index number with string "a"` makes perfect sense, one indeed cannot index a number with
+a string. The more important questions, which are (1) where do we index an input with string "a", and (2) where does
+the number come from, are left unanswered. While (1) is a property of the program, (2) is a property of the input.
 
-Fixing that, we get the following error. Which is honestly fine to have.
+Let's for a second, try to informally answer the posed questions. What would be the nice informative response useful
+to the user?
 
-```bash
-$ jq -nc '[{"a": 1}, {"a": "b"}] | map(.a) |   map(select(. % 2 == 1))'      
-> jq: error (at <unknown>): string ("b") and number (2) cannot be divided (remainder)
+> The program traverses the given array, accesses its age and name fields, and constructs a json object by accessing
+> "a" field of the ages and names. As `25` is a number, not an object, it has no field "a", hence the program fails.
+
+Spoiler alert, our type inference procedure will give us something very close to this textual explanation of the error:
+
+```text
+Shape mismatch detected!
+        at [0].age
+        Expected: {a: <>}
+        Got: 25
 ```
 
-Though, if we think about the set of json inputs that this script would properly work on, we can actually get an abstract shape.
+We can produce such informative error messages by statically analyzing the jq programs, inferring the shape of the
+JSON inputs a program accepts and comparing the inferred shape with the real inputs. An inferred shape is similar to
+a structurally typed record, below is the inferred shape for the provided example, and a typescript type that matches
+the same structure.
 
-The corresponding typescript type would roughly be;
+```text
+[
+    {
+        age: {a: <>}, 
+        name: {a: <>}
+    }
+]
+```
+
+The `<>` represents an unconstrained JSON term. Below is the corresponding typescript type definition.
 
 ```typescript
-type ValidInput = {
-    "a": number
-}[]
+type X = {
+    age: any
+    name: any
+}[];
 ```
 
-which means we expect an `array` of objects, where each object has the key `a`. After we analyze the jq filter and reach this conclusion,
-we now don't have to resort to localized errors that might be hard to detect, as we can give a more structured static error message based
-on the mismatch of the expected, and received input shapes.
+## Formalization
 
-Hence, the objective of the project is (1) to devise an analysis that'll take a given filter and return a shape, (2) compare a shape with a given json
-and report mismatches.
-
-For this purpose, we don't work with jq itself(which is not that complex, but still a large feat of engineering), but with a toy jq interpreter I've
-started implementing.
+For the purposes of prototyping, we have started with a small subset of jq. Below is the definition of the tjq AST in Rust.
 
 ```rust
 enum Filter {
-    Dot,                                      // .
-    Pipe(Box<Filter>, Box<Filter>),           // <f_1> | <f_2>
-    Comma(Box<Filter>, Box<Filter>),          // <f_1>, <f_2>
-    Value(Json),                              // <j>
-    ObjIndex(String),                         // .<s>
-    ArrayIndex(usize),                        // .[<n>]
-    ArrayIterator,                            // .[]
+    Dot,                             // .
+    Pipe(Box<Filter>, Box<Filter>),  // <f_1> | <f_2>
+    Comma(Box<Filter>, Box<Filter>), // <f_1>, <f_2>
+    ObjIndex(String),                // .<s>
+    ArrayIndex(usize),               // .[<n>]
+    ArrayIterator,                   // .[]
+    Null,                            // null
+    Boolean(bool),                   // true | false
+    Number(f64),                     // 1, 2..
+    String(String),                  // "abc"
+    Array(Vec<Filter>),              // [...]
+    Object(Vec<(Filter, Filter)>),   // {...}
 }
 ```
 
-The interpreter supports a small core of jq, which roughly makes most of the parts I want to support for now, plus the easy stuff like arithmetic.
+The language contains a duplicate definition of JSON inside, because we can construct JSON terms from the prior
+results from the program.
+
+Over this subset language, we have implemented an interpreter, and written constraint rules for every construct of the language, which we
+have implemented in Rust as part of the analysis.
 
 Given an input such as `[{name: John, age: 25}, {name: Jane, age: 30}]`, we can currently interpret the filter `.[] | .age, .name` to give the result
 
@@ -69,70 +96,43 @@ John
 Jane
 ```
 
-So, how do we infer shapes for this filter? The idea relies on something akin to symbolic execution. As we execute a given filter, we build a set of constraints
-on top of the input. At first, with no constraints, all json is valid. Each access constraints some part of the input json. Applying this idea on the provided example:
+The constraint rules are akin to symbolic execution. We start with an unconstrainted symbolic input `<>`, and execute the program with this input,
+using the constraint rules to refine the symbolic input further and further.
 
-1. `.[]` assumes the input is an array, hence the input must be refined into an array.
-2. `.[]` iterates over the array, so the next part of the filter `| <f_2>` will be the shape of the elements of the array.
-3. `<f_1>, <f_2>` deduplicates the input, and applies both `f_1` and `f_2` on the input. So we must collect their constraints, and use both of them.
-4. `.age` assumes the input has the field `age`, `.name` assumes the input has the field `name`, and `,` means we need both, so the end result of the inference is
-
-```typescript
-type ValidInput = {
-    name: unknown,
-    age: unknown,
-}[]
-```
-
-## How to formalize this?
-
-The formalization requires two things.
-
-1. A way of expressing constraints
-2. What constraints each construct produces
-
-Let's start with a very simple constraint language. All arrays are homogeneous, all field accesses are required.
-
-- `.a.[].b` implies `{"a": [{"b": _}]}`
-- `.[].[],[]` imples `[[[_]]]`
-
-The good thing about this is that constraints are easily composed
-
-- `.a.b + .b.a` gives `{"a": {"b": _}, "b": {"a": _}}`
-
-The second good thing about it is that we can just carry it within the execution and extend it.
-
-Let's see how that works.
-
-`.a | .b` starts with the empty constraint `<>`, for pipes, we execute the left side with the current constraint
-`<> :: .a` producing `.a`, and execute the right side with the resulting constraint `.a :: .b` producing `.a.b`.
-
-Going back to the original `.[] | .a, .b`
+Let's see how that works.  Below, we follow through the constraint generation for  `.[] | .a, .b`:
 
 1. `<> :: .[] --> .[]` 
 2. `C :: .a,.b --> (C :: .a) + (C :: .b)`
    1. `.[] :: .a --> .[].a`
    2. `.[] :: .a --> .[].b`
    3. `.[] :: .a,.b --> .[].a + .[].b`
-3. `.[].a + .[].b ==> [{"a": _, "b": _}]`
+3. `.[].a + .[].b ==> [{"a": <>, "b": <>}]`
 
-Let's write the rules for each construct:
+While steps (1) and (2) are part of the constraint generation, step (3) is the next step, we build a shape from the constraint.
+Below, we write the rules for each construct:
 
-### Dot `.` rule
+### Rules
+
+In the rules, `C` represents the state of the symbolic input before the execution of the current construct.
+
+#### Dot `.` rule
 
 `C :: . --> C`
 
-### Pipe `|` rule
+As `.` filter does nothing to the input, but merely passes it forward, it does not affect the constraints.
+
+#### Pipe `|` rule
 
 ```text
-
 C :: f1 --> X       X :: f2 --> Y
 ---------------------------------
         C :: f1 | f2 --> Y
-
 ```
 
-### Comma `,` rule
+A pipe is similar to the sequential execution in an imperative program. The execution of the left-hand-side of the pipe
+changes the constraint(program state), which is used by the right-hand-side.
+
+#### Comma `,` rule
 
 ```text
 C :: f1 --> X       C :: f2 --> Y
@@ -140,7 +140,9 @@ C :: f1 --> X       C :: f2 --> Y
         C :: f1, f2 --> X + Y
 ```
 
-### Value `json` rule
+A comma deduplicates the current constraint, and merges the resulting constraints together.
+
+#### Value `json` rules
 
 An integer, boolean, string or null produces no constraints
 
@@ -151,9 +153,9 @@ C :: s --> <>
 C :: null --> <>
 ```
 
-An array or object produces the sum of the constraints for their elements
+An array or object produces the sum of the constraints for their elements, similar to the `comma` rule.
 
-#### Array `[]` rule
+##### Array `[]` rule
 
 ```text
     C :: v_1 --> X_1    C :: v_2 --> X_2   ...   C :: v_n --> X_n
@@ -161,7 +163,7 @@ An array or object produces the sum of the constraints for their elements
           C :: [ v_1 , v_2 ... v_n ] --> X_1, X_2...X_n
 ```
 
-#### Object `{}` rule
+##### Object `{}` rule
 
 ```text
 C :: k_1 --> X_1       C :: v_1 --> Y_1   ...   C :: k_n --> X_n        C :: v_n --> Y_n
@@ -169,19 +171,23 @@ C :: k_1 --> X_1       C :: v_1 --> Y_1   ...   C :: k_n --> X_n        C :: v_n
           C :: { k_1: v_1 ..., k_n: v_n } --> X_1, Y_1, X_2, Y_2...X_n, Y_n
 ```
 
-### Object index `.<s>` rule
+#### Access Rules
+
+All three object/array access rules refine the current constraint with an access.
+
+##### Object index `.<s>` rule
 
 ```text
 C :: .<s> --> C.s
 ```
 
-### Array index `.[<n>]` rule
+##### Array index `.[<n>]` rule
 
 ```text
 C :: .[<n>] --> C.[n]
 ```
 
-### Array iterator `.[]` rule
+##### Array iterator `.[]` rule
 
 ```text
 C :: .[] --> C.[]
@@ -189,35 +195,111 @@ C :: .[] --> C.[]
 
 ### Shape Inference
 
-Once we build up a constraint, we need to infer a shape from the constraint. In doing so,
-we process the constraint in a tree-piercing style. At the beginning, we start with a `blob`, which is
-essentially an unconstrained piece of JSON. As we process the constraints, we refine the `blob` into
-a more concrete JSON-like object with `blob`s in unconstrained places.
+The construction of a constraint essentially gives us a unification problem. The constraint
+language itself is very small.
 
-Below is a demonstration of the processes:
+```rust
+pub enum Constraint {
+    Diamond,                                // <>
+    Sum(Box<Constraint>, Box<Constraint>),  // l + r
+    In(Box<Constraint>, Box<Constraint>),   // l.r
+    Field(String),                          // .<s>
+    Array(Option<usize>),                   // .[] .[<i>]
+}
+```
+
+The target shape is also similar.
+
+```rust
+pub enum Shape {
+    Blob,                                   // <>
+    Null,                                   // null
+    Bool,                                   // bool
+    Number,                                 // number
+    String,                                 // string
+    Array(Box<Shape>, Option<usize>),       // [T], [T ; n]
+    Tuple(Vec<Shape>),                      // (T1, T2, ...)
+    Object(Vec<(String, Shape)>),           // { s1: T1, s2: T2...}
+}
+```
+
+The current constraint language actually targets a subset of the shape language, the correspondence
+will increase further as we support more jq constructs.
+
+The diamond constraint(`<>`) corresponds 1-1 to the blob shape(`<>`). A field access corresponds to an
+object, an array iteration corresponds to an array, array accesses to shapes where unification is not possible
+will construct tuples, but otherwise they set a minimum length of the array. In(`.`) corresponds to composition
+of accesses, only leaving sum(`+`) without a direct corresponding structure.
+
+The sum is the unification of two constraints. It merges the internals of the shapes, and runs a type error if
+unification is not possible. Merging an array with an object is, for example, an invalid unification. Merging
+two objects essentially means creating a new object with both their key-values, and merging the values for
+any keys present in both objects.
+
+The resulting of shape building gives us a `shape`, which we can now compare with a JSON. Right now, this
+comparison is a bespoke implementation that follows the JSON along with the shape. Indeed, we can reuse the
+unification enabled by the `sum` constraint for this comparison too. Shape comparison is just a bespoke example
+of unification between two shapes, which can be interpreted back to constraints.
+
+As we have a mechanism to compare the inferred shape with the JSON input, we can go back to the example I mentioned at the beginning:
 
 ```text
 Input: [{"name": "John", "age": 25}, {"name": "Jane", "age": 30}]
 
 Filter: .[] | .age, .name | {v: .a}
+```
 
+Where we previously got the local and confusing error
+
+```bash
 jq: error (at <unknown>): Cannot index number with string "a"
+```
 
-Constraint: (<> + ((<>.[].age + <>.[].name) + (<>.[].age + <>.[].name).a))
+We can now get the global and more clear one.
 
-Shape: [{age: {a: <>}, name: {a: <>}}]
-
+```text
 Shape mistmatch detected!
         at [0].age
         Expected: {a: <>}
         Got: 25
 ```
 
-We give the input JSON `[{"name": "John", "age": 25}, {"name": "Jane", "age": 30}]` to
-the filter `.[] | .age, .name | {v: .a}`, and the interpretation gives a local error,
-`Cannot index number with string "a"`. We then process the filter to build up a constraint,
-which is rather cryptic, but what it really is is a summation of the different access patterns
-within the filter. We process the constraint to build up a `shape`, a semi-concrete JSON
-with `blob`s in several places `[{age: {a: <>}, name: {a: <>}}]`. When we compare the input
-with the shape, we get a global error this time, telling us the exact point the error occurs
-and how.
+## Roadmap
+
+The current implementation is a neat demo, but it's only semi-formalized and nowhere near the full jq. The following
+steps require us to implement a larger subset of jq, while understanding the limitations of the current analysis
+with further language constructs such as branches, functions, and recursion. We also need to work more on the formalization
+and error propagation, because the current type errors produced with unification failures are very handwaved.
+
+There is also the second part of the project≤, where we augment jq with optional type hints for the users to provide
+type information.
+
+### Language
+
+- [ ] Parsing(we don't have a parser)
+- [ ] Branches
+- [ ] Function calls, recursion
+- [ ] Error
+- [ ] Empty
+- [ ] Halt
+- [ ] Arithmetic
+- [ ] Recursive descent
+- [ ] String Interpolation
+- [ ] Variable Binding
+- [ ] Try-catch/non-local control flow
+- [ ] Assignment
+
+### Analysis and Type System
+
+- [ ] Branching
+- [ ] Recursion, function inlining
+- [ ] Type Error vs Error vs Empty vs Null vs Halt
+- [ ] Variable binding
+- [ ] Try-catch/non-local control flow
+- [ ] Assignment
+
+### Type Hints
+
+- [ ] Syntax?
+- [ ] How do they integrate to the type system?
+
