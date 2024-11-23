@@ -1,5 +1,8 @@
 # Typed JQ
 
+tjq is a prototype type inference procedure for jq programs. It requires no annotations, while performing a
+lightweight inference procedure for jq programs in order to produce better error messages.
+
 JQ is a successful tool for json manipulation.
 
 ```bash
