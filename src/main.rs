@@ -1,5 +1,3 @@
-mod constraint;
-use constraint::*;
 mod filter;
 use filter::*;
 mod json;
@@ -24,8 +22,14 @@ fn main() {
 
     let json = Json::Array(vec![
         Json::Object(vec![
-            ("name".to_string(), Json::Object(vec![("a".to_string(), Json::String("John".to_string()))])),
-            ("age".to_string(), Json::Object(vec![("a".to_string(), Json::Number(25.0))])),
+            (
+                "name".to_string(),
+                Json::Object(vec![("a".to_string(), Json::String("John".to_string()))]),
+            ),
+            (
+                "age".to_string(),
+                Json::Object(vec![("a".to_string(), Json::Number(25.0))]),
+            ),
         ]),
         Json::Object(vec![
             ("name".to_string(), Json::String("Jane".to_string())),
@@ -53,25 +57,22 @@ fn main() {
         }
     }
 
-    let c = Constraint::new(&filter);
+    let s = Shape::new(&filter);
 
-    println!("Constraint: {}", c);
+    println!("Shape: {}", s);
 
-    let s = Shape::new(c);
-
-    match s {
-        Ok(s) => {
-            println!("Shape: {}", s);
-
+    // Check internal type mismatches in the shape
+    println!("Running internal type checking...");
+    let m = s.check_self(vec![]);
+    match m {
+        Some(m) => println!("{m}"),
+        None => {
             let m = s.check(json, vec![]);
 
             match m {
                 Some(m) => println!("{m}"),
                 None => println!("The input conforms to the inferred shape"),
             }
-        }
-        Err(err) => {
-            println!("error: {:?}", err);
         }
     }
 }
