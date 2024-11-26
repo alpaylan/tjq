@@ -5,7 +5,7 @@ use std::{
 
 use itertools::Itertools;
 
-use crate::{Constraint, Filter, JQError, Json};
+use crate::{Filter, Json};
 
 #[derive(Debug, Clone)]
 pub enum Shape {
@@ -108,12 +108,8 @@ impl Display for Shape {
 }
 
 impl Shape {
-    pub fn new(c: Constraint) -> Result<Shape, JQError> {
-        Shape::build_shape(c, Shape::Blob)
-    }
-
-    pub fn new2(f: &Filter) -> Shape {
-        Shape::build_shape3(f, Shape::Blob)
+    pub fn new(f: &Filter) -> Shape {
+        Shape::build_shape(f, Shape::Blob)
     }
 
     pub fn from_json(j: Json) -> Shape {
@@ -135,7 +131,8 @@ impl Shape {
                 let mut shape = Shape::Blob;
 
                 for (k, j) in obj {
-                    shape = Shape::merge_shapes(shape, Shape::Object(vec![(k, Shape::from_json(j))]));
+                    shape =
+                        Shape::merge_shapes(shape, Shape::Object(vec![(k, Shape::from_json(j))]));
                 }
 
                 shape
@@ -145,7 +142,7 @@ impl Shape {
 
     pub fn build_shape_pipe(f1: Filter, f2: Filter, s: Shape) -> Shape {
         match f1 {
-            Filter::Dot => Shape::build_shape3(&f2, s),
+            Filter::Dot => Shape::build_shape(&f2, s),
             Filter::Pipe(f11, f12) => {
                 Shape::build_shape_pipe(*f11, Filter::Pipe(f12, Box::new(f2)), s)
             }
@@ -155,63 +152,110 @@ impl Shape {
                 Shape::merge_shapes(s1, s2)
             }
             Filter::ObjIndex(s_) => match s {
-                Shape::Blob => Shape::Object(vec![(s_.clone(), Shape::build_shape3(&f2, s))]),
-                Shape::Null => Shape::build_shape3(&f2, Shape::Null),
-                Shape::Bool(b) => Shape::build_shape3(&f2, Shape::Bool(b)),
-                Shape::Number(n) => Shape::build_shape3(&f2, Shape::Number(n)),
-                Shape::String(s) => Shape::build_shape3(&f2, Shape::String(s)),
-                Shape::Array(shape, _) => todo!(),
-                Shape::Tuple(vec) => todo!(),
+                Shape::Blob => {
+                    Shape::Object(vec![(s_.clone(), Shape::build_shape(&f2, Shape::Blob))])
+                }
+                Shape::Null => Shape::build_shape(&f2, Shape::Null),
+                Shape::Bool(b) => Shape::build_shape(&f2, Shape::Bool(b)),
+                Shape::Number(n) => Shape::build_shape(&f2, Shape::Number(n)),
+                Shape::String(s) => Shape::build_shape(&f2, Shape::String(s)),
+                Shape::Array(shape, u) => Shape::Mismatch(
+                    Box::new(Shape::Array(shape, u)),
+                    Box::new(Shape::Object(vec![(
+                        s_.clone(),
+                        Shape::build_shape(&f2, Shape::Blob),
+                    )])),
+                ),
+                Shape::Tuple(tuple) => Shape::Mismatch(
+                    Box::new(Shape::Tuple(tuple)),
+                    Box::new(Shape::Object(vec![(
+                        s_.clone(),
+                        Shape::build_shape(&f2, Shape::Blob),
+                    )])),
+                ),
                 Shape::Object(mut obj) => {
                     let maybe_shape = obj.iter().find_position(|(k, _)| *k == s_);
                     println!("[build_shape_pipe] maybe_shape: {:?}", maybe_shape);
                     if let Some((u, (_, shape))) = maybe_shape {
-                        obj[u] = (s_.clone(), Shape::build_shape3(&f2, shape.clone()));
+                        obj[u] = (s_.clone(), Shape::build_shape(&f2, shape.clone()));
                     } else {
-                        obj.push((s_.clone(), Shape::build_shape3(&f2, Shape::Blob)));
+                        obj.push((s_.clone(), Shape::build_shape(&f2, Shape::Blob)));
                     }
 
                     Shape::Object(obj)
                 }
-                Shape::Mismatch(shape, shape1) => todo!(),
+                Shape::Mismatch(s1, s2) => Shape::Mismatch(
+                    Box::new(Shape::build_shape(&f2, *s1)),
+                    Box::new(Shape::build_shape(&f2, *s2)),
+                ),
             },
             Filter::ArrayIndex(u) => match s {
-                Shape::Blob => Shape::Array(Box::new(Shape::build_shape3(&f2, s)), Some(u)),
-                Shape::Null => Shape::build_shape3(&f2, Shape::Null),
-                Shape::Bool(b) => Shape::build_shape3(&f2, Shape::Bool(b)),
-                Shape::Number(n) => Shape::build_shape3(&f2, Shape::Number(n)),
-                Shape::String(s) => Shape::build_shape3(&f2, Shape::String(s)),
+                Shape::Blob => Shape::Array(Box::new(Shape::build_shape(&f2, s)), Some(u)),
+                Shape::Null => Shape::build_shape(&f2, Shape::Null),
+                Shape::Bool(b) => Shape::build_shape(&f2, Shape::Bool(b)),
+                Shape::Number(n) => Shape::build_shape(&f2, Shape::Number(n)),
+                Shape::String(s) => Shape::build_shape(&f2, Shape::String(s)),
                 Shape::Array(shape, u_) => Shape::Array(shape, Some(u.max(u_.unwrap_or(0)))),
-                Shape::Tuple(vec) => todo!(),
-                Shape::Object(vec) => todo!(),
-                Shape::Mismatch(shape, shape1) => todo!(),
+                Shape::Tuple(tuple) => {
+                    let mut tuple = tuple.clone();
+
+                    while u >= tuple.len() {
+                        tuple.push(Shape::Blob);
+                    }
+
+                    tuple[u] = Shape::build_shape(&f2, tuple[u].clone());
+
+                    Shape::Tuple(tuple)
+                }
+                Shape::Object(obj) => Shape::Mismatch(
+                    Box::new(Shape::Object(obj)),
+                    Box::new(Shape::Array(Box::new(Shape::Blob), Some(u))),
+                ),
+                Shape::Mismatch(s1, s2) => Shape::Mismatch(
+                    Box::new(Shape::build_shape(&f2, *s1)),
+                    Box::new(Shape::build_shape(&f2, *s2)),
+                ),
             },
             Filter::ArrayIterator => match s {
-                Shape::Blob => Shape::Array(Box::new(Shape::build_shape3(&f2, s)), None),
-                Shape::Null => Shape::build_shape3(&f2, Shape::Null),
-                Shape::Bool(b) => Shape::build_shape3(&f2, Shape::Bool(b)),
-                Shape::Number(n) => Shape::build_shape3(&f2, Shape::Number(n)),
-                Shape::String(s) => Shape::build_shape3(&f2, Shape::String(s)),
-                Shape::Array(shape, _) => todo!(),
-                Shape::Tuple(vec) => todo!(),
-                Shape::Object(vec) => todo!(),
-                Shape::Mismatch(shape, shape1) => todo!(),
+                Shape::Blob => Shape::Array(Box::new(Shape::build_shape(&f2, s)), None),
+                Shape::Null => Shape::build_shape(&f2, Shape::Null),
+                Shape::Bool(b) => Shape::build_shape(&f2, Shape::Bool(b)),
+                Shape::Number(n) => Shape::build_shape(&f2, Shape::Number(n)),
+                Shape::String(s) => Shape::build_shape(&f2, Shape::String(s)),
+                Shape::Array(shape, u) => Shape::build_shape(&f2, Shape::Array(shape, u)),
+                Shape::Tuple(tuple) => Shape::build_shape(&f2, Shape::Tuple(tuple)),
+                Shape::Object(obj) => Shape::build_shape(&f2, Shape::Object(obj)),
+                Shape::Mismatch(s1, s2) => Shape::Mismatch(
+                    Box::new(Shape::build_shape(&f2, *s1)),
+                    Box::new(Shape::build_shape(&f2, *s2)),
+                ),
             },
-            Filter::Null => todo!(),
-            Filter::Boolean(_) => todo!(),
-            Filter::Number(_) => todo!(),
-            Filter::String(_) => todo!(),
-            Filter::Array(vec) => todo!(),
-            Filter::Object(vec) => todo!(),
+            Filter::Null => Shape::build_shape(&f2, Shape::Null),
+            Filter::Boolean(b) => Shape::build_shape(&f2, Shape::Bool(Some(b))),
+            Filter::Number(n) => Shape::build_shape(&f2, Shape::Number(Some(n))),
+            Filter::String(s) => Shape::build_shape(&f2, Shape::String(Some(s))),
+            Filter::Array(arr) => arr
+                .iter()
+                .map(|f| Shape::build_shape_pipe(f.clone(), f2.clone(), s.clone()))
+                .fold(s.clone(), Shape::merge_shapes),
+            Filter::Object(obj) => obj
+                .iter()
+                .flat_map(|(f1, f2)| {
+                    vec![
+                        Shape::build_shape_pipe(f1.clone(), f2.clone(), s.clone()),
+                        Shape::build_shape_pipe(f2.clone(), f2.clone(), s.clone()),
+                    ]
+                })
+                .fold(s.clone(), Shape::merge_shapes),
         }
     }
-    pub fn build_shape3(f: &Filter, s: Shape) -> Shape {
+    pub fn build_shape(f: &Filter, s: Shape) -> Shape {
         match f {
             Filter::Dot => s,
             Filter::Pipe(f1, f2) => Shape::build_shape_pipe(*f1.clone(), *f2.clone(), s),
             Filter::Comma(f1, f2) => {
-                let s1 = Shape::build_shape3(f1, s.clone());
-                let s2 = Shape::build_shape3(f2, s);
+                let s1 = Shape::build_shape(f1, s.clone());
+                let s2 = Shape::build_shape(f2, s);
                 Shape::merge_shapes(s1, s2)
             }
             Filter::ObjIndex(s_) => match s {
@@ -247,8 +291,8 @@ impl Shape {
                     Shape::Object(obj)
                 }
                 Shape::Mismatch(s1, s2) => Shape::Mismatch(
-                    Box::new(Shape::build_shape3(f, *s1)),
-                    Box::new(Shape::build_shape3(f, *s2)),
+                    Box::new(Shape::build_shape(f, *s1)),
+                    Box::new(Shape::build_shape(f, *s2)),
                 ),
             },
             Filter::ArrayIndex(u) => match s {
@@ -280,8 +324,8 @@ impl Shape {
                     Box::new(Shape::Array(Box::new(Shape::Blob), Some(*u))),
                 ),
                 Shape::Mismatch(s1, s2) => Shape::Mismatch(
-                    Box::new(Shape::build_shape3(f, *s1)),
-                    Box::new(Shape::build_shape3(f, *s2)),
+                    Box::new(Shape::build_shape(f, *s1)),
+                    Box::new(Shape::build_shape(f, *s2)),
                 ),
             },
             Filter::ArrayIterator => match s {
@@ -306,25 +350,24 @@ impl Shape {
                 Shape::Tuple(vec) => Shape::Tuple(vec),
                 Shape::Object(vec) => Shape::Object(vec),
                 Shape::Mismatch(s1, s2) => Shape::Mismatch(
-                    Box::new(Shape::build_shape3(f, *s1)),
-                    Box::new(Shape::build_shape3(f, *s2)),
+                    Box::new(Shape::build_shape(f, *s1)),
+                    Box::new(Shape::build_shape(f, *s2)),
                 ),
             },
             Filter::Null | Filter::Boolean(_) | Filter::Number(_) | Filter::String(_) => s,
             Filter::Array(vec) => vec
                 .iter()
-                .map(|f| Shape::build_shape3(f, s.clone()))
-                .fold(s.clone(), |acc, x| Shape::merge_shapes(acc, x)),
+                .map(|f| Shape::build_shape(f, s.clone()))
+                .fold(s.clone(), Shape::merge_shapes),
             Filter::Object(vec) => vec
                 .iter()
-                .map(|(f1, f2)| {
+                .flat_map(|(f1, f2)| {
                     vec![
-                        Shape::build_shape3(f1, s.clone()),
-                        Shape::build_shape3(f2, s.clone()),
+                        Shape::build_shape(f1, s.clone()),
+                        Shape::build_shape(f2, s.clone()),
                     ]
                 })
-                .flatten()
-                .fold(s.clone(), |acc, x| Shape::merge_shapes(acc, x)),
+                .fold(s.clone(), Shape::merge_shapes),
         }
     }
 
@@ -333,15 +376,9 @@ impl Shape {
             (Shape::Blob, s) => s,
             (s, Shape::Blob) => s,
             (Shape::Null, Shape::Null) => Shape::Null,
-            (Shape::Bool(None), Shape::Bool(None)) => Shape::Bool(None),
-            (Shape::Bool(Some(b)), Shape::Bool(None)) => Shape::Bool(Some(b)),
-            (Shape::Bool(None), Shape::Bool(Some(b))) => Shape::Bool(Some(b)),
-            (Shape::Number(None), Shape::Number(None)) => Shape::Number(None),
-            (Shape::Number(Some(n)), Shape::Number(None)) => Shape::Number(Some(n)),
-            (Shape::Number(None), Shape::Number(Some(n))) => Shape::Number(Some(n)),
-            (Shape::String(None), Shape::String(None)) => Shape::String(None),
-            (Shape::String(Some(s)), Shape::String(None)) => Shape::String(Some(s)),
-            (Shape::String(None), Shape::String(Some(s))) => Shape::String(Some(s)),
+            (Shape::Bool(b1), Shape::Bool(b2)) => Shape::Bool(b1.or(b2)),
+            (Shape::Number(n1), Shape::Number(n2)) => Shape::Number(n1.or(n2)),
+            (Shape::String(s1), Shape::String(s2)) => Shape::String(s1.or(s2)),
             (Shape::Array(shape1, u1), Shape::Array(shape2, u2)) => {
                 Shape::Array(Box::new(Shape::merge_shapes(*shape1, *shape2)), u1.max(u2))
             }
@@ -403,156 +440,6 @@ impl Shape {
         }
     }
 
-    /// Build shape with continuation:
-    ///     - When `Constraint::In` is used, the second part of the constraint must be calculated
-    ///     at the leaves the first one produces.
-    pub fn build_shape2(c1: Constraint, c2: Constraint, s: Shape) -> Result<Shape, JQError> {
-        match c1 {
-            Constraint::Diamond => Shape::build_shape(c2, s),
-            Constraint::Sum(c11, c12) => {
-                let s1 = Shape::build_shape2(*c11, c2.clone(), s)?;
-                Shape::build_shape2(*c12, c2, s1)
-            }
-            Constraint::In(c11, c12) => {
-                Shape::build_shape2(*c11, Constraint::In(c12, Box::new(c2)), s)
-            }
-            Constraint::Field(f) => match s {
-                Shape::Blob => Ok(Shape::Object(vec![(
-                    f,
-                    Shape::build_shape(c2, Shape::Blob)?,
-                )])),
-                Shape::Null => Ok(Shape::Null),
-                Shape::Bool(..)
-                | Shape::Number(..)
-                | Shape::String(..)
-                | Shape::Array(_, _)
-                | Shape::Tuple(_) => Err(JQError::ObjIndexForNonObject),
-                Shape::Object(mut obj) => {
-                    let inner = obj.clone().into_iter().find_position(|(k, _)| *k == f);
-
-                    if let Some((i, (key, shape))) = inner {
-                        obj.remove(i);
-
-                        obj.push((key.to_string(), Shape::build_shape(c2, shape.clone())?));
-                    } else {
-                        obj.push((f, Shape::build_shape(c2, Shape::Blob)?));
-                    }
-
-                    Ok(Shape::Object(obj))
-                }
-                Shape::Mismatch(shape, shape1) => todo!(),
-            },
-            Constraint::Array(None) => match s {
-                Shape::Blob => Ok(Shape::Array(
-                    Box::new(Shape::build_shape(c2, Shape::Blob)?),
-                    None,
-                )),
-                Shape::Null | Shape::Bool(..) | Shape::Number(..) | Shape::String(..) => {
-                    Err(JQError::ArrIteratorForNonIterable)
-                }
-                Shape::Array(shape, u) => {
-                    Ok(Shape::Array(Box::new(Shape::build_shape(c2, *shape)?), u))
-                }
-                Shape::Tuple(tuple) => {
-                    let (results, errs): (Vec<_>, Vec<_>) = tuple
-                        .into_iter()
-                        .map(|s| Shape::build_shape(c2.clone(), s))
-                        .partition(Result::is_ok);
-
-                    let results: Vec<Shape> = results.into_iter().map(Result::unwrap).collect();
-                    let errs: Vec<JQError> = errs.into_iter().map(Result::unwrap_err).collect();
-
-                    if errs.is_empty() {
-                        Ok(Shape::Tuple(results))
-                    } else {
-                        Err(errs.into_iter().next().unwrap())
-                    }
-                }
-                Shape::Object(obj) => {
-                    let (results, errs): (Vec<_>, Vec<_>) = obj
-                        .into_iter()
-                        .map(|(k, s)| (k, Shape::build_shape(c2.clone(), s)))
-                        .partition(|(_, r)| r.is_ok());
-
-                    let results: Vec<(String, Shape)> =
-                        results.into_iter().map(|(s, r)| (s, r.unwrap())).collect();
-                    let errs: Vec<JQError> =
-                        errs.into_iter().map(|(_, r)| r.unwrap_err()).collect();
-
-                    if errs.is_empty() {
-                        Ok(Shape::Object(results))
-                    } else {
-                        Err(errs.into_iter().next().unwrap())
-                    }
-                }
-                Shape::Mismatch(shape, shape1) => todo!(),
-            },
-            Constraint::Array(Some(_)) => todo!(),
-        }
-    }
-
-    pub fn build_shape(c: Constraint, s: Shape) -> Result<Shape, JQError> {
-        match c {
-            Constraint::Diamond => Ok(s),
-            Constraint::Sum(c1, c2) => {
-                let s1 = Shape::build_shape(*c1, s)?;
-                Shape::build_shape(*c2, s1)
-            }
-            Constraint::In(c1, c2) => Shape::build_shape2(*c1, *c2, s),
-            Constraint::Field(f) => match s {
-                Shape::Blob => Ok(Shape::Object(vec![(f.to_string(), Shape::Blob)])),
-                Shape::Null => Ok(Shape::Null),
-                Shape::Bool(..) => Err(JQError::ObjIndexForNonObject),
-                Shape::Number(..) => Err(JQError::ObjIndexForNonObject),
-                Shape::String(..) => Err(JQError::ObjIndexForNonObject),
-                Shape::Array(_, _) => Err(JQError::ObjIndexForNonObject),
-                Shape::Tuple(_) => Err(JQError::ObjIndexForNonObject),
-                Shape::Object(mut obj) => {
-                    let has_key = obj.iter().any(|(k, _)| *k == f);
-
-                    if !has_key {
-                        obj.push((f, Shape::Blob));
-                    }
-
-                    Ok(Shape::Object(obj))
-                }
-                Shape::Mismatch(shape, shape1) => todo!(),
-            },
-            Constraint::Array(u) => match s {
-                Shape::Blob => Ok(Shape::Array(Box::new(Shape::Blob), u)),
-                Shape::Null => {
-                    if u.is_some() {
-                        Ok(Shape::Array(Box::new(Shape::Blob), u))
-                    } else {
-                        Err(JQError::ArrIteratorForNonIterable)
-                    }
-                }
-                // todo: make these errors concrete
-                Shape::Bool(..) => Err(JQError::Unknown),
-                Shape::Number(..) => Err(JQError::Unknown),
-                Shape::String(..) => Err(JQError::Unknown),
-                Shape::Array(shape, n) => match (u, n) {
-                    (None, None) => Ok(Shape::Array(shape, None)),
-                    (None, Some(n)) => Ok(Shape::Array(shape, Some(n))),
-                    (Some(u), None) => Ok(Shape::Array(shape, Some(u))),
-                    (Some(u), Some(n)) => Ok(Shape::Array(shape, Some(u.max(n)))),
-                },
-                Shape::Tuple(mut tuple) => match u {
-                    Some(u) => {
-                        while u >= tuple.len() {
-                            tuple.push(Shape::Blob);
-                        }
-
-                        Ok(Shape::Tuple(tuple))
-                    }
-                    None => Ok(Shape::Tuple(tuple)),
-                },
-                Shape::Object(_) => Err(JQError::ArrIndexForNonArray),
-                Shape::Mismatch(shape, shape1) => todo!(),
-            },
-        }
-    }
-
     pub fn check(&self, j: Json, path: Vec<Access>) -> Option<ShapeMismatch> {
         match self {
             Shape::Blob => None,
@@ -569,7 +456,7 @@ impl Shape {
                 } else {
                     Some(ShapeMismatch::new(path, self.clone(), Shape::from_json(j)))
                 }
-            },
+            }
             Shape::Bool(Some(b)) => {
                 if let Json::Boolean(b_) = j {
                     if b == &b_ {
@@ -580,7 +467,7 @@ impl Shape {
                 } else {
                     Some(ShapeMismatch::new(path, self.clone(), Shape::from_json(j)))
                 }
-            },
+            }
             Shape::Number(None) => {
                 if let Json::Number(_) = j {
                     None
@@ -621,7 +508,11 @@ impl Shape {
                 if let Json::Array(arr) = j {
                     if let Some(u) = u {
                         if *u > arr.len() {
-                            return Some(ShapeMismatch::new(path, self.clone(), Shape::Tuple(arr.into_iter().map(Shape::from_json).collect())));
+                            return Some(ShapeMismatch::new(
+                                path,
+                                self.clone(),
+                                Shape::Tuple(arr.into_iter().map(Shape::from_json).collect()),
+                            ));
                         }
                     }
 
@@ -645,7 +536,11 @@ impl Shape {
             Shape::Tuple(tuple) => {
                 if let Json::Array(arr) = j {
                     if tuple.len() > arr.len() {
-                        return Some(ShapeMismatch::new(path, self.clone(), Shape::Tuple(arr.into_iter().map(Shape::from_json).collect())));
+                        return Some(ShapeMismatch::new(
+                            path,
+                            self.clone(),
+                            Shape::Tuple(arr.into_iter().map(Shape::from_json).collect()),
+                        ));
                     }
 
                     let (_, mismatches): (Vec<_>, Vec<_>) = tuple
@@ -657,11 +552,7 @@ impl Shape {
                         })
                         .partition(Option::is_none);
 
-                    if mismatches.is_empty() {
-                        None
-                    } else {
-                        mismatches.into_iter().next().unwrap()
-                    }
+                    mismatches.into_iter().next().flatten()
                 } else {
                     Some(ShapeMismatch::new(path, self.clone(), Shape::from_json(j)))
                 }
@@ -685,65 +576,54 @@ impl Shape {
                                 Some(ShapeMismatch::new(
                                     path.clone(),
                                     self.clone(),
-                                    Shape::Object(obj.clone().into_iter().map(|(k, v)| (k, Shape::from_json(v))).collect()),
+                                    Shape::Object(
+                                        obj.clone()
+                                            .into_iter()
+                                            .map(|(k, v)| (k, Shape::from_json(v)))
+                                            .collect(),
+                                    ),
                                 ))
                             }
                         })
                         .partition(Option::is_none);
 
-                    if mismatches.is_empty() {
-                        None
-                    } else {
-                        mismatches.into_iter().next().unwrap()
-                    }
+                    mismatches.into_iter().next().flatten()
                 } else {
                     Some(ShapeMismatch::new(path, self.clone(), Shape::from_json(j)))
                 }
             }
-            Shape::Mismatch(s1, s2) => {
-                Some(ShapeMismatch::new(path, *s1.clone(), *s2.clone()))
-            },
+            Shape::Mismatch(s1, s2) => Some(ShapeMismatch::new(path, *s1.clone(), *s2.clone())),
         }
     }
 
     pub fn check_self(&self, path: Vec<Access>) -> Option<ShapeMismatch> {
         match self {
-            Shape::Blob | Shape::Null | Shape::Bool(..) | Shape::Number(..) | Shape::String(..) => None,
+            Shape::Blob | Shape::Null | Shape::Bool(..) | Shape::Number(..) | Shape::String(..) => {
+                None
+            }
             Shape::Array(shape, _) => shape.check_self([path.clone(), vec![Access::Iter]].concat()),
             Shape::Tuple(tuple) => {
                 let (_, mismatches): (Vec<_>, Vec<_>) = tuple
                     .iter()
                     .enumerate()
-                    .map(|(i, s)| {
-                        s.check_self([path.clone(), vec![Access::Array(i)]].concat())
-                    })
+                    .map(|(i, s)| s.check_self([path.clone(), vec![Access::Array(i)]].concat()))
                     .partition(Option::is_none);
 
-                if mismatches.is_empty() {
-                    None
-                } else {
-                    mismatches.into_iter().next().unwrap()
-                }
+                mismatches.into_iter().next().flatten()
             }
             Shape::Object(obj) => {
                 let (_, mismatches): (Vec<_>, Vec<_>) = obj
                     .iter()
                     .map(|(key, shape)| {
-                        shape.check_self([path.clone(), vec![Access::Field(key.to_string())]].concat())
+                        shape.check_self(
+                            [path.clone(), vec![Access::Field(key.to_string())]].concat(),
+                        )
                     })
                     .partition(Option::is_none);
 
-                if mismatches.is_empty() {
-                    None
-                } else {
-                    mismatches.into_iter().next().unwrap()
-                }
+                mismatches.into_iter().next().flatten()
             }
-            Shape::Mismatch(s1, s2) => {
-                Some(
-                    ShapeMismatch::new(path, *s1.clone(), *s2.clone()),
-                )
-            },
+            Shape::Mismatch(s1, s2) => Some(ShapeMismatch::new(path, *s1.clone(), *s2.clone())),
         }
     }
 }

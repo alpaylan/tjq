@@ -1,5 +1,3 @@
-mod constraint;
-use constraint::*;
 mod filter;
 use filter::*;
 mod json;
@@ -12,7 +10,7 @@ fn main() {
         Box::new(Filter::Pipe(
             Box::new(Filter::ArrayIterator),
             Box::new(Filter::Comma(
-                Box::new(Filter::ArrayIndex(3)),
+                Box::new(Filter::ObjIndex("age".to_string())),
                 Box::new(Filter::ObjIndex("name".to_string())),
             )),
         )),
@@ -59,11 +57,12 @@ fn main() {
         }
     }
 
-    let s = Shape::new2(&filter);
+    let s = Shape::new(&filter);
 
     println!("Shape: {}", s);
 
     // Check internal type mismatches in the shape
+    println!("Running internal type checking...");
     let m = s.check_self(vec![]);
     match m {
         Some(m) => println!("{m}"),
