@@ -6,3 +6,4 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.95"
 itertools = "0.13.0"
+topological-sort = "0.2.2"
