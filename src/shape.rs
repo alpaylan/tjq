@@ -7,7 +7,7 @@ use itertools::Itertools;
 
 use crate::{Filter, Json};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Shape {
     Blob,
     Null,
@@ -20,7 +20,7 @@ pub enum Shape {
     Mismatch(Box<Shape>, Box<Shape>),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Access {
     Field(String),
     Array(usize),
@@ -37,7 +37,7 @@ impl Display for Access {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ShapeMismatch {
     path: Vec<Access>,
     expected: Shape,
@@ -107,9 +107,13 @@ impl Display for Shape {
     }
 }
 
+struct ShapeContext {
+    shapes: HashMap<String, Shape>,
+}
+
 impl Shape {
     pub fn new(f: &Filter) -> Shape {
-        Shape::build_shape(f, Shape::Blob)
+        Shape::build_shape(f, Shape::Blob).input_shape
     }
 
     pub fn from_json(j: Json) -> Shape {
@@ -140,7 +144,7 @@ impl Shape {
         }
     }
 
-    pub fn build_shape_pipe(f1: Filter, f2: Filter, s: Shape) -> Shape {
+    pub fn build_shape_pipe(f1: Filter, f2: Filter, s: Shape) -> Shapes {
         match f1 {
             Filter::Dot => Shape::build_shape(&f2, s),
             Filter::Pipe(f11, f12) => {
@@ -175,7 +179,6 @@ impl Shape {
                 ),
                 Shape::Object(mut obj) => {
                     let maybe_shape = obj.iter().find_position(|(k, _)| *k == s_);
-                    println!("[build_shape_pipe] maybe_shape: {:?}", maybe_shape);
                     if let Some((u, (_, shape))) = maybe_shape {
                         obj[u] = (s_.clone(), Shape::build_shape(&f2, shape.clone()));
                     } else {
@@ -247,16 +250,27 @@ impl Shape {
                     ]
                 })
                 .fold(s.clone(), Shape::merge_shapes),
+            Filter::BinOp(lhs, op, rhs) => {
+                let s1 = Shape::build_shape_pipe(*lhs.clone(), f2.clone(), s.clone());
+                let s2 = Shape::build_shape_pipe(*rhs.clone(), f2, s);
+                Shape::merge_shapes(s1, s2)
+            }
+            Filter::Empty => todo!(),
+            Filter::Error(_) => todo!(),
         }
     }
-    pub fn build_shape(f: &Filter, s: Shape) -> Shape {
+    pub fn build_shape(
+        f: &Filter,
+        identities: Vec<String>,
+        ctx: &mut ShapeContext,
+    ) -> Vec<String> {
         match f {
-            Filter::Dot => s,
-            Filter::Pipe(f1, f2) => Shape::build_shape_pipe(*f1.clone(), *f2.clone(), s),
+            Filter::Dot => identities,
+            Filter::Pipe(f1, f2) => {
+                todo!()
+            },
             Filter::Comma(f1, f2) => {
-                let s1 = Shape::build_shape(f1, s.clone());
-                let s2 = Shape::build_shape(f2, s);
-                Shape::merge_shapes(s1, s2)
+                todo!()
             }
             Filter::ObjIndex(s_) => match s {
                 Shape::Blob => Shape::Object(vec![(s_.clone(), Shape::Blob)]),
@@ -368,6 +382,42 @@ impl Shape {
                     ]
                 })
                 .fold(s.clone(), Shape::merge_shapes),
+            Filter::BinOp(l, op, r) => match op {
+                crate::BinOp::Add => {
+                    let s1 = Shape::build_shape(l, s.clone());
+                    let s2 = Shape::build_shape(r, s);
+                    println!("{l} + {r}");
+                    println!(
+                        "{s1} + {s2} = {}",
+                        Shape::merge_shapes(s1.clone(), s2.clone())
+                    );
+                    Shape::merge_shapes(s1, s2)
+                }
+                crate::BinOp::Sub
+                | crate::BinOp::Mul
+                | crate::BinOp::Div
+                | crate::BinOp::Gt
+                | crate::BinOp::Ge
+                | crate::BinOp::Lt
+                | crate::BinOp::Le
+                | crate::BinOp::Mod => {
+                    let s1 = Shape::build_shape(l, s.clone());
+                    let s2 = Shape::build_shape(r, s);
+                    Shape::merge_shapes(Shape::merge_shapes(s1, s2), Shape::Number(None))
+                }
+                crate::BinOp::And | crate::BinOp::Or => {
+                    let s1 = Shape::build_shape(l, s.clone());
+                    let s2 = Shape::build_shape(r, s);
+                    Shape::merge_shapes(Shape::merge_shapes(s1, s2), Shape::Bool(None))
+                }
+                crate::BinOp::Eq | crate::BinOp::Ne => {
+                    let s1 = Shape::build_shape(l, s.clone());
+                    let s2 = Shape::build_shape(r, s);
+                    Shape::merge_shapes(s1, s2)
+                }
+            },
+            Filter::Empty => s,
+            Filter::Error(_) => todo!(),
         }
     }
 
@@ -625,5 +675,68 @@ impl Shape {
             }
             Shape::Mismatch(s1, s2) => Some(ShapeMismatch::new(path, *s1.clone(), *s2.clone())),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{BinOp, Filter, Json, Shape, ShapeMismatch};
+
+    #[test]
+    fn test_plus() {
+        let json = Json::Number(1.0);
+        let filter = Filter::BinOp(
+            Box::new(Filter::Number(1.0)),
+            BinOp::Add,
+            Box::new(Filter::Dot),
+        );
+
+        let shape = Shape::new(&filter);
+        let results = shape.check(json, vec![]);
+
+        assert_eq!(results, None);
+    }
+
+    #[test]
+    fn test_plus_false() {
+        let json = Json::Number(1.0);
+        let filter = Filter::Comma(
+            Box::new(Filter::BinOp(
+                Box::new(Filter::Dot),
+                BinOp::Add,
+                Box::new(Filter::Number(1.0)),
+            )),
+            Box::new(Filter::BinOp(
+                Box::new(Filter::Dot),
+                BinOp::Add,
+                Box::new(Filter::String("hello".to_string())),
+            )),
+        );
+
+        let shape = Shape::new(&filter);
+        let mismatch = shape.check_self(vec![]);
+        println!("{shape}");
+        assert_eq!(
+            mismatch,
+            Some(ShapeMismatch::new(
+                vec![],
+                Shape::Number(None),
+                Shape::String(None)
+            ))
+        );
+    }
+
+    #[test]
+    fn test_minus() {
+        let json = Json::Number(1.0);
+        let filter = Filter::BinOp(
+            Box::new(Filter::Number(1.0)),
+            BinOp::Sub,
+            Box::new(Filter::Number(2.0)),
+        );
+
+        let results = Filter::filter(&json, &filter);
+
+        assert_eq!(results, vec![Ok(Json::Number(-1.0))]);
     }
 }

@@ -1,3 +1,5 @@
+mod error;
+use error::*;
 mod filter;
 use filter::*;
 mod json;
@@ -40,20 +42,16 @@ fn main() {
     println!("Input: {}", json);
     println!("Filter: {}", filter);
 
-    let result = Filter::filter(&json, &filter);
+    let results = Filter::filter(&json, &filter);
 
-    match result {
-        Ok(results) => {
-            if results.is_empty() {
-                println!("null");
+    for result in results {
+        match result {
+            Ok(result) => {
+                println!("{result}");
             }
-
-            for result in results {
-                println!("{}", result);
+            Err(err) => {
+                println!("{err}");
             }
-        }
-        Err(err) => {
-            println!("error: {:?}", err);
         }
     }
 

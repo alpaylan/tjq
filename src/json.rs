@@ -1,6 +1,6 @@
 use std::fmt::{self, Display, Formatter};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Json {
     Null,
     Boolean(bool),
@@ -33,7 +33,7 @@ impl Display for Json {
                     if i != 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "\"{}\": {}", key, value)?;
+                    write!(f, "{}: {}", key, value)?;
                 }
                 write!(f, "}}")
             }
@@ -41,3 +41,27 @@ impl Display for Json {
     }
 }
 
+impl Json {
+    pub fn debug(&self) -> String {
+        match self {
+            Json::Null => "null".to_string(),
+            Json::Boolean(b) => format!("boolean ({})", b),
+            Json::Number(n) => format!("number ({})", n),
+            Json::String(s) => format!("string \"{}\"", s),
+            Json::Array(vec) => format!(
+                "array [{}]",
+                vec.iter()
+                    .map(|j| j.debug())
+                    .collect::<Vec<String>>()
+                    .join(", "),
+            ),
+            Json::Object(vec) => format!(
+                "object {{ {} }}",
+                vec.iter()
+                    .map(|(k, j)| format!("\"{}\": {}", k, j.debug()))
+                    .collect::<Vec<String>>()
+                    .join(", "),
+            ),
+        }
+    }
+}
