@@ -110,22 +110,11 @@ impl Filter {
     pub fn filter(json: &Json, filter: &Filter) -> Vec<Result<Json, JQError>> {
         match filter {
             Filter::Dot => vec![Ok(json.clone())],
-            Filter::Pipe(f1, f2) => {
-                let results = Filter::filter(json, f1);
-                let results = results
-                    .into_iter()
-                    .flat_map(|result| result.and_then(|json| Ok(Filter::filter(&json, f2))))
-                    .flatten()
-                    .collect::<Vec<_>>();
-                // let (results, errs): (Vec<_>, Vec<_>) =
-                //     results.into_iter().partition(Result::is_ok);
-                results
-                // if errs.is_empty() {
-                //     results
-                // } else {
-                //     vec![errs[0].clone()]
-                // }
-            }
+            Filter::Pipe(f1, f2) => Filter::filter(json, f1)
+                .into_iter()
+                .flat_map(|result| result.map(|json| Filter::filter(&json, f2)))
+                .flatten()
+                .collect::<Vec<_>>(),
             Filter::Comma(f1, f2) => [Filter::filter(json, f1), Filter::filter(json, f2)].concat(),
             Filter::ObjIndex(s) => vec![match json {
                 Json::Object(obj) => Ok(obj
@@ -133,11 +122,17 @@ impl Filter {
                     .find(|(key, _)| key == s)
                     .map(|(_, value)| value.clone())
                     .unwrap_or(Json::Null)),
-                _ => Err(JQError::ObjIndexForNonObject(json.clone(), Json::String(s.clone()))),
+                _ => Err(JQError::ObjIndexForNonObject(
+                    json.clone(),
+                    Json::String(s.clone()),
+                )),
             }],
             Filter::ArrayIndex(i) => vec![match json {
                 Json::Array(arr) => Ok(arr.get(*i).cloned().unwrap_or(Json::Null)),
-                _ => Err(JQError::ArrIndexForNonArray(json.clone(), Json::Number(*i as f64))),
+                _ => Err(JQError::ArrIndexForNonArray(
+                    json.clone(),
+                    Json::Number(*i as f64),
+                )),
             }],
             Filter::ArrayIterator => match json {
                 Json::Array(arr) => arr.iter().map(|value| Ok(value.clone())).collect(),
@@ -151,8 +146,7 @@ impl Filter {
             Filter::Array(arr) => {
                 let results = arr
                     .iter()
-                    .map(|f| Filter::filter(json, f))
-                    .flatten()
+                    .flat_map(|f| Filter::filter(json, f))
                     .collect::<Vec<_>>();
                 let (results, errs): (Vec<_>, Vec<_>) =
                     results.into_iter().partition(Result::is_ok);
@@ -170,18 +164,17 @@ impl Filter {
                     .iter()
                     .map(|(f1, f2)| (Filter::filter(json, f1), Filter::filter(json, f2)))
                     .collect();
-                
+
                 let results = results
                     .into_iter()
                     .map(|(keys, values)| itertools::iproduct!(keys, values).collect::<Vec<_>>())
                     .multi_cartesian_product()
                     .collect::<Vec<_>>();
 
-
                 let (results, errs): (Vec<_>, Vec<_>) = results
                     .into_iter()
                     .partition(|results| results.iter().all(|(k, v)| k.is_ok() && v.is_ok()));
-                
+
                 if errs.is_empty() {
                     let objs: Vec<Vec<(Json, Json)>> = results
                         .into_iter()
@@ -221,7 +214,7 @@ impl Filter {
                 let ls = Filter::filter(json, l);
                 let rs = Filter::filter(json, r);
 
-                return itertools::iproduct!(ls, rs)
+                itertools::iproduct!(ls, rs)
                     .map(|(l, r)| match (l, r) {
                         (Ok(Json::Number(l)), Ok(Json::Number(r))) => match bin_op {
                             BinOp::Add => Ok(Json::Number(l + r)),
@@ -256,7 +249,7 @@ impl Filter {
                         (Err(err), _) => Err(err),
                         (_, Err(err)) => Err(err),
                     })
-                    .collect::<Vec<_>>();
+                    .collect::<Vec<_>>()
             }
             Filter::Empty => todo!(),
             Filter::Error(_) => todo!(),
@@ -264,11 +257,9 @@ impl Filter {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use crate::{BinOp, Filter, Json};
-
 
     #[test]
     fn test_plus() {

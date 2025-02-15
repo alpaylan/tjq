@@ -22,8 +22,8 @@ fn main() {
         )),
         Box::new(Filter::Object(vec![(
             Filter::String("v".to_string()),
-            Filter::Dot,
-            // Filter::ObjIndex("a".to_string()),
+            // Filter::Dot,
+            Filter::ObjIndex("a".to_string()),
         )])),
     );
 
