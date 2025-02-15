@@ -256,9 +256,9 @@ impl Shape {
                 Box::new(s1.normalize(shapes)),
                 Box::new(s2.normalize(shapes)),
             ),
-            Shape::Union(shapes_) => Shape::Union(
-                shapes_.iter().map(|s| s.normalize(shapes)).collect(),
-            ),
+            Shape::Union(shapes_) => {
+                Shape::Union(shapes_.iter().map(|s| s.normalize(shapes)).collect())
+            }
         }
     }
 
@@ -493,193 +493,169 @@ impl Shape {
                     let s1 = Shape::build_shape(l, shapes.clone(), ctx);
                     let s2 = Shape::build_shape(r, shapes, ctx);
 
-                    s1.into_iter().zip(s2).fold(vec![], |mut acc, (l, r)| {
-                        match (l, r) {
-                            // null + X
-                            // X + null
-                            (Shape::Null, s) | (s, Shape::Null) => {
-                                acc.push(s);
-                                acc
-                            }
-                            // str + str
-                            (Shape::String(s1), Shape::String(s2)) => {
-                                match (s1, s2) {
-                                    (None, None) => acc.push(Shape::String(None)),
-                                    (Some(s1), None) | (None, Some(s1)) => {
-                                        acc.push(Shape::String(Some(s1)))
-                                    }
+                    s1.into_iter()
+                        .zip(s2)
+                        .map(|(l, r)| {
+                            match (l, r) {
+                                // null + X
+                                // X + null
+                                (Shape::Null, s) | (s, Shape::Null) => s,
+                                // str + str
+                                (Shape::String(s1), Shape::String(s2)) => match (s1, s2) {
+                                    (None, None) => Shape::String(None),
+                                    (Some(s1), None) | (None, Some(s1)) => Shape::String(Some(s1)),
                                     (Some(s1), Some(s2)) => {
-                                        acc.push(Shape::String(Some(format!("{s1}{s2}"))));
+                                        Shape::String(Some(format!("{s1}{s2}")))
                                     }
+                                },
+                                (Shape::String(_), Shape::TVar(t))
+                                | (Shape::TVar(t), Shape::String(_)) => {
+                                    let current_shape = ctx.shapes.get(&t).unwrap().clone();
+                                    let current_shape = Shape::merge_shapes(
+                                        current_shape,
+                                        Shape::String(None),
+                                        ctx,
+                                    );
+                                    ctx.shapes.insert(t, current_shape);
+
+                                    Shape::String(None)
                                 }
-                                acc
-                            }
-                            (Shape::String(_), Shape::TVar(t))
-                            | (Shape::TVar(t), Shape::String(_)) => {
-                                let current_shape = ctx.shapes.get(&t).unwrap().clone();
-                                let current_shape =
-                                    Shape::merge_shapes(current_shape, Shape::String(None), ctx);
-                                ctx.shapes.insert(t, current_shape);
+                                // arr + arr
+                                (Shape::Array(shape1, u1), Shape::Array(shape2, u2)) => {
+                                    let shape = Shape::merge_shapes(*shape1, *shape2, ctx);
+                                    let u = u1.max(u2);
 
-                                acc.push(Shape::String(None));
-                                acc
-                            }
-                            // arr + arr
-                            (Shape::Array(shape1, u1), Shape::Array(shape2, u2)) => {
-                                let shape = Shape::merge_shapes(*shape1, *shape2, ctx);
-                                let u = u1.max(u2);
-
-                                acc.push(Shape::Array(Box::new(shape), u));
-                                acc
-                            }
-                            (Shape::Array(shape, u), Shape::TVar(t))
-                            | (Shape::TVar(t), Shape::Array(shape, u)) => {
-                                let current_shape = ctx.shapes.get(&t).unwrap().clone();
-                                let current_shape = Shape::merge_shapes(
-                                    current_shape,
-                                    Shape::Array(shape.clone(), u),
-                                    ctx,
-                                );
-                                ctx.shapes.insert(t, current_shape);
-
-                                acc.push(Shape::Array(shape, u));
-                                acc
-                            }
-                            // obj + obj
-                            (Shape::Object(obj1), Shape::Object(obj2)) => {
-                                // todo: check this
-                                let mut obj = HashMap::new();
-
-                                for (k, s1) in obj1.clone() {
-                                    let s2 = obj2.iter().find(|(key, _)| key == &k).map(|(_, s)| s);
-
-                                    if let Some(s2) = s2 {
-                                        obj.insert(k, Shape::merge_shapes(s1, s2.clone(), ctx));
-                                    } else {
-                                        obj.insert(k, s1);
-                                    }
+                                    Shape::Array(Box::new(shape), u)
                                 }
+                                (Shape::Array(shape, u), Shape::TVar(t))
+                                | (Shape::TVar(t), Shape::Array(shape, u)) => {
+                                    let current_shape = ctx.shapes.get(&t).unwrap().clone();
+                                    let current_shape = Shape::merge_shapes(
+                                        current_shape,
+                                        Shape::Array(shape.clone(), u),
+                                        ctx,
+                                    );
+                                    ctx.shapes.insert(t, current_shape);
 
-                                for (k, s2) in obj2 {
-                                    let s1 = obj1.iter().find(|(key, _)| key == &k).map(|(_, s)| s);
-
-                                    if let Some(s1) = s1 {
-                                        obj.insert(k, Shape::merge_shapes(s1.clone(), s2, ctx));
-                                    } else {
-                                        obj.insert(k, s2);
-                                    }
+                                    Shape::Array(shape, u)
                                 }
+                                // obj + obj
+                                (Shape::Object(obj1), Shape::Object(obj2)) => {
+                                    // todo: check this
+                                    let mut obj = HashMap::new();
 
-                                acc.push(Shape::Object(obj.into_iter().collect()));
-                                acc
-                            }
-                            (Shape::Object(obj), Shape::TVar(t))
-                            | (Shape::TVar(t), Shape::Object(obj)) => {
-                                let current_shape = ctx.shapes.get(&t).unwrap().clone();
-                                let current_shape = Shape::merge_shapes(
-                                    current_shape.clone(),
-                                    Shape::Object(obj.clone()),
-                                    ctx,
-                                );
-                                ctx.shapes.insert(t, current_shape);
+                                    for (k, s1) in obj1.clone() {
+                                        let s2 =
+                                            obj2.iter().find(|(key, _)| key == &k).map(|(_, s)| s);
 
-                                acc.push(Shape::Object(obj));
-                                acc
-                            }
-                            // num + num
-                            (Shape::Number(n1), Shape::Number(n2)) => {
-                                match (n1, n2) {
-                                    (None, None) => acc.push(Shape::Number(None)),
-                                    (Some(n1), None) | (None, Some(n1)) => {
-                                        acc.push(Shape::Number(Some(n1)))
+                                        if let Some(s2) = s2 {
+                                            obj.insert(k, Shape::merge_shapes(s1, s2.clone(), ctx));
+                                        } else {
+                                            obj.insert(k, s1);
+                                        }
                                     }
-                                    (Some(n1), Some(n2)) => {
-                                        acc.push(Shape::Number(Some(n1 + n2)));
+
+                                    for (k, s2) in obj2 {
+                                        let s1 =
+                                            obj1.iter().find(|(key, _)| key == &k).map(|(_, s)| s);
+
+                                        if let Some(s1) = s1 {
+                                            obj.insert(k, Shape::merge_shapes(s1.clone(), s2, ctx));
+                                        } else {
+                                            obj.insert(k, s2);
+                                        }
                                     }
+
+                                    Shape::Object(obj.into_iter().collect())
                                 }
-                                acc
-                            }
-                            (Shape::Number(_), Shape::TVar(t))
-                            | (Shape::TVar(t), Shape::Number(_)) => {
-                                let current_shape = ctx.shapes.get(&t).unwrap().clone();
-                                let current_shape = Shape::merge_shapes(
-                                    current_shape.clone(),
-                                    Shape::Number(None),
-                                    ctx,
-                                );
-                                ctx.shapes.insert(t, current_shape);
+                                (Shape::Object(obj), Shape::TVar(t))
+                                | (Shape::TVar(t), Shape::Object(obj)) => {
+                                    let current_shape = ctx.shapes.get(&t).unwrap().clone();
+                                    let current_shape = Shape::merge_shapes(
+                                        current_shape.clone(),
+                                        Shape::Object(obj.clone()),
+                                        ctx,
+                                    );
+                                    ctx.shapes.insert(t, current_shape);
 
-                                acc.push(Shape::Number(None));
-                                acc
+                                    Shape::Object(obj)
+                                }
+                                // num + num
+                                (Shape::Number(n1), Shape::Number(n2)) => match (n1, n2) {
+                                    (None, None) => Shape::Number(None),
+                                    (Some(n1), None) | (None, Some(n1)) => Shape::Number(Some(n1)),
+                                    (Some(n1), Some(n2)) => Shape::Number(Some(n1 + n2)),
+                                },
+                                (Shape::Number(_), Shape::TVar(t))
+                                | (Shape::TVar(t), Shape::Number(_)) => {
+                                    let current_shape = ctx.shapes.get(&t).unwrap().clone();
+                                    let current_shape = Shape::merge_shapes(
+                                        current_shape.clone(),
+                                        Shape::Number(None),
+                                        ctx,
+                                    );
+                                    ctx.shapes.insert(t, current_shape);
+
+                                    Shape::Number(None)
+                                }
+                                (l, r) => Shape::Mismatch(Box::new(l), Box::new(r)),
                             }
-                            (l, r) => {
-                                acc.push(Shape::Mismatch(Box::new(l), Box::new(r)));
-                                acc
-                            }
-                        }
-                    })
+                        })
+                        .collect()
                 }
                 crate::BinOp::Sub => {
                     let s1 = Shape::build_shape(l, shapes.clone(), ctx);
                     let s2 = Shape::build_shape(r, shapes, ctx);
 
-                    s1.into_iter().zip(s2).fold(vec![], |mut acc, (l, r)| {
-                        log::debug!("computing {l} - {r}");
-                        match (l, r) {
-                            // arr - arr
-                            (Shape::Array(shape1, u1), Shape::Array(shape2, u2)) => {
-                                let shape = Shape::merge_shapes(*shape1, *shape2, ctx);
-                                let u = u1.max(u2);
+                    s1.into_iter()
+                        .zip(s2)
+                        .map(|(l, r)| {
+                            log::debug!("computing {l} - {r}");
+                            match (l, r) {
+                                // arr - arr
+                                (Shape::Array(shape1, u1), Shape::Array(shape2, u2)) => {
+                                    let shape = Shape::merge_shapes(*shape1, *shape2, ctx);
+                                    let u = u1.max(u2);
 
-                                acc.push(Shape::Array(Box::new(shape), u));
-                                acc
-                            }
-                            (Shape::Array(shape, u), Shape::TVar(t))
-                            | (Shape::TVar(t), Shape::Array(shape, u)) => {
-                                let current_shape = ctx.shapes.get(&t).unwrap().clone();
-                                let current_shape = Shape::merge_shapes(
-                                    current_shape,
-                                    Shape::Array(shape.clone(), u),
-                                    ctx,
-                                );
-                                ctx.shapes.insert(t, current_shape);
-
-                                acc.push(Shape::Array(shape, u));
-                                acc
-                            }
-                            // num - num
-                            (Shape::Number(n1), Shape::Number(n2)) => {
-                                match (n1, n2) {
-                                    (None, None) => acc.push(Shape::Number(None)),
-                                    (Some(n1), None) | (None, Some(n1)) => {
-                                        acc.push(Shape::Number(Some(n1)))
-                                    }
-                                    (Some(n1), Some(n2)) => {
-                                        acc.push(Shape::Number(Some(n1 - n2)));
-                                    }
+                                    Shape::Array(Box::new(shape), u)
                                 }
-                                acc
-                            }
-                            (Shape::Number(_), Shape::TVar(t))
-                            | (Shape::TVar(t), Shape::Number(_)) => {
-                                let current_shape = ctx.shapes.get(&t).unwrap().clone();
-                                let current_shape = Shape::merge_shapes(
-                                    current_shape.clone(),
-                                    Shape::Number(None),
-                                    ctx,
-                                );
-                                ctx.shapes.insert(t, current_shape);
+                                (Shape::Array(shape, u), Shape::TVar(t))
+                                | (Shape::TVar(t), Shape::Array(shape, u)) => {
+                                    let current_shape = ctx.shapes.get(&t).unwrap().clone();
+                                    let current_shape = Shape::merge_shapes(
+                                        current_shape,
+                                        Shape::Array(shape.clone(), u),
+                                        ctx,
+                                    );
+                                    ctx.shapes.insert(t, current_shape);
 
-                                acc.push(Shape::Number(None));
-                                acc
+                                    Shape::Array(shape, u)
+                                }
+                                // num - num
+                                (Shape::Number(n1), Shape::Number(n2)) => match (n1, n2) {
+                                    (None, None) => Shape::Number(None),
+                                    (Some(n1), None) | (None, Some(n1)) => Shape::Number(Some(n1)),
+                                    (Some(n1), Some(n2)) => Shape::Number(Some(n1 - n2)),
+                                },
+                                (Shape::Number(_), Shape::TVar(t))
+                                | (Shape::TVar(t), Shape::Number(_)) => {
+                                    let current_shape = ctx.shapes.get(&t).unwrap().clone();
+                                    let current_shape = Shape::merge_shapes(
+                                        current_shape.clone(),
+                                        Shape::Number(None),
+                                        ctx,
+                                    );
+                                    ctx.shapes.insert(t, current_shape);
+
+                                    Shape::Number(None)
+                                }
+                                (l, r) => {
+                                    log::debug!("mismatch: {l} - {r}");
+                                    Shape::Mismatch(Box::new(l), Box::new(r))
+                                }
                             }
-                            (l, r) => {
-                                log::debug!("mismatch: {l} - {r}");
-                                acc.push(Shape::Mismatch(Box::new(l), Box::new(r)));
-                                acc
-                            }
-                        }
-                    })
+                        })
+                        .collect()
                 }
                 crate::BinOp::Mul => {
                     let s1 = Shape::build_shape(l, shapes.clone(), ctx);
@@ -707,7 +683,10 @@ impl Shape {
                                     let current_shape = ctx.shapes.get(&t).unwrap().clone();
                                     let current_shape = Shape::merge_shapes(
                                         current_shape.clone(),
-                                        Shape::Union(vec![Shape::Number(None), Shape::String(None)]),
+                                        Shape::Union(vec![
+                                            Shape::Number(None),
+                                            Shape::String(None),
+                                        ]),
                                         ctx,
                                     );
                                     ctx.shapes.insert(t, current_shape);
@@ -1035,7 +1014,7 @@ impl Shape {
                 } else {
                     mismatches.into_iter().next().flatten()
                 }
-            },
+            }
         }
     }
 

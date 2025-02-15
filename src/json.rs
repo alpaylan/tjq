@@ -12,6 +12,13 @@ pub enum Json {
 
 impl PartialOrd for Json {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Eq for Json {}
+impl Ord for Json {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // JSON values are ordered as follows:
         // null
         // false
@@ -21,49 +28,42 @@ impl PartialOrd for Json {
         // arrays, in lexical order
         // objects
         match (self, other) {
-            (Json::Null, Json::Null) => Some(std::cmp::Ordering::Equal),
-            (Json::Null, _) => Some(std::cmp::Ordering::Less),
-            (_, Json::Null) => Some(std::cmp::Ordering::Greater),
-            (Json::Boolean(b1), Json::Boolean(b2)) => Some(b1.cmp(b2)),
-            (Json::Boolean(_), _) => Some(std::cmp::Ordering::Less),
-            (_, Json::Boolean(_)) => Some(std::cmp::Ordering::Greater),
-            (Json::Number(n1), Json::Number(n2)) => n1.partial_cmp(n2),
-            (Json::Number(_), _) => Some(std::cmp::Ordering::Less),
-            (_, Json::Number(_)) => Some(std::cmp::Ordering::Greater),
-            (Json::String(s1), Json::String(s2)) => s1.partial_cmp(s2),
-            (Json::String(_), _) => Some(std::cmp::Ordering::Less),
-            (_, Json::String(_)) => Some(std::cmp::Ordering::Greater),
+            (Json::Null, Json::Null) => std::cmp::Ordering::Equal,
+            (Json::Null, _) => std::cmp::Ordering::Less,
+            (_, Json::Null) => std::cmp::Ordering::Greater,
+            (Json::Boolean(b1), Json::Boolean(b2)) => b1.cmp(b2),
+            (Json::Boolean(_), _) => std::cmp::Ordering::Less,
+            (_, Json::Boolean(_)) => std::cmp::Ordering::Greater,
+            (Json::Number(n1), Json::Number(n2)) => n1.partial_cmp(n2).unwrap(),
+            (Json::Number(_), _) => std::cmp::Ordering::Less,
+            (_, Json::Number(_)) => std::cmp::Ordering::Greater,
+            (Json::String(s1), Json::String(s2)) => s1.cmp(s2),
+            (Json::String(_), _) => std::cmp::Ordering::Less,
+            (_, Json::String(_)) => std::cmp::Ordering::Greater,
             (Json::Array(a1), Json::Array(a2)) => {
                 for (j1, j2) in a1.iter().zip(a2.iter()) {
-                    match j1.partial_cmp(j2) {
-                        Some(std::cmp::Ordering::Equal) => continue,
+                    match j1.cmp(j2) {
+                        std::cmp::Ordering::Equal => continue,
                         other => return other,
                     }
                 }
-                a1.len().partial_cmp(&a2.len())
+                a1.len().cmp(&a2.len())
             }
-            (Json::Array(_), _) => Some(std::cmp::Ordering::Less),
-            (_, Json::Array(_)) => Some(std::cmp::Ordering::Greater),
+            (Json::Array(_), _) => std::cmp::Ordering::Less,
+            (_, Json::Array(_)) => std::cmp::Ordering::Greater,
             (Json::Object(o1), Json::Object(o2)) => {
                 for ((k1, j1), (k2, j2)) in o1.iter().zip(o2.iter()) {
                     match k1.cmp(k2) {
-                        std::cmp::Ordering::Equal => match j1.partial_cmp(j2) {
-                            Some(std::cmp::Ordering::Equal) => continue,
+                        std::cmp::Ordering::Equal => match j1.cmp(j2) {
+                            std::cmp::Ordering::Equal => continue,
                             other => return other,
                         },
-                        other => return Some(other),
+                        other => return other,
                     }
                 }
-                o1.len().partial_cmp(&o2.len())
+                o1.len().cmp(&o2.len())
             }
         }
-    }
-}
-
-impl Eq for Json {}
-impl Ord for Json {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.partial_cmp(other).unwrap()
     }
 }
 
