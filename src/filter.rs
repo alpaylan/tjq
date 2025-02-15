@@ -215,39 +215,87 @@ impl Filter {
                 let rs = Filter::filter(json, r);
 
                 itertools::iproduct!(ls, rs)
-                    .map(|(l, r)| match (l, r) {
-                        (Ok(Json::Number(l)), Ok(Json::Number(r))) => match bin_op {
-                            BinOp::Add => Ok(Json::Number(l + r)),
-                            BinOp::Sub => Ok(Json::Number(l - r)),
-                            BinOp::Mul => Ok(Json::Number(l * r)),
-                            BinOp::Div => Ok(Json::Number(l / r)),
-                            BinOp::Mod => Ok(Json::Number(l % r)),
-                            BinOp::Eq => Ok(Json::Boolean(l == r)),
-                            BinOp::Ne => Ok(Json::Boolean(l != r)),
-                            BinOp::Gt => Ok(Json::Boolean(l > r)),
-                            BinOp::Ge => Ok(Json::Boolean(l >= r)),
-                            BinOp::Lt => Ok(Json::Boolean(l < r)),
-                            BinOp::Le => Ok(Json::Boolean(l <= r)),
-                            _ => Err(JQError::OpTypeError(
-                                Json::Number(l),
-                                *bin_op,
-                                Json::Number(r),
-                            )),
+                    .map(|(l, r)| match bin_op {
+                        BinOp::Add => match (l, r) {
+                            (Ok(Json::Number(l)), Ok(Json::Number(r))) => Ok(Json::Number(l + r)),
+                            (Ok(Json::String(l)), Ok(Json::String(r))) => {
+                                Ok(Json::String(format!("{}{}", l, r)))
+                            }
+                            (Ok(Json::Array(l)), Ok(Json::Array(r))) => {
+                                Ok(Json::Array([l, r].concat()))
+                            }
+                            (Ok(Json::Object(l)), Ok(Json::Object(r))) => {
+                                Ok(Json::Object([l, r].concat()))
+                            }
+                            (Ok(l), Ok(r)) => Err(JQError::OpTypeError(l, *bin_op, r)),
+                            (Err(err), _) => Err(err),
+                            (_, Err(err)) => Err(err),
                         },
-                        (Ok(Json::Boolean(l)), Ok(Json::Boolean(r))) => match bin_op {
-                            BinOp::Eq => Ok(Json::Boolean(l == r)),
-                            BinOp::Ne => Ok(Json::Boolean(l != r)),
-                            BinOp::And => Ok(Json::Boolean(l && r)),
-                            BinOp::Or => Ok(Json::Boolean(l || r)),
-                            _ => Err(JQError::OpTypeError(
-                                Json::Boolean(l),
-                                *bin_op,
-                                Json::Boolean(r),
+                        BinOp::Sub => match (l, r) {
+                            (Ok(Json::Number(l)), Ok(Json::Number(r))) => Ok(Json::Number(l - r)),
+                            (Ok(Json::Array(l)), Ok(Json::Array(r))) => Ok(Json::Array(
+                                l.iter().filter(|x| !r.contains(x)).cloned().collect(),
                             )),
+                            (Ok(l), Ok(r)) => Err(JQError::OpTypeError(l, *bin_op, r)),
+                            (Err(err), _) => Err(err),
+                            (_, Err(err)) => Err(err),
                         },
-                        (Ok(l), Ok(r)) => Err(JQError::OpTypeError(l, *bin_op, r)),
-                        (Err(err), _) => Err(err),
-                        (_, Err(err)) => Err(err),
+                        BinOp::Mul => match (l, r) {
+                            (Ok(Json::Number(l)), Ok(Json::Number(r))) => Ok(Json::Number(l * r)),
+                            (Ok(Json::String(s)), Ok(Json::Number(n)))
+                            | (Ok(Json::Number(n)), Ok(Json::String(s))) => {
+                                Ok(Json::String(s.repeat(n as usize)))
+                            }
+                            (Ok(Json::Array(l)), Ok(Json::Number(r))) => Ok(Json::Array(
+                                l.iter().cycle().take(r as usize).cloned().collect(),
+                            )),
+                            (Ok(Json::Number(l)), Ok(Json::Array(r))) => Ok(Json::Array(
+                                r.iter().cycle().take(l as usize).cloned().collect(),
+                            )),
+                            (Ok(l), Ok(r)) => Err(JQError::OpTypeError(l, *bin_op, r)),
+                            (Err(err), _) => Err(err),
+                            (_, Err(err)) => Err(err),
+                        },
+                        BinOp::Div => match (l, r) {
+                            (Ok(Json::Number(l)), Ok(Json::Number(r))) => Ok(Json::Number(l / r)),
+                            (Ok(l), Ok(r)) => Err(JQError::OpTypeError(l, *bin_op, r)),
+                            (Err(err), _) | (_, Err(err)) => Err(err),
+                        },
+                        BinOp::Mod => match (l, r) {
+                            (Ok(Json::Number(l)), Ok(Json::Number(r))) => Ok(Json::Number(l % r)),
+                            (Ok(l), Ok(r)) => Err(JQError::OpTypeError(l, *bin_op, r)),
+                            (Err(err), _) | (_, Err(err)) => Err(err),
+                        },
+                        BinOp::Eq => match (l, r) {
+                            (Ok(l), Ok(r)) => Ok(Json::Boolean(l == r)),
+                            (Err(err), _) | (_, Err(err)) => Err(err),
+                        },
+                        BinOp::Ne => match (l, r) {
+                            (Ok(l), Ok(r)) => Ok(Json::Boolean(l != r)),
+                            (Err(err), _) | (_, Err(err)) => Err(err),
+                        },
+                        BinOp::Gt => match (l, r) {
+                            (Ok(l), Ok(r)) => Ok(Json::Boolean(l > r)),
+                            (Err(err), _) => Err(err),
+                            (_, Err(err)) => Err(err),
+                        },
+                        BinOp::Ge => match (l, r) {
+                            (Ok(l), Ok(r)) => Ok(Json::Boolean(l >= r)),
+                            (Err(err), _) => Err(err),
+                            (_, Err(err)) => Err(err),
+                        },
+                        BinOp::Lt => match (l, r) {
+                            (Ok(l), Ok(r)) => Ok(Json::Boolean(l < r)),
+                            (Err(err), _) => Err(err),
+                            (_, Err(err)) => Err(err),
+                        },
+                        BinOp::Le => match (l, r) {
+                            (Ok(l), Ok(r)) => Ok(Json::Boolean(l <= r)),
+                            (Err(err), _) => Err(err),
+                            (_, Err(err)) => Err(err),
+                        },
+                        BinOp::And => todo!(),
+                        BinOp::Or => todo!(),
                     })
                     .collect::<Vec<_>>()
             }

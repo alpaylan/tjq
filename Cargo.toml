@@ -6,4 +6,6 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.95"
 itertools = "0.13.0"
+log = "0.4.25"
 topological-sort = "0.2.2"
+tracing-subscriber = "0.3.19"

@@ -13,18 +13,12 @@ fn parse(input: &str) -> Filter {
 
 fn main() {
     let filter = Filter::Pipe(
-        Box::new(Filter::Pipe(
-            Box::new(Filter::ArrayIterator),
-            Box::new(Filter::Comma(
-                Box::new(Filter::ObjIndex("age".to_string())),
-                Box::new(Filter::ObjIndex("name".to_string())),
-            )),
+        Box::new(Filter::ArrayIterator),
+        Box::new(Filter::BinOp(
+            Box::new(Filter::ObjIndex("age".to_string())),
+            BinOp::Mul,
+            Box::new(Filter::Number(30.0)),
         )),
-        Box::new(Filter::Object(vec![(
-            Filter::String("v".to_string()),
-            // Filter::Dot,
-            Filter::ObjIndex("a".to_string()),
-        )])),
     );
 
     let json = Json::Array(vec![
@@ -35,7 +29,8 @@ fn main() {
             ),
             (
                 "age".to_string(),
-                Json::Object(vec![("a".to_string(), Json::Number(25.0))]),
+                // Json::Object(vec![("a".to_string(), Json::Number(25.0))]),
+                Json::String("alp".to_string()),
             ),
         ]),
         Json::Object(vec![
@@ -60,7 +55,7 @@ fn main() {
         }
     }
 
-    let s = Shape::new(&filter);
+    let (s, results) = Shape::new(&filter);
 
     println!("Shape: {}", s);
 
