@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fmt::{self, Display, Formatter},
     vec,
 };
@@ -24,6 +25,8 @@ pub enum Filter {
     BinOp(Box<Filter>, BinOp, Box<Filter>), // <f_1> <op> <f_2>
     Empty,                                  // Empty
     Error(Option<String>),                  // Error, Error("message")
+    Call(String, Option<Vec<Filter>>),      // <s>(<f_1>, <f_2>...)
+    IfThenElse(Box<Filter>, Box<Filter>, Box<Filter>), // if <f_1> then <f_2> else <f_3>
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +85,23 @@ impl Display for Filter {
             Filter::Empty => write!(f, "empty"),
             Filter::Error(None) => write!(f, "error"),
             Filter::Error(Some(s)) => write!(f, "error(\"{}\")", s),
+            Filter::Call(name, filters) => {
+                write!(f, "{}", name)?;
+                if let Some(filters) = filters {
+                    write!(f, "(")?;
+                    for (i, filter) in filters.iter().enumerate() {
+                        if i != 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{}", filter)?;
+                    }
+                    write!(f, ")")?;
+                }
+                Ok(())
+            }
+            Filter::IfThenElse(filter, filter1, filter2) => {
+                write!(f, "if {} then {} else {} end", filter, filter1, filter2)
+            }
         }
     }
 }
@@ -107,15 +127,23 @@ impl Display for BinOp {
 }
 
 impl Filter {
-    pub fn filter(json: &Json, filter: &Filter) -> Vec<Result<Json, JQError>> {
+    pub fn filter(
+        json: &Json,
+        filter: &Filter,
+        filters: &HashMap<String, Filter>,
+    ) -> Vec<Result<Json, JQError>> {
         match filter {
             Filter::Dot => vec![Ok(json.clone())],
-            Filter::Pipe(f1, f2) => Filter::filter(json, f1)
+            Filter::Pipe(f1, f2) => Filter::filter(json, f1, filters)
                 .into_iter()
-                .flat_map(|result| result.map(|json| Filter::filter(&json, f2)))
+                .flat_map(|result| result.map(|json| Filter::filter(&json, f2, filters)))
                 .flatten()
                 .collect::<Vec<_>>(),
-            Filter::Comma(f1, f2) => [Filter::filter(json, f1), Filter::filter(json, f2)].concat(),
+            Filter::Comma(f1, f2) => [
+                Filter::filter(json, f1, filters),
+                Filter::filter(json, f2, filters),
+            ]
+            .concat(),
             Filter::ObjIndex(s) => vec![match json {
                 Json::Object(obj) => Ok(obj
                     .iter()
@@ -146,7 +174,7 @@ impl Filter {
             Filter::Array(arr) => {
                 let results = arr
                     .iter()
-                    .flat_map(|f| Filter::filter(json, f))
+                    .flat_map(|f| Filter::filter(json, f, filters))
                     .collect::<Vec<_>>();
                 let (results, errs): (Vec<_>, Vec<_>) =
                     results.into_iter().partition(Result::is_ok);
@@ -162,7 +190,12 @@ impl Filter {
             Filter::Object(obj) => {
                 let results: Vec<(Vec<Result<Json, JQError>>, Vec<Result<Json, JQError>>)> = obj
                     .iter()
-                    .map(|(f1, f2)| (Filter::filter(json, f1), Filter::filter(json, f2)))
+                    .map(|(f1, f2)| {
+                        (
+                            Filter::filter(json, f1, filters),
+                            Filter::filter(json, f2, filters),
+                        )
+                    })
                     .collect();
 
                 let results = results
@@ -211,8 +244,8 @@ impl Filter {
                 }
             }
             Filter::BinOp(l, bin_op, r) => {
-                let ls = Filter::filter(json, l);
-                let rs = Filter::filter(json, r);
+                let ls = Filter::filter(json, l, filters);
+                let rs = Filter::filter(json, r, filters);
 
                 itertools::iproduct!(ls, rs)
                     .map(|(l, r)| match bin_op {
@@ -301,6 +334,32 @@ impl Filter {
             }
             Filter::Empty => todo!(),
             Filter::Error(_) => todo!(),
+            Filter::Call(name, filters_) => {
+                match filters_ {
+                    Some(_) => todo!("Call with arguments is not implemented"),
+                    None => {
+                        let filter = filters.get(name).unwrap();
+                        Filter::filter(json, filter, filters)
+                    }
+                }
+            },
+            Filter::IfThenElse(filter, filter1, filter2) => {
+                let results = Filter::filter(json, filter, filters);
+                results
+                    .into_iter()
+                    .map(|result| {
+                        result.map(|json_| {
+                            if let Json::Boolean(true) = json_ {
+                                Filter::filter(json, filter1, filters)
+                            } else {
+                                Filter::filter(json, filter2, filters)
+                            }
+                        })
+                    })
+                    .flatten()
+                    .flatten()
+                    .collect()
+            },
         }
     }
 }
@@ -318,7 +377,7 @@ mod tests {
             Box::new(Filter::Number(2.0)),
         );
 
-        let results = Filter::filter(&json, &filter);
+        let results = Filter::filter(&json, &filter, &Default::default());
 
         assert_eq!(results, vec![Ok(Json::Number(3.0))]);
     }
@@ -332,7 +391,7 @@ mod tests {
             Box::new(Filter::Number(2.0)),
         );
 
-        let results = Filter::filter(&json, &filter);
+        let results = Filter::filter(&json, &filter, &Default::default());
 
         assert_eq!(results, vec![Ok(Json::Number(-1.0))]);
     }

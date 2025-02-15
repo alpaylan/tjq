@@ -186,12 +186,12 @@ fn toposort(dependencies: HashMap<String, Vec<String>>) -> TopologicalSort<Strin
 }
 
 impl Shape {
-    pub fn new(f: &Filter) -> (Shape, Vec<Shape>) {
+    pub fn new(f: &Filter, filters: &HashMap<String, Filter>) -> (Shape, Vec<Shape>) {
         let mut ctx = ShapeContext::new();
         ctx.shapes
             .insert("I".to_string(), Shape::TVar("I".to_string()));
 
-        let mut results = Shape::build_shape(f, vec![Shape::TVar("I".to_string())], &mut ctx);
+        let mut results = Shape::build_shape(f, vec![Shape::TVar("I".to_string())], &mut ctx, filters);
         log::debug!("type context: {:?}", ctx.shapes);
         log::debug!("result types: {:?}", results);
         ctx.normalize();
@@ -277,16 +277,16 @@ impl Shape {
         }
     }
 
-    pub fn build_shape(f: &Filter, shapes: Vec<Shape>, ctx: &mut ShapeContext) -> Vec<Shape> {
+    pub fn build_shape(f: &Filter, shapes: Vec<Shape>, ctx: &mut ShapeContext, filters: &HashMap<String, Filter>) -> Vec<Shape> {
         match f {
             Filter::Dot => shapes,
             Filter::Pipe(f1, f2) => {
-                let shapes = Shape::build_shape(f1, shapes, ctx);
-                Shape::build_shape(f2, shapes, ctx)
+                let shapes = Shape::build_shape(f1, shapes, ctx, filters);
+                Shape::build_shape(f2, shapes, ctx, filters)
             }
             Filter::Comma(f1, f2) => {
-                let s1 = Shape::build_shape(f1, shapes.clone(), ctx);
-                let s2 = Shape::build_shape(f2, shapes, ctx);
+                let s1 = Shape::build_shape(f1, shapes.clone(), ctx, filters);
+                let s2 = Shape::build_shape(f2, shapes, ctx, filters);
                 [s1, s2].concat()
             }
             Filter::ObjIndex(s) => shapes
@@ -461,7 +461,7 @@ impl Shape {
                     let shapes_: Vec<Shape> = vec
                         .iter()
                         // todo: could we just pass shapes inside????
-                        .flat_map(|f| Shape::build_shape(f, vec![shape.clone()], ctx))
+                        .flat_map(|f| Shape::build_shape(f, vec![shape.clone()], ctx, filters))
                         .collect();
 
                     Shape::Tuple(shapes_)
@@ -474,11 +474,11 @@ impl Shape {
                         vec.iter()
                             .map(|(f1, f2)| {
                                 (
-                                    Shape::build_shape(f1, vec![shape.clone()], ctx)
+                                    Shape::build_shape(f1, vec![shape.clone()], ctx, filters)
                                         .first()
                                         .expect("expect 1 shape only")
                                         .to_string(),
-                                    Shape::build_shape(f2, vec![shape.clone()], ctx)
+                                    Shape::build_shape(f2, vec![shape.clone()], ctx, filters)
                                         .first()
                                         .expect("expect 1 shape only")
                                         .clone(),
@@ -490,8 +490,8 @@ impl Shape {
                 .collect(),
             Filter::BinOp(l, op, r) => match op {
                 crate::BinOp::Add => {
-                    let s1 = Shape::build_shape(l, shapes.clone(), ctx);
-                    let s2 = Shape::build_shape(r, shapes, ctx);
+                    let s1 = Shape::build_shape(l, shapes.clone(), ctx, filters);
+                    let s2 = Shape::build_shape(r, shapes, ctx, filters);
 
                     s1.into_iter()
                         .zip(s2)
@@ -604,8 +604,8 @@ impl Shape {
                         .collect()
                 }
                 crate::BinOp::Sub => {
-                    let s1 = Shape::build_shape(l, shapes.clone(), ctx);
-                    let s2 = Shape::build_shape(r, shapes, ctx);
+                    let s1 = Shape::build_shape(l, shapes.clone(), ctx, filters);
+                    let s2 = Shape::build_shape(r, shapes, ctx, filters);
 
                     s1.into_iter()
                         .zip(s2)
@@ -658,8 +658,8 @@ impl Shape {
                         .collect()
                 }
                 crate::BinOp::Mul => {
-                    let s1 = Shape::build_shape(l, shapes.clone(), ctx);
-                    let s2 = Shape::build_shape(r, shapes, ctx);
+                    let s1 = Shape::build_shape(l, shapes.clone(), ctx, filters);
+                    let s2 = Shape::build_shape(r, shapes, ctx, filters);
 
                     s1.into_iter()
                         .zip(s2)
@@ -699,8 +699,8 @@ impl Shape {
                         .collect()
                 }
                 crate::BinOp::Div | crate::BinOp::Mod => {
-                    let s1 = Shape::build_shape(l, shapes.clone(), ctx);
-                    let s2 = Shape::build_shape(r, shapes, ctx);
+                    let s1 = Shape::build_shape(l, shapes.clone(), ctx, filters);
+                    let s2 = Shape::build_shape(r, shapes, ctx, filters);
 
                     s1.into_iter()
                         .zip(s2)
@@ -741,8 +741,8 @@ impl Shape {
                 | crate::BinOp::Or
                 | crate::BinOp::Eq
                 | crate::BinOp::Ne => {
-                    let s1 = Shape::build_shape(l, shapes.clone(), ctx);
-                    let s2 = Shape::build_shape(r, shapes, ctx);
+                    let s1 = Shape::build_shape(l, shapes.clone(), ctx, filters);
+                    let s2 = Shape::build_shape(r, shapes, ctx, filters);
 
                     s1.into_iter()
                         .zip(s2)
@@ -757,6 +757,33 @@ impl Shape {
             },
             Filter::Empty => todo!(),
             Filter::Error(_) => todo!(),
+            Filter::Call(name, filters_) => {
+                match filters_ {
+                    Some(_) => todo!("call with args is not supported yet"),
+                    None => {
+                        let filter = filters.get(name).expect("filter not found");
+                        Shape::build_shape(filter, shapes, ctx, filters)
+                    }
+                }
+            },
+            Filter::IfThenElse(filter, filter1, filter2) => {
+                let s = Shape::build_shape(filter, shapes.clone(), ctx, filters);
+                let s1 = Shape::build_shape(filter1, shapes.clone(), ctx, filters);
+                let s2 = Shape::build_shape(filter2, shapes, ctx, filters);
+
+                s.into_iter()
+                    .zip(s1)
+                    .zip(s2)
+                    .map(|((s, s1), s2)| {
+                        match (s, s1, s2) {
+                            (Shape::Bool(Some(true)), s1, _) => s1,
+                            (Shape::Bool(Some(false)), _, s2) => s2,
+                            (Shape::Bool(None), s1, s2) => Shape::Union(vec![s1, s2]),
+                            (s, _, _) => Shape::Mismatch(Box::new(s), Box::new(Shape::Bool(None))),
+                        }
+                    })
+                    .collect()
+            },
         }
     }
 
@@ -1063,6 +1090,8 @@ impl Shape {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use crate::{BinOp, Filter, Json, Shape, ShapeMismatch};
 
     #[test]
@@ -1074,7 +1103,7 @@ mod tests {
             Box::new(Filter::Dot),
         );
         println!("{filter}");
-        let (shape, results) = Shape::new(&filter);
+        let (shape, results) = Shape::new(&filter, &HashMap::new());
         println!("{shape}");
         let results = shape.check(json, vec![]);
 
@@ -1097,7 +1126,7 @@ mod tests {
             )),
         );
         println!("{filter}");
-        let (shape, results) = Shape::new(&filter);
+        let (shape, results) = Shape::new(&filter, &HashMap::new());
         let mismatch = shape.check_self(vec![]);
         println!("{shape}");
         assert_eq!(
@@ -1119,10 +1148,10 @@ mod tests {
             Box::new(Filter::Number(2.0)),
         );
         println!("{filter}");
-        let results = Filter::filter(&json, &filter);
+        let results = Filter::filter(&json, &filter, &HashMap::new());
         assert_eq!(results, vec![Ok(Json::Number(-1.0))]);
 
-        let (shape, results) = Shape::new(&filter);
+        let (shape, results) = Shape::new(&filter, &HashMap::new());
         println!("{shape}");
         assert_eq!(shape, Shape::Blob);
         assert_eq!(results, vec![Shape::Number(Some(-1.0))]);
@@ -1136,7 +1165,7 @@ mod tests {
             BinOp::Sub,
             Box::new(Filter::ObjIndex("a".to_string())),
         );
-        let (shape, results) = Shape::new(&filter);
+        let (shape, results) = Shape::new(&filter, &HashMap::new());
         println!("{shape}");
         assert_eq!(
             shape,
@@ -1153,7 +1182,7 @@ mod tests {
             BinOp::Sub,
             Box::new(Filter::ObjIndex("a".to_string())),
         );
-        let (shape, results) = Shape::new(&filter);
+        let (shape, results) = Shape::new(&filter, &HashMap::new());
         println!("{shape}");
         assert_eq!(shape, Shape::Object(vec![("a".to_string(), Shape::Blob)]));
         assert_eq!(
