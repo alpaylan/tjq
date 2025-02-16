@@ -191,7 +191,8 @@ impl Shape {
         ctx.shapes
             .insert("I".to_string(), Shape::TVar("I".to_string()));
 
-        let mut results = Shape::build_shape(f, vec![Shape::TVar("I".to_string())], &mut ctx, filters);
+        let mut results =
+            Shape::build_shape(f, vec![Shape::TVar("I".to_string())], &mut ctx, filters);
         log::debug!("type context: {:?}", ctx.shapes);
         log::debug!("result types: {:?}", results);
         ctx.normalize();
@@ -277,7 +278,12 @@ impl Shape {
         }
     }
 
-    pub fn build_shape(f: &Filter, shapes: Vec<Shape>, ctx: &mut ShapeContext, filters: &HashMap<String, Filter>) -> Vec<Shape> {
+    pub fn build_shape(
+        f: &Filter,
+        shapes: Vec<Shape>,
+        ctx: &mut ShapeContext,
+        filters: &HashMap<String, Filter>,
+    ) -> Vec<Shape> {
         match f {
             Filter::Dot => shapes,
             Filter::Pipe(f1, f2) => {
@@ -757,13 +763,11 @@ impl Shape {
             },
             Filter::Empty => todo!(),
             Filter::Error(_) => todo!(),
-            Filter::Call(name, filters_) => {
-                match filters_ {
-                    Some(_) => todo!("call with args is not supported yet"),
-                    None => {
-                        let filter = filters.get(name).expect("filter not found");
-                        Shape::build_shape(filter, shapes, ctx, filters)
-                    }
+            Filter::Call(name, filters_) => match filters_ {
+                Some(_) => todo!("call with args is not supported yet"),
+                None => {
+                    let filter = filters.get(name).expect("filter not found");
+                    Shape::build_shape(filter, shapes, ctx, filters)
                 }
             },
             Filter::IfThenElse(filter, filter1, filter2) => {
@@ -774,16 +778,14 @@ impl Shape {
                 s.into_iter()
                     .zip(s1)
                     .zip(s2)
-                    .map(|((s, s1), s2)| {
-                        match (s, s1, s2) {
-                            (Shape::Bool(Some(true)), s1, _) => s1,
-                            (Shape::Bool(Some(false)), _, s2) => s2,
-                            (Shape::Bool(None), s1, s2) => Shape::Union(vec![s1, s2]),
-                            (s, _, _) => Shape::Mismatch(Box::new(s), Box::new(Shape::Bool(None))),
-                        }
+                    .map(|((s, s1), s2)| match (s, s1, s2) {
+                        (Shape::Bool(Some(true)), s1, _) => s1,
+                        (Shape::Bool(Some(false)), _, s2) => s2,
+                        (Shape::Bool(None), s1, s2) => Shape::Union(vec![s1, s2]),
+                        (s, _, _) => Shape::Mismatch(Box::new(s), Box::new(Shape::Bool(None))),
                     })
                     .collect()
-            },
+            }
         }
     }
 
@@ -1092,7 +1094,7 @@ impl Shape {
 mod tests {
     use std::collections::HashMap;
 
-    use crate::{BinOp, Filter, Json, Shape, ShapeMismatch};
+    use crate::{filter::builtin_filters, BinOp, Filter, Json, Shape, ShapeMismatch};
 
     #[test]
     fn test_plus() {
@@ -1187,7 +1189,57 @@ mod tests {
         assert_eq!(shape, Shape::Object(vec![("a".to_string(), Shape::Blob)]));
         assert_eq!(
             results[0],
-            Shape::Mismatch(Box::new(Shape::String(None)), Box::new(Shape::Number(None)))
+            Shape::Mismatch(
+                Box::new(Shape::String(Some("x".to_string()))),
+                Box::new(Shape::Blob)
+            )
         );
+    }
+
+    #[test]
+    fn test_abs() {
+        let filter = Filter::Call("abs".to_string(), None);
+
+        let (shape, results) = Shape::new(&filter, &builtin_filters());
+        assert_eq!(
+            shape,
+            Shape::Union(vec![Shape::Number(None), Shape::String(None)])
+        );
+        // todo: enable this after implementing union type normalization
+        // assert_eq!(
+        //     results,
+        //     vec![Shape::Union(vec![Shape::Number(None), Shape::String(None)])]
+        // );
+    }
+
+    #[test]
+    fn test_isboolean() {
+        let filter = Filter::Call("isboolean".to_string(), None);
+
+        let (shape, results) = Shape::new(&filter, &builtin_filters());
+        assert_eq!(shape, Shape::Blob);
+        assert_eq!(results, vec![Shape::Bool(None)]);
+    }
+
+    #[test]
+    fn test_type() {
+        let filter = Filter::Call("type".to_string(), None);
+
+        let (shape, results) = Shape::new(&filter, &builtin_filters());
+
+        assert_eq!(shape, Shape::Blob);
+
+        // todo: enable this after implementing union type normalization
+        // assert_eq!(
+        //     results,
+        //     vec![Shape::Union(vec![
+        //         Shape::String(Some("null".to_string())),
+        //         Shape::String(Some("boolean".to_string())),
+        //         Shape::String(Some("number".to_string())),
+        //         Shape::String(Some("string".to_string())),
+        //         Shape::String(Some("array".to_string())),
+        //         Shape::String(Some("object".to_string()))
+        //     ])]
+        // );
     }
 }

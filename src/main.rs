@@ -1,5 +1,4 @@
 mod error;
-use std::collections::HashMap;
 
 use error::*;
 mod filter;
@@ -11,27 +10,6 @@ use shape::*;
 
 fn parse(input: &str) -> Filter {
     todo!()
-}
-
-fn default_filters() -> HashMap<String, Filter> {
-    let id = ("id".to_string(), Filter::Dot);
-    let abs = (
-        "abs".to_string(),
-        Filter::IfThenElse(
-            Box::new(Filter::BinOp(
-                Box::new(Filter::Dot),
-                BinOp::Lt,
-                Box::new(Filter::Number(0.0)),
-            )),
-            Box::new(Filter::BinOp(
-                Box::new(Filter::Dot),
-                BinOp::Mul,
-                Box::new(Filter::Number(-1.0)),
-            )),
-            Box::new(Filter::Dot),
-        ),
-    );
-    HashMap::from_iter(vec![id, abs])
 }
 
 fn main() {
@@ -58,14 +36,10 @@ fn main() {
         ]),
     ]);
 
-    let filter = Filter::Call("abs".to_string(), None);
-
-    let json = Json::Number(-10.0);
-
     println!("Input: {}", json);
     println!("Filter: {}", filter);
 
-    let results = Filter::filter(&json, &filter, &default_filters());
+    let results = Filter::filter(&json, &filter, &builtin_filters());
 
     for result in results {
         match result {
@@ -78,12 +52,16 @@ fn main() {
         }
     }
 
-    let (s, results) = Shape::new(&filter, &default_filters());
+    let (s, results) = Shape::new(&filter, &builtin_filters());
 
     println!("Shape: {}", s);
     println!(
         "Result shapes: {}",
-        results.iter().map(Shape::to_string).collect::<Vec<_>>().join(", ")
+        results
+            .iter()
+            .map(Shape::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
     );
     // Check internal type mismatches in the shape
     println!("Running internal type checking...");

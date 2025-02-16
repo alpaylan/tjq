@@ -10,6 +10,16 @@ pub enum Json {
     Object(Vec<(String, Json)>),
 }
 
+impl Json {
+    pub fn boolify(&self) -> bool {
+        match self {
+            Json::Boolean(b) => *b,
+            Json::Null => false,
+            _ => true,
+        }
+    }
+}
+
 impl PartialOrd for Json {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
