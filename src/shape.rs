@@ -1,4 +1,5 @@
 use std::{
+    cmp::Ordering,
     collections::HashMap,
     fmt::{self, Display, Formatter},
 };
@@ -19,7 +20,7 @@ pub enum Shape {
     Tuple(Vec<Shape>),
     Object(Vec<(String, Shape)>),
     Mismatch(Box<Shape>, Box<Shape>),
-    Union(Vec<Shape>),
+    Union(Box<Shape>, Box<Shape>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -106,15 +107,7 @@ impl Display for Shape {
                 write!(f, "}}")
             }
             Shape::Mismatch(s1, s2) => write!(f, "({s1} >< {s2})"),
-            Shape::Union(shapes) => write!(
-                f,
-                "({})",
-                shapes
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect::<Vec<String>>()
-                    .join(" | ")
-            ),
+            Shape::Union(s1, s2) => write!(f, "({s1} | {s2})"),
         }
     }
 }
@@ -185,6 +178,14 @@ fn toposort(dependencies: HashMap<String, Vec<String>>) -> TopologicalSort<Strin
     ts
 }
 
+#[derive(Debug, Copy, Clone, PartialEq)]
+enum Subtyping {
+    Equal,
+    Subtype,
+    Supertype,
+    Incompatible,
+}
+
 impl Shape {
     pub fn new(f: &Filter, filters: &HashMap<String, Filter>) -> (Shape, Vec<Shape>) {
         let mut ctx = ShapeContext::new();
@@ -198,7 +199,7 @@ impl Shape {
         ctx.normalize();
 
         for result in results.iter_mut() {
-            *result = result.normalize(&ctx.shapes);
+            *result = result.normalize(&ctx.shapes).canonicalize();
         }
 
         (ctx.shapes.remove("I").unwrap(), results)
@@ -215,12 +216,11 @@ impl Shape {
             Shape::Array(shape, _) => shape.dependencies(),
             Shape::Tuple(tuple) => tuple.iter().flat_map(|s| s.dependencies()).collect(),
             Shape::Object(obj) => obj.iter().flat_map(|(_, s)| s.dependencies()).collect(),
-            Shape::Mismatch(s1, s2) => s1
+            Shape::Mismatch(s1, s2) | Shape::Union(s1, s2) => s1
                 .dependencies()
                 .into_iter()
                 .chain(s2.dependencies())
                 .collect(),
-            Shape::Union(shapes) => shapes.iter().flat_map(|s| s.dependencies()).collect(),
         }
     }
 
@@ -257,9 +257,234 @@ impl Shape {
                 Box::new(s1.normalize(shapes)),
                 Box::new(s2.normalize(shapes)),
             ),
-            Shape::Union(shapes_) => {
-                Shape::Union(shapes_.iter().map(|s| s.normalize(shapes)).collect())
+            Shape::Union(s1, s2) => Shape::Union(
+                Box::new(s1.normalize(shapes)),
+                Box::new(s2.normalize(shapes)),
+            ),
+        }
+    }
+
+    pub fn subtype(&self, other: &Self) -> Subtyping {
+        match (self, other) {
+            (Shape::TVar(t), _) | (_, Shape::TVar(t)) => {
+                // TVar can be any type, so it should not be a subtype of any other type
+                Subtyping::Incompatible
             }
+            (Shape::Null, Shape::Null) => Subtyping::Equal,
+            (Shape::Blob, Shape::Blob) => Subtyping::Equal,
+            (Shape::Bool(b1), Shape::Bool(b2)) => match (b1, b2) {
+                (Some(b1), Some(b2)) if b1 == b2 => Subtyping::Equal,
+                (Some(_), None) => Subtyping::Supertype,
+                (None, Some(_)) => Subtyping::Subtype,
+                (None, None) => Subtyping::Equal,
+                _ => Subtyping::Incompatible,
+            },
+            (Shape::Number(n1), Shape::Number(n2)) => match (n1, n2) {
+                (Some(n1), Some(n2)) if n1 == n2 => Subtyping::Equal,
+                (Some(_), None) => Subtyping::Supertype,
+                (None, Some(_)) => Subtyping::Subtype,
+                (None, None) => Subtyping::Equal,
+                _ => Subtyping::Incompatible,
+            },
+            (Shape::String(s1), Shape::String(s2)) => match (s1, s2) {
+                (Some(s1), Some(s2)) if s1 == s2 => Subtyping::Equal,
+                (Some(_), None) => Subtyping::Supertype,
+                (None, Some(_)) => Subtyping::Subtype,
+                (None, None) => Subtyping::Equal,
+                _ => Subtyping::Incompatible,
+            },
+            (Shape::Array(shape1, u1), Shape::Array(shape2, u2)) => {
+                let inner_subtyping = shape1.subtype(shape2);
+                let outer_subtyping = match (u1, u2) {
+                    // Larger arrays can be used in place of smaller arrays, so the smaller array is the supertype
+                    (Some(u1), Some(u2)) => match u1.cmp(u2) {
+                        Ordering::Less => Subtyping::Supertype,
+                        Ordering::Greater => Subtyping::Subtype,
+                        Ordering::Equal => Subtyping::Equal,
+                    },
+                    (None, Some(_)) => Subtyping::Supertype,
+                    (Some(_), None) => Subtyping::Subtype,
+                    (None, None) => Subtyping::Equal,
+                };
+
+                match (inner_subtyping, outer_subtyping) {
+                    (Subtyping::Equal, Subtyping::Equal) => Subtyping::Equal,
+                    (Subtyping::Subtype, Subtyping::Subtype)
+                    | (Subtyping::Subtype, Subtyping::Equal)
+                    | (Subtyping::Equal, Subtyping::Subtype) => Subtyping::Subtype,
+                    (Subtyping::Supertype, Subtyping::Supertype)
+                    | (Subtyping::Supertype, Subtyping::Equal)
+                    | (Subtyping::Equal, Subtyping::Supertype) => Subtyping::Supertype,
+                    (Subtyping::Incompatible, _)
+                    | (_, Subtyping::Incompatible)
+                    | (Subtyping::Subtype, Subtyping::Supertype)
+                    | (Subtyping::Supertype, Subtyping::Subtype) => Subtyping::Incompatible,
+                }
+            }
+            (Shape::Array(shape, u), Shape::Tuple(shapes)) => {
+                // If `shape` is a subtype of all elements in `shapes`
+                // and `u` is greater than `shapes.len()`, then array is a subtype of the tuple
+                // because for any place that expects the tuple, we can use the array instead.
+                let inner_subtyping = shapes.iter().all(|s| {
+                    if let Subtyping::Subtype | Subtyping::Equal = shape.subtype(s) {
+                        true
+                    } else {
+                        false
+                    }
+                });
+
+                if inner_subtyping && u.unwrap_or(0) >= shapes.len() {
+                    return Subtyping::Subtype;
+                }
+
+                // If `shape` is a supertype of all elements in `shapes`
+                // and `u` is less than `shapes.len()`, then array is a supertype of the tuple
+                // because for any place that expects the array, we can use the tuple instead.
+                let inner_subtyping = shapes.iter().all(|s| {
+                    if let Subtyping::Supertype | Subtyping::Equal = shape.subtype(s) {
+                        true
+                    } else {
+                        false
+                    }
+                });
+
+                if inner_subtyping && u.unwrap_or(0) <= shapes.len() {
+                    return Subtyping::Supertype;
+                }
+
+                Subtyping::Incompatible
+            }
+            (Shape::Tuple(shapes), Shape::Array(shape, u)) => {
+                todo!("should be the reverse of the above")
+            }
+            (Shape::Tuple(shapes1), Shape::Tuple(shapes2)) => {
+                let subtypings = shapes1
+                    .iter()
+                    .zip(shapes2)
+                    .map(|(s1, s2)| s1.subtype(s2))
+                    .collect::<Vec<_>>();
+
+                if subtypings
+                    .iter()
+                    .all(|s| *s == Subtyping::Equal || *s == Subtyping::Subtype)
+                    && shapes1.len() >= shapes2.len()
+                {
+                    Subtyping::Subtype
+                } else if subtypings
+                    .iter()
+                    .all(|s| *s == Subtyping::Equal || *s == Subtyping::Supertype)
+                    && shapes1.len() <= shapes2.len()
+                {
+                    Subtyping::Supertype
+                } else {
+                    Subtyping::Incompatible
+                }
+            }
+            (Shape::Object(obj1), Shape::Object(obj2)) => {
+                let mut subtypings = vec![];
+
+                for (k, s1) in obj1 {
+                    let s2 = obj2.iter().find(|(key, _)| key == k).map(|(_, s)| s);
+
+                    if let Some(s2) = s2 {
+                        subtypings.push(s1.subtype(s2));
+                    } else {
+                        subtypings.push(Subtyping::Subtype);
+                    }
+                }
+
+                for (k, s2) in obj2 {
+                    let s1 = obj1.iter().find(|(key, _)| key == k).map(|(_, s)| s);
+
+                    if let Some(s1) = s1 {
+                        subtypings.push(s1.subtype(s2));
+                    } else {
+                        subtypings.push(Subtyping::Supertype);
+                    }
+                }
+
+                if subtypings
+                    .iter()
+                    .all(|s| *s == Subtyping::Equal || *s == Subtyping::Subtype)
+                {
+                    Subtyping::Subtype
+                } else if subtypings
+                    .iter()
+                    .all(|s| *s == Subtyping::Equal || *s == Subtyping::Supertype)
+                {
+                    Subtyping::Supertype
+                } else {
+                    Subtyping::Incompatible
+                }
+            }
+            (Shape::Mismatch(s1, s2), _) | (_, Shape::Mismatch(s1, s2)) => Subtyping::Incompatible,
+            (Shape::Union(s1, s2), s) | (s, Shape::Union(s1, s2)) => {
+                match (s1.subtype(s), s2.subtype(s)) {
+                    (Subtyping::Equal, Subtyping::Equal) => Subtyping::Equal,
+                    (Subtyping::Subtype, Subtyping::Subtype)
+                    | (Subtyping::Subtype, Subtyping::Equal)
+                    | (Subtyping::Equal, Subtyping::Subtype) => Subtyping::Subtype,
+                    (Subtyping::Supertype, Subtyping::Supertype)
+                    | (Subtyping::Supertype, Subtyping::Equal)
+                    | (Subtyping::Equal, Subtyping::Supertype) => Subtyping::Supertype,
+                    _ => Subtyping::Incompatible,
+                }
+            }
+            _ => Subtyping::Incompatible,
+        }
+    }
+
+    pub fn canonicalize(&self) -> Shape {
+        match self {
+            Shape::TVar(_)
+            | Shape::Blob
+            | Shape::Null
+            | Shape::Bool(_)
+            | Shape::Number(_)
+            | Shape::String(_) => self.clone(),
+            Shape::Array(shape, u) => Shape::Array(Box::new(shape.canonicalize()), *u),
+            Shape::Tuple(shapes) => {
+                Shape::Tuple(shapes.iter().map(|s| s.canonicalize()).collect::<Vec<_>>())
+            }
+            Shape::Object(items) => Shape::Object(
+                items
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.canonicalize()))
+                    .collect::<Vec<_>>(),
+            ),
+            Shape::Mismatch(s1, s2) => {
+                Shape::Mismatch(Box::new(s1.canonicalize()), Box::new(s2.canonicalize()))
+            }
+            Shape::Union(s1, s2) => match (*s1.clone(), *s2.clone()) {
+                (Shape::Union(s2, s3), s1) | (s1, Shape::Union(s2, s3)) => {
+                    let s1 = s1.canonicalize();
+                    let s2 = s2.canonicalize();
+                    let s3 = s3.canonicalize();
+                    match (s1.subtype(&s2), s1.subtype(&s3)) {
+                        (Subtyping::Equal, _)
+                        | (_, Subtyping::Equal)
+                        | (Subtyping::Subtype, _)
+                        | (_, Subtyping::Subtype) => {
+                            Shape::Union(Box::new(s2), Box::new(s3)).canonicalize()
+                        }
+                        (Subtyping::Supertype, _) => {
+                            Shape::Union(Box::new(s1), Box::new(s3)).canonicalize()
+                        }
+                        (_, Subtyping::Supertype) => {
+                            Shape::Union(Box::new(s1), Box::new(s2)).canonicalize()
+                        }
+                        (Subtyping::Incompatible, Subtyping::Incompatible) => Shape::Union(
+                            Box::new(s1),
+                            Box::new(Shape::Union(Box::new(s2), Box::new(s3))),
+                        ),
+                    }
+                }
+                (s1, s2) => {
+                    let s1 = s1.canonicalize();
+                    let s2 = s2.canonicalize();
+                    Shape::Union(Box::new(s1), Box::new(s2))
+                }
+            },
         }
     }
 
@@ -284,6 +509,7 @@ impl Shape {
         ctx: &mut ShapeContext,
         filters: &HashMap<String, Filter>,
     ) -> Vec<Shape> {
+        println!("building shape for {f}");
         match f {
             Filter::Dot => shapes,
             Filter::Pipe(f1, f2) => {
@@ -351,7 +577,7 @@ impl Shape {
                         Shape::Object(obj)
                     }
                     Shape::Mismatch(s1, s2) => todo!(),
-                    Shape::Union(shapes) => todo!(),
+                    Shape::Union(s1, s2) => todo!(),
                 })
                 .collect(),
             Filter::ArrayIndex(u) => shapes
@@ -407,7 +633,7 @@ impl Shape {
                         Box::new(Shape::Array(Box::new(Shape::Blob), Some(*u))),
                     ),
                     Shape::Mismatch(s1, s2) => todo!(),
-                    Shape::Union(shapes) => todo!(),
+                    Shape::Union(s1, s2) => todo!(),
                 })
                 .collect(),
             Filter::ArrayIterator => shapes
@@ -453,7 +679,7 @@ impl Shape {
                     Shape::Tuple(vec) => vec,
                     Shape::Object(vec) => vec.into_iter().map(|(_, shape)| shape).collect(),
                     Shape::Mismatch(s1, s2) => todo!(),
-                    Shape::Union(shapes) => todo!(),
+                    Shape::Union(s1, s2) => todo!(),
                 })
                 .collect(),
             Filter::Null => vec![Shape::Null],
@@ -469,8 +695,16 @@ impl Shape {
                         // todo: could we just pass shapes inside????
                         .flat_map(|f| Shape::build_shape(f, vec![shape.clone()], ctx, filters))
                         .collect();
-
-                    Shape::Tuple(shapes_)
+                    println!("type context: {:?}", ctx.shapes);
+                    let merged = shapes_.iter().fold(Shape::Blob, |acc, s| {
+                        Shape::merge_shapes(acc, s.clone(), ctx)
+                    });
+                    if let Shape::Mismatch(_, _) = merged {
+                        println!("mismatch: {merged}");
+                        Shape::Tuple(shapes_)
+                    } else {
+                        Shape::Array(Box::new(merged), None)
+                    }
                 })
                 .collect(),
             Filter::Object(vec) => shapes
@@ -680,8 +914,11 @@ impl Shape {
                                 },
                                 (Shape::Number(n), Shape::String(s))
                                 | (Shape::String(s), Shape::Number(n)) => match (n, s) {
-                                    (None, None) => Shape::Number(None),
-                                    (Some(_), None) | (None, Some(_)) => Shape::Number(None),
+                                    (None, None) => Shape::Union(
+                                        Box::new(Shape::String(None)),
+                                        Box::new(Shape::Number(None)),
+                                    ),
+                                    (Some(_), None) | (None, Some(_)) => Shape::String(None),
                                     (Some(n), Some(s)) => Shape::String(Some(s.repeat(n as usize))),
                                 },
                                 (Shape::Number(_), Shape::TVar(t))
@@ -689,10 +926,10 @@ impl Shape {
                                     let current_shape = ctx.shapes.get(&t).unwrap().clone();
                                     let current_shape = Shape::merge_shapes(
                                         current_shape.clone(),
-                                        Shape::Union(vec![
-                                            Shape::Number(None),
-                                            Shape::String(None),
-                                        ]),
+                                        Shape::Union(
+                                            Box::new(Shape::Number(None)),
+                                            Box::new(Shape::String(None)),
+                                        ),
                                         ctx,
                                     );
                                     ctx.shapes.insert(t, current_shape);
@@ -764,9 +1001,25 @@ impl Shape {
             Filter::Empty => todo!(),
             Filter::Error(_) => todo!(),
             Filter::Call(name, filters_) => match filters_ {
-                Some(_) => todo!("call with args is not supported yet"),
+                Some(args) => {
+                    println!("calling {name} with {:?}", args);
+                    let filter = filters
+                        .get(name)
+                        .expect(format!("filter {name} not found").as_str());
+                    if let Filter::Bound(vars, filter) = filter {
+                        let mut filter = *filter.clone();
+                        for (var, arg) in vars.iter().zip(args.iter()) {
+                            println!("substituting {var} with {arg} for {filter}");
+                            filter = filter.substitute(var, arg);
+                        }
+                        Shape::build_shape(&filter, shapes, ctx, filters)
+                    } else {
+                        panic!("expected bound filter, found '{}'", filter);
+                    }
+                    // Shape::build_shape(filter, shapes, ctx, filters)
+                }
                 None => {
-                    let filter = filters.get(name).expect("filter not found");
+                    let filter = filters.get(name).unwrap_or(&Filter::Dot);
                     Shape::build_shape(filter, shapes, ctx, filters)
                 }
             },
@@ -781,16 +1034,21 @@ impl Shape {
                     .map(|((s, s1), s2)| match (s, s1, s2) {
                         (Shape::Bool(Some(true)), s1, _) => s1,
                         (Shape::Bool(Some(false)), _, s2) => s2,
-                        (Shape::Bool(None), s1, s2) => Shape::Union(vec![s1, s2]),
+                        (Shape::Bool(None), s1, s2) => Shape::Union(Box::new(s1), Box::new(s2)),
                         (s, _, _) => Shape::Mismatch(Box::new(s), Box::new(Shape::Bool(None))),
                     })
                     .collect()
+            }
+            Filter::Bound(items, filter) => {
+                // todo: understand this better
+                Shape::build_shape(filter, shapes, ctx, filters)
             }
         }
     }
 
     pub fn merge_shapes(s1: Shape, s2: Shape, ctx: &mut ShapeContext) -> Shape {
         match (s1, s2) {
+            (Shape::Blob, s) | (s, Shape::Blob) => s,
             (Shape::TVar(t), s) | (s, Shape::TVar(t)) => {
                 let current_shape = ctx.shapes.get(&t).unwrap().clone();
                 match current_shape {
@@ -1033,11 +1291,12 @@ impl Shape {
                 }
             }
             Shape::Mismatch(s1, s2) => Some(ShapeMismatch::new(path, *s1.clone(), *s2.clone())),
-            Shape::Union(shapes) => {
-                let (matches, mismatches): (Vec<_>, Vec<_>) = shapes
+            Shape::Union(s1, s2) => {
+                let (matches, mismatches): (Vec<_>, Vec<_>) = vec![s1, s2]
                     .iter()
                     .map(|s| Shape::check(s, j.clone(), path.clone()))
                     .partition(Option::is_none);
+
                 if !matches.is_empty() {
                     None
                 } else {
@@ -1078,8 +1337,8 @@ impl Shape {
                 mismatches.into_iter().next().flatten()
             }
             Shape::Mismatch(s1, s2) => Some(ShapeMismatch::new(path, *s1.clone(), *s2.clone())),
-            Shape::Union(shapes) => {
-                let (_, mismatches): (Vec<_>, Vec<_>) = shapes
+            Shape::Union(s1, s2) => {
+                let (_, mismatches): (Vec<_>, Vec<_>) = vec![s1, s2]
                     .iter()
                     .map(|s| s.check_self(path.clone()))
                     .partition(Option::is_none);
@@ -1150,7 +1409,7 @@ mod tests {
             Box::new(Filter::Number(2.0)),
         );
         println!("{filter}");
-        let results = Filter::filter(&json, &filter, &HashMap::new());
+        let results = Filter::filter(&json, &filter, &HashMap::new(), &mut Default::default());
         assert_eq!(results, vec![Ok(Json::Number(-1.0))]);
 
         let (shape, results) = Shape::new(&filter, &HashMap::new());
@@ -1203,7 +1462,7 @@ mod tests {
         let (shape, results) = Shape::new(&filter, &builtin_filters());
         assert_eq!(
             shape,
-            Shape::Union(vec![Shape::Number(None), Shape::String(None)])
+            Shape::Union(Box::new(Shape::Number(None)), Box::new(Shape::String(None)))
         );
         // todo: enable this after implementing union type normalization
         // assert_eq!(
@@ -1229,17 +1488,108 @@ mod tests {
 
         assert_eq!(shape, Shape::Blob);
 
-        // todo: enable this after implementing union type normalization
-        // assert_eq!(
-        //     results,
-        //     vec![Shape::Union(vec![
-        //         Shape::String(Some("null".to_string())),
-        //         Shape::String(Some("boolean".to_string())),
-        //         Shape::String(Some("number".to_string())),
-        //         Shape::String(Some("string".to_string())),
-        //         Shape::String(Some("array".to_string())),
-        //         Shape::String(Some("object".to_string()))
-        //     ])]
-        // );
+        assert_eq!(
+            results,
+            vec![Shape::Union(
+                Box::new(Shape::String(Some("null".to_string()))),
+                Box::new(Shape::Union(
+                    Box::new(Shape::String(Some("boolean".to_string()))),
+                    Box::new(Shape::Union(
+                        Box::new(Shape::String(Some("number".to_string()))),
+                        Box::new(Shape::Union(
+                            Box::new(Shape::String(Some("string".to_string()))),
+                            Box::new(Shape::Union(
+                                Box::new(Shape::String(Some("array".to_string()))),
+                                Box::new(Shape::String(Some("object".to_string())))
+                            ))
+                        ))
+                    ))
+                ))
+            )]
+        );
+    }
+
+    #[test]
+    fn test_map1() {
+        let filter = Filter::Call(
+            "map".to_string(),
+            Some(vec![Filter::Call("abs".to_string(), None)]),
+        );
+
+        let (shape, results) = Shape::new(&filter, &builtin_filters());
+        assert_eq!(
+            shape,
+            Shape::Array(
+                Box::new(Shape::Union(
+                    Box::new(Shape::Number(None)),
+                    Box::new(Shape::String(None))
+                )),
+                None
+            )
+        );
+        assert_eq!(
+            results,
+            vec![Shape::Array(
+                Box::new(Shape::Union(
+                    Box::new(Shape::Number(None)),
+                    Box::new(Shape::String(None))
+                )),
+                None
+            )]
+        );
+    }
+
+    #[test]
+    fn test_map2() {
+        let json = Json::Array(vec![Json::Number(-1.0), Json::Number(2.0)]);
+        let filter = Filter::Call(
+            "map".to_string(),
+            Some(vec![Filter::Bound(
+                vec![],
+                Box::new(Filter::BinOp(
+                    Box::new(Filter::Dot),
+                    BinOp::Mul,
+                    Box::new(Filter::Number(2.0)),
+                )),
+            )]),
+        );
+
+        let results = Filter::filter(&json, &filter, &builtin_filters(), &mut Default::default());
+
+        assert_eq!(
+            results,
+            vec![Ok(Json::Array(vec![Json::Number(-2.0), Json::Number(4.0)]))]
+        );
+    }
+
+    #[test]
+    fn test_map3() {
+        let json = Json::Array(vec![
+            Json::Array(vec![Json::Number(-1.0), Json::Number(-2.0)]),
+            Json::Array(vec![Json::Number(3.0), Json::Number(4.0)]),
+        ]);
+        println!("Input: {}", json);
+        let filter = Filter::Call(
+            "map".to_string(),
+            Some(vec![Filter::Call(
+                "map".to_string(),
+                Some(vec![Filter::Call("abs".to_string(), None)]),
+            )]),
+        );
+        println!("Filter: {}", filter);
+
+        let results = Filter::filter(&json, &filter, &builtin_filters(), &mut Default::default());
+
+        assert_eq!(
+            results,
+            vec![Ok(Json::Array(vec![
+                Json::Array(vec![Json::Number(1.0), Json::Number(2.0)]),
+                Json::Array(vec![Json::Number(3.0), Json::Number(4.0)]),
+            ]))]
+        );
+
+        for result in results {
+            println!("Result: {}", result.unwrap());
+        }
     }
 }

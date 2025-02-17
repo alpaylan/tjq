@@ -39,7 +39,7 @@ fn main() {
     println!("Input: {}", json);
     println!("Filter: {}", filter);
 
-    let results = Filter::filter(&json, &filter, &builtin_filters());
+    let results = Filter::filter(&json, &filter, &builtin_filters(), &mut Default::default());
 
     for result in results {
         match result {

@@ -9,6 +9,7 @@ pub enum JQError {
     ArrIteratorForNonIterable(Json),
     NonStringObjectKey(Json),
     OpTypeError(Json, BinOp, Json),
+    FilterNotDefined(String, usize),
     Unknown,
 }
 
@@ -49,6 +50,9 @@ impl Display for JQError {
                 )
             }
             JQError::Unknown => write!(f, "Unknown error"),
+            JQError::FilterNotDefined(name, args) => {
+                write!(f, "{}/{} is not defined", name, args)
+            }
         }
     }
 }
