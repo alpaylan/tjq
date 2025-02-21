@@ -57,10 +57,14 @@ jobs:
           cargo build --release --target x86_64-apple-darwin
           cargo build --release --target aarch64-apple-darwin
 
-      - name: Upload macOS binaries
+      - name: Upload macOS x86_64 binary
         uses: actions/upload-artifact@v4
         with:
-          name: tjq-macos
-          path: |
-            target/x86_64-apple-darwin/release/tjq
-            target/aarch64-apple-darwin/release/tjq
+          name: tjq-macos-x86_64
+          path: target/x86_64-apple-darwin/release/tjq
+        
+      - name: Upload macOS aarch64 binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: tjq-macos-aarch64
+          path: target/aarch64-apple-darwin/release/tjq
