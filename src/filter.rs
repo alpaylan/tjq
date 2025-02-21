@@ -320,7 +320,11 @@ impl Filter {
                                 (Json::Number(l), Json::Number(r)) => Ok(Json::Number(l * r)),
                                 (Json::String(s), Json::Number(n))
                                 | (Json::Number(n), Json::String(s)) => {
-                                    Ok(Json::String(s.repeat(n as usize)))
+                                    if n < 0.0 {
+                                        Ok(Json::Null)
+                                    } else {
+                                        Ok(Json::String(s.repeat(n as usize)))
+                                    }
                                 }
                                 (Json::Array(l), Json::Number(r)) => Ok(Json::Array(
                                     l.iter().cycle().take(r as usize).cloned().collect(),

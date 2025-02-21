@@ -483,7 +483,11 @@ impl Shape {
                 (s1, s2) => {
                     let s1 = s1.canonicalize();
                     let s2 = s2.canonicalize();
-                    Shape::Union(Box::new(s1), Box::new(s2))
+                    match s1.subtype(&s2) {
+                        Subtyping::Equal | Subtyping::Subtype => s2,
+                        Subtyping::Supertype => s1,
+                        Subtyping::Incompatible => Shape::Union(Box::new(s1), Box::new(s2)),
+                    }
                 }
             },
         }
@@ -966,8 +970,8 @@ impl Shape {
                                     (Some(_), None) | (None, Some(_)) => Shape::String(None),
                                     (Some(n), Some(s)) => Shape::String(Some(s.repeat(n as usize))),
                                 },
-                                (Shape::Number(_), Shape::TVar(t))
-                                | (Shape::TVar(t), Shape::Number(_)) => {
+                                (Shape::Number(n), Shape::TVar(t))
+                                | (Shape::TVar(t), Shape::Number(n)) => {
                                     let current_shape = ctx.shapes.get(&t).unwrap().clone();
                                     let current_shape = Shape::merge_shapes(
                                         current_shape.clone(),
@@ -979,7 +983,27 @@ impl Shape {
                                     );
                                     ctx.shapes.insert(t, current_shape);
 
-                                    Shape::Number(None)
+                                    if let Some(n) = n {
+                                        if n >= 0.0 {
+                                            Shape::Union(
+                                                Box::new(Shape::Number(None)),
+                                                Box::new(Shape::String(None)),
+                                            )
+                                        } else {
+                                            Shape::Union(
+                                                Box::new(Shape::Number(None)),
+                                                Box::new(Shape::Null),
+                                            )
+                                        }
+                                    } else {
+                                        Shape::Union(
+                                            Box::new(Shape::Union(
+                                                Box::new(Shape::Number(None)),
+                                                Box::new(Shape::String(None)),
+                                            )),
+                                            Box::new(Shape::Null),
+                                        )
+                                    }
                                 }
                                 (l, r) => Shape::Mismatch(Box::new(l), Box::new(r)),
                             }
@@ -1404,7 +1428,7 @@ mod tests {
     use std::collections::HashMap;
 
     use crate::{
-        filter::builtin_filters, shape::Access, BinOp, Filter, Json, Shape, ShapeMismatch,
+        filter::builtin_filters, parse, shape::Access, BinOp, Filter, Json, Shape, ShapeMismatch,
     };
 
     #[test]
@@ -1551,16 +1575,10 @@ mod tests {
         let filter = Filter::Call("abs".to_string(), None);
 
         let (shape, results) = Shape::new(&filter, &builtin_filters());
-        assert_eq!(
-            shape,
-            Shape::Union(Box::new(Shape::Number(None)), Box::new(Shape::String(None)))
-        );
+        assert_eq!(shape, Shape::Number(None));
 
         assert_eq!(results.len(), 1);
-        assert_eq!(
-            results.first().unwrap(),
-            &Shape::Union(Box::new(Shape::Number(None)), Box::new(Shape::String(None)))
-        );
+        assert_eq!(results.first().unwrap().canonicalize(), Shape::Number(None));
     }
 
     #[test]
@@ -1628,10 +1646,7 @@ mod tests {
         let json3 = Json::Array(vec![Json::Number(-1.0), Json::String("world".to_string())]);
         let json4 = Json::Array(vec![Json::String("hello".to_string()), Json::Boolean(true)]);
 
-        let filter = Filter::Call(
-            "map".to_string(),
-            Some(vec![Filter::Call("abs".to_string(), None)]),
-        );
+        let (_, filter) = parse("map(. * 2)");
 
         let (shape, results) = Shape::new(&filter, &builtin_filters());
         assert_eq!(
@@ -1772,13 +1787,7 @@ mod tests {
         assert_eq!(
             shape,
             Shape::Array(
-                Box::new(Shape::Array(
-                    Box::new(Shape::Union(
-                        Box::new(Shape::Number(None)),
-                        Box::new(Shape::String(None))
-                    )),
-                    None
-                )),
+                Box::new(Shape::Array(Box::new(Shape::Number(None)), None)),
                 None
             )
         );
@@ -1786,15 +1795,9 @@ mod tests {
         assert_eq!(results.len(), 1);
 
         assert_eq!(
-            results.first().unwrap(),
-            &Shape::Array(
-                Box::new(Shape::Array(
-                    Box::new(Shape::Union(
-                        Box::new(Shape::Number(None)),
-                        Box::new(Shape::String(None))
-                    )),
-                    None
-                )),
+            results.first().unwrap().canonicalize(),
+            Shape::Array(
+                Box::new(Shape::Array(Box::new(Shape::Number(None)), None)),
                 None
             )
         );
