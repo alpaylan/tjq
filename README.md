@@ -58,7 +58,7 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/alpaylan/tjq/releases/d
 You can then run the CLI with the following command:
 
 ```bash
-tjq --expression=".[] | .age, .name | {v: .a}" --input='[{"name": {"a": "John"}, "age": "alp"}, {"name": "Jane", "age": 30}]
+tjq --expression=".[] | .age, .name | {v: .a}" --input='[{"name": {"a": "John"}, "age": "alp"}, {"name": "Jane", "age": 30}]'
 ```
 
 The CLI currently only supports 4 flags:

@@ -484,11 +484,7 @@ pub fn builtin_filters() -> HashMap<String, Filter> {
                 BinOp::Lt,
                 Box::new(Filter::Number(0.0)),
             )),
-            Box::new(Filter::BinOp(
-                Box::new(Filter::Dot),
-                BinOp::Mul,
-                Box::new(Filter::Number(-1.0)),
-            )),
+            Box::new(Filter::UnOp(UnOp::Neg, Box::new(Filter::Dot))),
             Box::new(Filter::Dot),
         ),
     );

@@ -83,7 +83,7 @@ impl Display for Shape {
             Shape::Number(None) => write!(f, "<number>"),
             Shape::Number(Some(n)) => write!(f, "{n}"),
             Shape::String(None) => write!(f, "<string>"),
-            Shape::String(Some(s)) => write!(f, "{s}"),
+            Shape::String(Some(s)) => write!(f, "\"{s}\""),
             Shape::Array(shape, Some(n)) => write!(f, "[{shape} ; {n}]"),
             Shape::Array(shape, None) => write!(f, "[{shape}]"),
             Shape::Tuple(tuple) => {
