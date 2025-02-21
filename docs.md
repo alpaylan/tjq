@@ -1,5 +1,7 @@
 # Typed JQ
 
+note: This document is currently out of date, and will be updated soon.
+
 JQ is a successful tool for json manipulation.
 
 ```bash

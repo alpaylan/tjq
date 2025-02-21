@@ -105,8 +105,8 @@ pub(crate) fn parse_filter<'a>(
             s => Filter::Call(s.to_string(), None),
         },
         "variable" => {
-            log::warn!("todo: variable is not yet supported");
-            Filter::Dot
+            log::warn!("todo: variables are not yet supported");
+            unimplemented!("todo: variables are not yet supported")
         }
         "array" => Filter::Array(
             (1..root.child_count())
@@ -307,8 +307,8 @@ pub(crate) fn parse_filter<'a>(
         | "assignment_expression"
         | "field_expression"
         | "foreach_expression" => {
-            log::warn!("todo: function_expressions are not yet supported");
-            Filter::Dot
+            log::warn!("todo: {} are not yet supported", root.kind());
+            unimplemented!("todo: {} are not yet supported", root.kind());
         }
         _ => {
             log::warn!(
