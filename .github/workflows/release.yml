@@ -21,7 +21,7 @@ jobs:
       - name: Upload Linux binaries
         uses: actions/upload-artifact@v4
         with:
-          name: tjq-linux
+          name: tjq-x86_64-unknown-linux-gnu
           path: target/x86_64-unknown-linux-gnu/release/tjq
 
   build-windows:
@@ -39,7 +39,7 @@ jobs:
       - name: Upload Windows binary
         uses: actions/upload-artifact@v4
         with:
-          name: tjq-windows
+          name: tjq-x86_64-pc-windows-msvc
           path: target/x86_64-pc-windows-msvc/release/tjq.exe
 
 
@@ -60,11 +60,11 @@ jobs:
       - name: Upload macOS x86_64 binary
         uses: actions/upload-artifact@v4
         with:
-          name: tjq-macos-x86_64
+          name: tjq-x86_64-apple-darwin
           path: target/x86_64-apple-darwin/release/tjq
         
       - name: Upload macOS aarch64 binary
         uses: actions/upload-artifact@v4
         with:
-          name: tjq-macos-aarch64
+          name: tjq-aarch64-apple-darwin
           path: target/aarch64-apple-darwin/release/tjq

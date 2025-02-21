@@ -22,10 +22,11 @@ else
 fi
 
 LATEST_RELEASE=$(curl -s https://api.github.com/repos/$REPO/releases/latest | grep "tag_name" | cut -d '"' -f 4)
+LATEST_RELEASE="v0.0.1"
 
-URL="https://github.com/$REPO/releases/download/$LATEST_RELEASE/${BINARY_NAME}-${PLATFORM}.tar.gz"
+URL="https://github.com/$REPO/releases/download/$LATEST_RELEASE/${BINARY_NAME}-${PLATFORM}"
 echo "Downloading $BINARY_NAME from $URL..."
-curl -L $URL | tar xz
+curl -L $URL -o "$BINARY_NAME"
 
 chmod +x "$BINARY_NAME"
 sudo mv "$BINARY_NAME" "$INSTALL_DIR/$BINARY_NAME"
