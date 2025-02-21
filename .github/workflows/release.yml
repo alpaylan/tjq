@@ -12,7 +12,6 @@ jobs:
       matrix:
         target: 
           - x86_64-unknown-linux-gnu
-          - x86_64-pc-windows-msvc
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -41,6 +40,25 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust Windows target
+        run: rustup target add x86_64-pc-windows-msvc
+
+      - name: Build Windows binary
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Upload Windows binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: tjq-windows
+          path: target/x86_64-pc-windows-msvc/release/tjq.exe
+
+
   build-macos:
     runs-on: macos-latest
     steps:
@@ -58,7 +76,7 @@ jobs:
       - name: Upload macOS binaries
         uses: actions/upload-artifact@v4
         with:
-          name: yourbinary-macos
+          name: tjq-macos
           path: |
-            target/x86_64-apple-darwin/release/yourbinary
-            target/aarch64-apple-darwin/release/yourbinary
+            target/x86_64-apple-darwin/release/tjq
+            target/aarch64-apple-darwin/release/tjq
