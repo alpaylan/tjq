@@ -6,51 +6,85 @@ on:
       - "v*.*.*"  # Trigger on version tags like v1.0.0
 
 jobs:
-  build:
+  build-ubuntu:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        target: 
-          - x86_64-unknown-linux-gnu
-          - x86_64-apple-darwin
-          - aarch64-apple-darwin
-          - x86_64-pc-windows-msvc
     steps:
-      - name: Checkout Repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Cross
-        run: cargo install cross
+      - name: Install Rust
+        run: rustup target add x86_64-apple-darwin aarch64-apple-darwin
 
-      - name: Install Rust Targets
-        run: rustup target add ${{ matrix.target }}
-
-      - name: Build for ${{ matrix.target }}
-        run: cross build --release --target ${{ matrix.target }}
-
-      - name: Verify Binary Exists
+      - name: Build macOS binaries
         run: |
-          if [[ "${{ matrix.target }}" == "x86_64-pc-windows-msvc" ]]; then
-            ls -lh target/${{ matrix.target }}/release/tjq.exe
-          else
-            ls -lh target/${{ matrix.target }}/release/tjq
-          fi
+          cargo build --release --target x86_64-apple-darwin
+          cargo build --release --target aarch64-apple-darwin
 
-      - name: Package Binaries
-        run: |
-          if [[ "${{ matrix.target }}" == "x86_64-pc-windows-msvc" ]]; then
-            zip tjq-${{ matrix.target }}.zip target/${{ matrix.target }}/release/tjq.exe
-          else
-            tar -czvf tjq-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release tjq
-          fi
-        shell: bash
+      - name: Upload macOS binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: -macos
+          path: |
+            target/x86_64-apple-darwin/release/
+            target/aarch64-apple-darwin/release/
 
       - name: Upload Release Assets
         uses: softprops/action-gh-release@v1
         with:
-          files: |
-            tjq-*.tar.gz
-            tjq-*.zip
+          files: tjq-*.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust Windows target
+        run: rustup target add x86_64-pc-windows-msvc
+
+      - name: Build Windows binary
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Upload Windows binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: -windows
+          path: target/x86_64-pc-windows-msvc/release/.exe
+
+      - name: Upload Release Assets
+        uses: softprops/action-gh-release@v1
+        with:
+          files: tjq-*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup target add x86_64-apple-darwin aarch64-apple-darwin
+
+      - name: Build macOS binaries
+        run: |
+          cargo build --release --target x86_64-apple-darwin
+          cargo build --release --target aarch64-apple-darwin
+
+      - name: Upload macOS binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: -macos
+          path: |
+            target/x86_64-apple-darwin/release/
+            target/aarch64-apple-darwin/release/
+
+      - name: Upload Release Assets
+        uses: softprops/action-gh-release@v1
+        with:
+          files: tjq-*.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
