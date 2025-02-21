@@ -12,8 +12,6 @@ jobs:
       matrix:
         target: 
           - x86_64-unknown-linux-gnu
-          - x86_64-apple-darwin
-          - aarch64-apple-darwin
           - x86_64-pc-windows-msvc
     steps:
       - name: Checkout Repository
@@ -28,9 +26,9 @@ jobs:
       - name: Package Binaries
         run: |
           if [[ "${{ matrix.target }}" == "x86_64-pc-windows-msvc" ]]; then
-            zip yourbinary-${{ matrix.target }}.zip target/${{ matrix.target }}/release/yourbinary.exe
+            zip tjq-${{ matrix.target }}.zip target/${{ matrix.target }}/release/tjq.exe
           else
-            tar -czvf yourbinary-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release yourbinary
+            tar -czvf tjq-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release tjq
           fi
         shell: bash
 
@@ -42,3 +40,25 @@ jobs:
             tjq-*.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup target add x86_64-apple-darwin aarch64-apple-darwin
+
+      - name: Build macOS binaries
+        run: |
+          cargo build --release --target x86_64-apple-darwin
+          cargo build --release --target aarch64-apple-darwin
+
+      - name: Upload macOS binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: yourbinary-macos
+          path: |
+            target/x86_64-apple-darwin/release/yourbinary
+            target/aarch64-apple-darwin/release/yourbinary
