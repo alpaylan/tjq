@@ -47,4 +47,25 @@ As we process the jq program, we build up a `shape`, a semi-concrete JSON with h
 `[{age: {a: <>}, name: {a: <>}}]`. After we build up the shape, we can now compare the
 shape with the input to get global errors.
 
+## Installation of the CLI
+
+You can install the latest version of tjq by running the following command:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/alpaylan/tjq/releases/download/v0.0.1/tjq-installer.sh | sh
+```
+
+You can then run the CLI with the following command:
+
+```bash
+tjq --expression=".[] | .age, .name | {v: .a}" --input='[{"name": {"a": "John"}, "age": "alp"}, {"name": "Jane", "age": 30}]
+```
+
+The CLI currently only supports 4 flags:
+
+- (--expression) and (--path) for providing the jq program.
+- (--input) and (--input-path) for providing the input json.
+
+You can also use `--help` or `-h` to get more information about the flags.
+
 If the project is interesting to you, please checkout [docs.md](/docs.md), and leave a star!
