@@ -18,6 +18,23 @@ impl Json {
             _ => true,
         }
     }
+
+    pub fn from_serde_value(value: serde_json::Value) -> Self {
+        match value {
+            serde_json::Value::Null => Json::Null,
+            serde_json::Value::Bool(b) => Json::Boolean(b),
+            serde_json::Value::Number(n) => Json::Number(n.as_f64().unwrap()),
+            serde_json::Value::String(s) => Json::String(s),
+            serde_json::Value::Array(arr) => {
+                Json::Array(arr.into_iter().map(Json::from_serde_value).collect())
+            }
+            serde_json::Value::Object(obj) => Json::Object(
+                obj.into_iter()
+                    .map(|(k, v)| (k, Json::from_serde_value(v)))
+                    .collect(),
+            ),
+        }
+    }
 }
 
 impl PartialOrd for Json {

@@ -22,6 +22,7 @@ pub enum Filter {
     String(String),                                    // "abc"
     Array(Vec<Filter>),                                // [...]
     Object(Vec<(Filter, Filter)>),                     // {...}
+    UnOp(UnOp, Box<Filter>),                           // <op> <f>
     BinOp(Box<Filter>, BinOp, Box<Filter>),            // <f_1> <op> <f_2>
     Empty,                                             // Empty
     Error(Option<String>),                             // Error, Error("message")
@@ -45,6 +46,12 @@ pub enum BinOp {
     Le,  // <=
     And, // and
     Or,  // or
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnOp {
+    Neg, // -
+    Not, // not
 }
 
 impl Display for Filter {
@@ -79,6 +86,9 @@ impl Display for Filter {
                     write!(f, "{}: {}", key, value)?;
                 }
                 write!(f, "}}")
+            }
+            Filter::UnOp(un_op, filter) => {
+                write!(f, "{} {}", un_op, filter)
             }
             Filter::BinOp(filter, bin_op, filter1) => {
                 write!(f, "{} {} {}", filter, bin_op, filter1)
@@ -126,6 +136,15 @@ impl Display for BinOp {
             BinOp::Le => write!(f, "<="),
             BinOp::And => write!(f, "and"),
             BinOp::Or => write!(f, "or"),
+        }
+    }
+}
+
+impl Display for UnOp {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            UnOp::Neg => write!(f, "-"),
+            UnOp::Not => write!(f, "not"),
         }
     }
 }
@@ -250,6 +269,25 @@ impl Filter {
                     }
                 }
             }
+            Filter::UnOp(un_op, f) => {
+                let results = Filter::filter(json, f, filters, variable_ctx);
+                results
+                    .into_iter()
+                    .map(|result| match result {
+                        Ok(json) => match un_op {
+                            UnOp::Neg => match json {
+                                Json::Number(n) => Ok(Json::Number(-n)),
+                                _ => Err(JQError::UnOpTypeError(json, *un_op)),
+                            },
+                            UnOp::Not => match json {
+                                Json::Boolean(b) => Ok(Json::Boolean(!b)),
+                                _ => Err(JQError::UnOpTypeError(json, *un_op)),
+                            },
+                        },
+                        Err(err) => Err(err),
+                    })
+                    .collect()
+            }
             Filter::BinOp(l, bin_op, r) => {
                 let ls = Filter::filter(json, l, filters, variable_ctx);
                 let rs = Filter::filter(json, r, filters, variable_ctx);
@@ -269,14 +307,14 @@ impl Filter {
                                 (Json::Object(l), Json::Object(r)) => {
                                     Ok(Json::Object([l, r].concat()))
                                 }
-                                (l, r) => Err(JQError::OpTypeError(l, *bin_op, r)),
+                                (l, r) => Err(JQError::BinOpTypeError(l, *bin_op, r)),
                             },
                             BinOp::Sub => match (l, r) {
                                 (Json::Number(l), Json::Number(r)) => Ok(Json::Number(l - r)),
                                 (Json::Array(l), Json::Array(r)) => Ok(Json::Array(
                                     l.iter().filter(|x| !r.contains(x)).cloned().collect(),
                                 )),
-                                (l, r) => Err(JQError::OpTypeError(l, *bin_op, r)),
+                                (l, r) => Err(JQError::BinOpTypeError(l, *bin_op, r)),
                             },
                             BinOp::Mul => match (l, r) {
                                 (Json::Number(l), Json::Number(r)) => Ok(Json::Number(l * r)),
@@ -290,15 +328,15 @@ impl Filter {
                                 (Json::Number(l), Json::Array(r)) => Ok(Json::Array(
                                     r.iter().cycle().take(l as usize).cloned().collect(),
                                 )),
-                                (l, r) => Err(JQError::OpTypeError(l, *bin_op, r)),
+                                (l, r) => Err(JQError::BinOpTypeError(l, *bin_op, r)),
                             },
                             BinOp::Div => match (l, r) {
                                 (Json::Number(l), Json::Number(r)) => Ok(Json::Number(l / r)),
-                                (l, r) => Err(JQError::OpTypeError(l, *bin_op, r)),
+                                (l, r) => Err(JQError::BinOpTypeError(l, *bin_op, r)),
                             },
                             BinOp::Mod => match (l, r) {
                                 (Json::Number(l), Json::Number(r)) => Ok(Json::Number(l % r)),
-                                (l, r) => Err(JQError::OpTypeError(l, *bin_op, r)),
+                                (l, r) => Err(JQError::BinOpTypeError(l, *bin_op, r)),
                             },
                             BinOp::Eq => Ok(Json::Boolean(l == r)),
                             BinOp::Ne => Ok(Json::Boolean(l != r)),
@@ -312,7 +350,7 @@ impl Filter {
                     })
                     .collect::<Vec<_>>()
             }
-            Filter::Empty => todo!(),
+            Filter::Empty => vec![],
             Filter::Error(_) => todo!(),
             Filter::Call(name, filters_) => match filters_ {
                 Some(args) => {
@@ -399,13 +437,13 @@ impl Filter {
                 items
                     .iter()
                     .map(|(filter, filter1)| {
-                        (
-                            filter.substitute(var, arg),
-                            filter1.substitute(var, arg),
-                        )
+                        (filter.substitute(var, arg), filter1.substitute(var, arg))
                     })
                     .collect(),
             ),
+            Filter::UnOp(un_op, filter) => {
+                Filter::UnOp(*un_op, Box::new(filter.substitute(var, arg)))
+            }
             Filter::BinOp(filter, bin_op, filter1) => Filter::BinOp(
                 Box::new(filter.substitute(var, arg)),
                 *bin_op,
@@ -425,7 +463,7 @@ impl Filter {
                         }),
                     )
                 }
-            },
+            }
             Filter::IfThenElse(filter, filter1, filter2) => Filter::IfThenElse(
                 Box::new(filter.substitute(var, arg)),
                 Box::new(filter1.substitute(var, arg)),

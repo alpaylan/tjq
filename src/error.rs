@@ -1,6 +1,6 @@
 use std::fmt::{self, Display, Formatter};
 
-use crate::{BinOp, Json};
+use crate::{filter::UnOp, BinOp, Json};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum JQError {
@@ -8,7 +8,8 @@ pub enum JQError {
     ArrIndexForNonArray(Json, Json),
     ArrIteratorForNonIterable(Json),
     NonStringObjectKey(Json),
-    OpTypeError(Json, BinOp, Json),
+    BinOpTypeError(Json, BinOp, Json),
+    UnOpTypeError(Json, UnOp),
     FilterNotDefined(String, usize),
     Unknown,
 }
@@ -26,7 +27,7 @@ impl Display for JQError {
                 write!(f, "Cannot iterate over {}", json.debug())
             }
             JQError::NonStringObjectKey(json) => todo!(),
-            JQError::OpTypeError(json, bin_op, json1) => {
+            JQError::BinOpTypeError(json, bin_op, json1) => {
                 write!(
                     f,
                     "{} and {} cannot be {}",
@@ -52,6 +53,17 @@ impl Display for JQError {
             JQError::Unknown => write!(f, "Unknown error"),
             JQError::FilterNotDefined(name, args) => {
                 write!(f, "{}/{} is not defined", name, args)
+            }
+            JQError::UnOpTypeError(json, un_op) => {
+                write!(
+                    f,
+                    "{} cannot be {}",
+                    json.debug(),
+                    match un_op {
+                        UnOp::Neg => "negated",
+                        UnOp::Not => "inverted",
+                    }
+                )
             }
         }
     }

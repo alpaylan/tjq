@@ -5,7 +5,6 @@ use std::{
 };
 
 use topological_sort::TopologicalSort;
-use trace::trace;
 
 use crate::{Filter, Json};
 
@@ -50,7 +49,7 @@ pub struct ShapeMismatch {
 
 impl Display for ShapeMismatch {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        writeln!(f, "Shape mismatch detected!")?;
+        writeln!(f, "[x] shape mismatch detected!")?;
 
         write!(f, "\tat ")?;
         for path in self.path.iter() {
@@ -181,7 +180,7 @@ fn toposort(dependencies: HashMap<String, Vec<String>>) -> TopologicalSort<Strin
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
-enum Subtyping {
+pub enum Subtyping {
     Equal,
     Subtype,
     Supertype,
@@ -529,6 +528,7 @@ impl Shape {
                         let new_type_var = ctx.fresh();
                         ctx.shapes
                             .insert(new_type_var.clone(), Shape::TVar(new_type_var.clone()));
+                        // todo: check this
                         Shape::TVar(new_type_var)
                     }
                     Shape::TVar(t) => {
@@ -727,6 +727,42 @@ impl Shape {
                     )
                 })
                 .collect(),
+            Filter::UnOp(op, filter) => match op {
+                crate::UnOp::Not => {
+                    let s = Shape::build_shape(filter, shapes, ctx, filters);
+                    s.into_iter()
+                        .map(|s| match s {
+                            Shape::Bool(b) => Shape::Bool(b.map(|b| !b)),
+                            Shape::TVar(t) => {
+                                let current_shape = ctx.shapes.get(&t).unwrap().clone();
+                                let current_shape =
+                                    Shape::merge_shapes(current_shape, Shape::Bool(None), ctx);
+                                ctx.shapes.insert(t, current_shape);
+
+                                Shape::Bool(None)
+                            }
+                            s => Shape::Mismatch(Box::new(s), Box::new(Shape::Bool(None))),
+                        })
+                        .collect()
+                }
+                crate::UnOp::Neg => {
+                    let s = Shape::build_shape(filter, shapes, ctx, filters);
+                    s.into_iter()
+                        .map(|s| match s {
+                            Shape::Number(n) => Shape::Number(n.map(|n| -n)),
+                            Shape::TVar(t) => {
+                                let current_shape = ctx.shapes.get(&t).unwrap().clone();
+                                let current_shape =
+                                    Shape::merge_shapes(current_shape, Shape::Number(None), ctx);
+                                ctx.shapes.insert(t, current_shape);
+
+                                Shape::Number(None)
+                            }
+                            s => Shape::Mismatch(Box::new(s), Box::new(Shape::Number(None))),
+                        })
+                        .collect()
+                }
+            },
             Filter::BinOp(l, op, r) => match op {
                 crate::BinOp::Add => {
                     let s1 = Shape::build_shape(l, shapes.clone(), ctx, filters);
@@ -1007,7 +1043,7 @@ impl Shape {
                         .collect()
                 }
             },
-            Filter::Empty => todo!(),
+            Filter::Empty => vec![],
             Filter::Error(_) => todo!(),
             Filter::Call(name, filters_) => match filters_ {
                 Some(args) => {
@@ -1211,15 +1247,16 @@ impl Shape {
             }
             Shape::Array(shape, u) => {
                 if let Json::Array(arr) = j {
-                    if let Some(u) = u {
-                        if *u > arr.len() {
-                            return Some(ShapeMismatch::new(
-                                path,
-                                self.clone(),
-                                Shape::Tuple(arr.into_iter().map(Shape::from_json).collect()),
-                            ));
-                        }
-                    }
+                    // todo: this produces a null, should we add a null strictness level?
+                    //  if let Some(u) = u {
+                    //     if *u > arr.len() {
+                    //         return Some(ShapeMismatch::new(
+                    //             path,
+                    //             self.clone(),
+                    //             Shape::Tuple(arr.into_iter().map(Shape::from_json).collect()),
+                    //         ));
+                    //     }
+                    // }
 
                     let (_, mismatches): (Vec<_>, Vec<_>) = arr
                         .into_iter()
