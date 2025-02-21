@@ -1,6 +1,6 @@
 [package]
-name = "typjq"
-version = "0.1.0"
+name = "tjq"
+version = "0.0.1"
 edition = "2021"
 
 [dependencies]

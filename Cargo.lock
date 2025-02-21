@@ -345,6 +345,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "tjq"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "clap_derive",
+ "itertools",
+ "log",
+ "serde_json",
+ "topological-sort",
+ "trace",
+ "tracing-subscriber",
+ "tree-sitter",
+ "tree-sitter-jq",
+]
+
+[[package]]
 name = "topological-sort"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -413,23 +430,6 @@ source = "git+https://github.com/nverno/tree-sitter-jq.git#987f3c7961505f3f8c195
 dependencies = [
  "cc",
  "tree-sitter",
-]
-
-[[package]]
-name = "typjq"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "clap_derive",
- "itertools",
- "log",
- "serde_json",
- "topological-sort",
- "trace",
- "tracing-subscriber",
- "tree-sitter",
- "tree-sitter-jq",
 ]
 
 [[package]]

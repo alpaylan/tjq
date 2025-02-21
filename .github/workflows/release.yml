@@ -22,7 +22,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: -ubuntu
-          path: target/x86_64-unknown-linux-gnu/release/
+          path: target/x86_64-unknown-linux-gnu/release/tjq
 
   build-windows:
     runs-on: windows-latest
@@ -40,7 +40,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: -windows
-          path: target/x86_64-pc-windows-msvc/release/.exe
+          path: target/x86_64-pc-windows-msvc/release/tjq.exe
 
 
   build-macos:
@@ -62,5 +62,5 @@ jobs:
         with:
           name: -macos
           path: |
-            target/x86_64-apple-darwin/release/
-            target/aarch64-apple-darwin/release/
+            target/x86_64-apple-darwin/release/tjq
+            target/aarch64-apple-darwin/release/tjq
