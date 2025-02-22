@@ -30,26 +30,31 @@ struct CLI {
 
 fn main() {
     let args = CLI::parse();
-    let expression = args.expression.or_else(|| {
-        if let Some(path) = &args.path {
-            std::fs::read_to_string(path).ok()
-        } else {
-            None
-        }
-    }).expect("no expression provided, either as an argument or a file path");
+    let expression = args
+        .expression
+        .or_else(|| {
+            if let Some(path) = &args.path {
+                std::fs::read_to_string(path).ok()
+            } else {
+                None
+            }
+        })
+        .expect("no expression provided, either as an argument or a file path");
 
+    let (defs, filter) = parse(expression.as_str());
 
-    let(defs, filter) = parse(expression.as_str());
-
-
-    let json = args.input.or_else(|| {
-        if let Some(path) = &args.input_path {
-            std::fs::read_to_string(path).ok()
-        } else {
-            None
-        }
-    }).expect("no input provided, either as an argument or a file path");
-    let json = Json::from_serde_value(serde_json::from_str::<Value>(json.as_str()).expect("invalid JSON"));
+    let json = args
+        .input
+        .or_else(|| {
+            if let Some(path) = &args.input_path {
+                std::fs::read_to_string(path).ok()
+            } else {
+                None
+            }
+        })
+        .expect("no input provided, either as an argument or a file path");
+    let json =
+        Json::from_serde_value(serde_json::from_str::<Value>(json.as_str()).expect("invalid JSON"));
 
     log::info!("input: '{}'", json);
     log::info!("filter: '{}'", filter);

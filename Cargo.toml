@@ -11,9 +11,7 @@ itertools = "0.13.0"
 log = "0.4.25"
 serde_json = "1.0.139"
 topological-sort = "0.2.2"
+trace = "0.1.7"
 tracing-subscriber = "0.3.19"
 tree-sitter =  "~0.20.10"
 tree-sitter-jq = { git = "https://github.com/nverno/tree-sitter-jq.git", version = "0.0.1" }
-
-[dev-dependencies]
-trace = "0.1.7"

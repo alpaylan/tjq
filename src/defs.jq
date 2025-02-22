@@ -1,9 +1,9 @@
 # Vendored from https://github.com/01mf02/jaq/blob/main/jaq-std/src/defs.jq
-def empty: {}[] as $x | .;
+# todo(binding_expressions): def empty: {}[] as $x | .;
 def null:  [][0];
 
-def debug(msgs): ((msgs | debug) as $x | empty), .;
-def error(msgs): ((msgs | error) as $x | empty), .;
+# todo(binding_expressions): def debug(msgs): ((msgs | debug) as $x | empty), .;
+# todo(binding_expressions): def error(msgs): ((msgs | error) as $x | empty), .;
 
 def halt_error: halt_error(5);
 
@@ -39,7 +39,7 @@ def significand:
   elif . == 0.0 then 0.0
   else scalbln(.; ilogb | -1 * .) end;
 def pow10:            pow(10.0; .);
-def drem($l; r):      remainder($l; r) | if . == 0 then copysign(.; $l) end;
+# todo(variables): def drem($l; r):      remainder($l; r) | if . == 0 then copysign(.; $l) end;
 def nexttoward(x; y): nextafter(x; y);
 def scalb(x; e):      x * pow(2.0; e);
 def gamma: tgamma;
@@ -73,34 +73,34 @@ def tostring: "\(.)";
 # Generators
 def range(from; to): range(from; to; 1);
 def range(to): range(0; to);
-def repeat(f): def rec: f, rec; rec;
-def recurse(f): def rec: ., (f | rec); rec;
-def recurse: recurse(.[]?);
-def recurse(f; cond): recurse(f | select(cond));
-def while(cond; update): def rec: if cond then ., (update | rec) else empty end; rec;
-def until(cond; update): def rec: if cond then . else update | rec end; rec;
+# todo(function_expression): def repeat(f): def rec: f, rec; rec;
+# todo(function_expression): def recurse(f): def rec: ., (f | rec); rec;
+# todo(function_expression): def recurse: recurse(.[]?);
+# todo(function_expression): def recurse(f; cond): recurse(f | select(cond));
+# todo(function_expression): def while(cond; update): def rec: if cond then ., (update | rec) else empty end; rec;
+# todo(function_expression): def until(cond; update): def rec: if cond then . else update | rec end; rec;
 
 # Iterators
 def map(f): [.[] | f];
-def map_values(f): .[] |= f;
-def add(f): reduce f as $x (null; . + $x);
-def add: add(.[]);
-def join(x): .[:-1][] += x | add;
-def min_by(f): reduce min_by_or_empty(f) as $x (null; $x);
-def max_by(f): reduce max_by_or_empty(f) as $x (null; $x);
+# todo(assignment_expression): def map_values(f): .[] |= f;
+# todo(reduce_expression, variable): def add(f): reduce f as $x (null; . + $x);
+# todo(reduce_expression, variable): def add: add(.[]);
+# todo(assignment_expression): def join(x): .[:-1][] += x | add;
+# todo(reduce_expression, variable): def min_by(f): reduce min_by_or_empty(f) as $x (null; $x);
+# todo(reduce_expression, variable): def max_by(f): reduce max_by_or_empty(f) as $x (null; $x);
 def min: min_by(.);
 def max: max_by(.);
 def unique_by(f): [group_by(f)[] | .[0]];
 def unique: unique_by(.);
 
-def del(f): f |= empty;
+# todo(assginment_expression): def del(f): f |= empty;
 
 # Arrays
 def first:  .[ 0];
 def last:   .[-1];
-def nth(n): .[ n];
+# todo(array index expressions): def nth(n): .[ n];
 
-def skip($n; g): foreach g as $x ($n; . - 1; if . < 0 then $x else empty end);
+# todo(foreach_expression): def skip($n; g): foreach g as $x ($n; . - 1; if . < 0 then $x else empty end);
 def nth(n; g): last(limit(n + 1; g));
 
 # Predicates
@@ -113,28 +113,28 @@ def all: all(.[]; .);
 def any: any(.[]; .);
 
 # Walking
-def walk(f): def rec: (.[]? |= rec) | f; rec;
+# todo(function_expression): def walk(f): def rec: (.[]? |= rec) | f; rec;
 
-def flatten: [recurse(arrays[]) | select(isarray | not)];
-def flatten($d): if $d > 0 then map(if isarray then flatten($d-1) else [.] end) | add end;
+# todo(function_expression): def flatten: [recurse(arrays[]) | select(isarray | not)];
+# todo(variables): def flatten($d): if $d > 0 then map(if isarray then flatten($d-1) else [.] end) | add end;
 
 # Regular expressions
-def capture_of_match: map(select(.name) | { (.name): .string} ) | add + {};
+# todo(add): def capture_of_match: map(select(.name) | { (.name): .string} ) | add + {};
 
 def    test(re; flags): matches(re; flags) | any;
-def    scan(re; flags): matches(re; flags)[] | .[0].string;
-def   match(re; flags): matches(re; flags)[] | .[0] + { captures: .[1:] };
+# todo(field_expression): def    scan(re; flags): matches(re; flags)[] | .[0].string;
+# todo(def   match(re; flags): matches(re; flags)[] | .[0] + { captures: .[1:] };
 def capture(re; flags): matches(re; flags)[] | capture_of_match;
 
-def split($sep):
-  if isstring and ($sep | isstring) then . / $sep
-  else error("split input and separator must be strings") end;
+# todo(variables): def split($sep):
+#   if isstring and ($sep | isstring) then . / $sep
+#   else error("split input and separator must be strings") end;
 def split (re; flags): split_(re; flags + "g");
 def splits(re; flags): split(re; flags)[];
 
-def sub(re; f; flags):
-  def handle: if isarray then capture_of_match | f end;
-  reduce split_matches(re; flags)[] as $x (""; . + ($x | handle));
+# todo(variables, function_expression): def sub(re; f; flags):
+#   def handle: if isarray then capture_of_match | f end;
+#   reduce split_matches(re; flags)[] as $x (""; . + ($x | handle));
 
 def gsub(re; f; flags): sub(re; f; "g" + flags);
 

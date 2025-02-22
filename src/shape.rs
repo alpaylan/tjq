@@ -16,7 +16,7 @@ pub enum Shape {
     Bool(Option<bool>),
     Number(Option<f64>),
     String(Option<String>),
-    Array(Box<Shape>, Option<usize>),
+    Array(Box<Shape>, Option<isize>),
     Tuple(Vec<Shape>),
     Object(Vec<(String, Shape)>),
     Mismatch(Box<Shape>, Box<Shape>),
@@ -334,7 +334,7 @@ impl Shape {
                     }
                 });
 
-                if inner_subtyping && u.unwrap_or(0) >= shapes.len() {
+                if inner_subtyping && u.unwrap_or(0).max(0) as usize >= shapes.len() {
                     return Subtyping::Subtype;
                 }
 
@@ -349,7 +349,7 @@ impl Shape {
                     }
                 });
 
-                if inner_subtyping && u.unwrap_or(0) <= shapes.len() {
+                if inner_subtyping && u.unwrap_or(0).max(0) as usize <= shapes.len() {
                     return Subtyping::Supertype;
                 }
 
@@ -626,7 +626,7 @@ impl Shape {
                     Shape::Array(shape, None) => Shape::Array(shape, Some(*u)),
                     Shape::Array(shape, Some(u_)) => Shape::Array(shape, Some(*u.max(&u_))),
                     Shape::Tuple(mut tuple) => {
-                        while *u >= tuple.len() {
+                        while (*u).max(0) as usize >= tuple.len() {
                             let new_type_var = ctx.fresh();
                             tuple.push(Shape::TVar(new_type_var));
                         }

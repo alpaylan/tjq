@@ -38,6 +38,33 @@ pub(crate) fn parse(code: &str) -> (HashMap<String, Filter>, Filter) {
     (defs, f)
 }
 
+pub(crate) fn parse_defs(code: &str) -> HashMap<String, Filter> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(tree_sitter_jq::language())
+        .expect("Error loading jq grammar");
+    let tree = parser.parse(code, None).unwrap();
+
+    assert_eq!(tree.root_node().kind(), "program");
+
+    let mut defs = HashMap::new();
+
+    for i in 0..tree.root_node().child_count() {
+        let child = tree.root_node().child(i).unwrap();
+        match child.kind() {
+            "function_definition" => {
+                let _ = parse_filter(code, child, &mut defs);
+            }
+            "comment" => {}
+            _ => {
+                panic!("unexpected node in program: {}", child.kind());
+            }
+        }
+    }
+
+    defs
+}
+
 pub(crate) fn parse_filter<'a>(
     code: &str,
     root: Node<'a>,
@@ -75,7 +102,7 @@ pub(crate) fn parse_filter<'a>(
                 //     defs,
                 // ))
                 let rhs = root.child(2).unwrap();
-                let rhs = code[rhs.range().start_byte..rhs.range().end_byte].parse::<usize>().expect("array index should be a valid integer(expressions in the index are not yet supported)");
+                let rhs = code[rhs.range().start_byte..rhs.range().end_byte].parse::<isize>().expect(format!("array index should be a valid integer(expressions in the index are not yet supported), encountered '{}'", &code[rhs.range().start_byte..rhs.range().end_byte]).as_str());
                 Filter::ArrayIndex(rhs)
             };
 
@@ -106,20 +133,29 @@ pub(crate) fn parse_filter<'a>(
         },
         "variable" => {
             log::warn!("todo: variables are not yet supported");
-            unimplemented!("todo: variables are not yet supported")
+            unimplemented!(
+                "todo: variables are not yet supported, encountered '{}'",
+                &code[root.range().start_byte..root.range().end_byte]
+            );
         }
-        "array" => Filter::Array(
-            (1..root.child_count())
-                .step_by(2)
-                .map(|i| {
-                    parse_filter(
-                        code,
-                        root.child(i).expect("array should have a value"),
-                        defs,
-                    )
-                })
-                .collect(),
-        ),
+        "array" => {
+            if root.child_count() == 2 {
+                return Filter::Array(vec![]);
+            }
+
+            Filter::Array(
+                (1..root.child_count())
+                    .step_by(2)
+                    .map(|i| {
+                        parse_filter(
+                            code,
+                            root.child(i).expect("array should have a value"),
+                            defs,
+                        )
+                    })
+                    .collect(),
+            )
+        }
         "object" => {
             let mut pairs: Vec<(Filter, Filter)> = vec![];
             for i in 1..root.child_count() - 1 {
@@ -234,12 +270,17 @@ pub(crate) fn parse_filter<'a>(
                     (cond, then)
                 })
                 .collect();
-            let else_ = parse_filter(
-                code,
-                root.child(root.child_count() - 2)
-                    .expect("if expression should have an else"),
-                defs,
-            );
+            
+            let else_ = if root.child_count() == 5 {
+                Filter::Dot
+            } else {
+                parse_filter(
+                    code,
+                    root.child(root.child_count() - 2)
+                        .expect("if expression should have an else"),
+                    defs,
+                )
+            };
 
             Filter::IfThenElse(
                 Box::new(cond),
@@ -308,7 +349,11 @@ pub(crate) fn parse_filter<'a>(
         | "field_expression"
         | "foreach_expression" => {
             log::warn!("todo: {} are not yet supported", root.kind());
-            unimplemented!("todo: {} are not yet supported", root.kind());
+            unimplemented!(
+                "todo: '{}' are not yet supported, encountered '{}'",
+                root.kind(),
+                &code[root.range().start_byte..root.range().end_byte]
+            );
         }
         _ => {
             log::warn!(

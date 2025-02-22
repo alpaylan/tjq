@@ -6,7 +6,7 @@ use std::{
 
 use itertools::Itertools;
 
-use crate::{JQError, Json};
+use crate::{parse_defs, JQError, Json};
 
 #[derive(Debug, Clone)]
 pub enum Filter {
@@ -14,7 +14,7 @@ pub enum Filter {
     Pipe(Box<Filter>, Box<Filter>),                    // <f_1> | <f_2>
     Comma(Box<Filter>, Box<Filter>),                   // <f_1>, <f_2>
     ObjIndex(String),                                  // .<s>
-    ArrayIndex(usize),                                 // .[<n>]
+    ArrayIndex(isize),                                 // .[<n>]
     ArrayIterator,                                     // .[]
     Null,                                              // null
     Boolean(bool),                                     // true | false
@@ -182,7 +182,11 @@ impl Filter {
                 )),
             }],
             Filter::ArrayIndex(i) => vec![match json {
-                Json::Array(arr) => Ok(arr.get(*i).cloned().unwrap_or(Json::Null)),
+                Json::Array(arr) => {
+                    let i = if *i < 0 { arr.len() as isize + i } else { *i } as usize;
+
+                    Ok(arr.get(i).cloned().unwrap_or(Json::Null))
+                }
                 _ => Err(JQError::ArrIndexForNonArray(
                     json.clone(),
                     Json::Number(*i as f64),
@@ -479,89 +483,9 @@ impl Filter {
 }
 
 pub fn builtin_filters() -> HashMap<String, Filter> {
-    let id = ("id".to_string(), Filter::Dot);
-    let abs = (
-        "abs".to_string(),
-        Filter::IfThenElse(
-            Box::new(Filter::BinOp(
-                Box::new(Filter::Dot),
-                BinOp::Lt,
-                Box::new(Filter::Number(0.0)),
-            )),
-            Box::new(Filter::UnOp(UnOp::Neg, Box::new(Filter::Dot))),
-            Box::new(Filter::Dot),
-        ),
-    );
-
-    let isboolean = (
-        "isboolean".to_string(),
-        Filter::BinOp(
-            Box::new(Filter::BinOp(
-                Box::new(Filter::Dot),
-                BinOp::Eq,
-                Box::new(Filter::Boolean(true)),
-            )),
-            BinOp::Or,
-            Box::new(Filter::BinOp(
-                Box::new(Filter::Dot),
-                BinOp::Eq,
-                Box::new(Filter::Boolean(false)),
-            )),
-        ),
-    );
-
-    let type_ = (
-        "type".to_string(),
-        Filter::IfThenElse(
-            Box::new(Filter::BinOp(
-                Box::new(Filter::Dot),
-                BinOp::Eq,
-                Box::new(Filter::Null),
-            )),
-            Box::new(Filter::String("null".to_string())),
-            Box::new(Filter::IfThenElse(
-                Box::new(Filter::Call("isboolean".to_string(), None)),
-                Box::new(Filter::String("boolean".to_string())),
-                Box::new(Filter::IfThenElse(
-                    Box::new(Filter::BinOp(
-                        Box::new(Filter::Dot),
-                        BinOp::Lt,
-                        Box::new(Filter::String("".to_string())),
-                    )),
-                    Box::new(Filter::String("number".to_string())),
-                    Box::new(Filter::IfThenElse(
-                        Box::new(Filter::BinOp(
-                            Box::new(Filter::Dot),
-                            BinOp::Lt,
-                            Box::new(Filter::Array(vec![])),
-                        )),
-                        Box::new(Filter::String("string".to_string())),
-                        Box::new(Filter::IfThenElse(
-                            Box::new(Filter::BinOp(
-                                Box::new(Filter::Dot),
-                                BinOp::Lt,
-                                Box::new(Filter::Object(vec![])),
-                            )),
-                            Box::new(Filter::String("array".to_string())),
-                            Box::new(Filter::String("object".to_string())),
-                        )),
-                    )),
-                )),
-            )),
-        ),
-    );
-
-    let map = (
-        "map".to_string(),
-        Filter::Bound(
-            vec!["f".to_string()],
-            Box::new(Filter::Array(vec![Filter::Pipe(
-                Box::new(Filter::ArrayIterator),
-                Box::new(Filter::Call("f".to_string(), None)),
-            )])),
-        ),
-    );
-    HashMap::from_iter(vec![id, abs, isboolean, type_, map])
+    // read defs.jq
+    let defs = parse_defs(include_str!("defs.jq"));
+    defs
 }
 
 #[cfg(test)]
