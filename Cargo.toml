@@ -1,7 +1,9 @@
 [package]
 name = "tjq"
+description = "tjq is a typed jq implementation in Rust that uses a prototype type inference engine, requiring no type annotations."
 version = "0.0.1"
 edition = "2021"
+license = "MIT"
 
 [dependencies]
 anyhow = "1.0.95"
