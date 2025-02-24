@@ -7,7 +7,7 @@ use crate::filter::Filter;
 pub(crate) fn parse(code: &str) -> (HashMap<String, Filter>, Filter) {
     let mut parser = tree_sitter::Parser::new();
     parser
-        .set_language(tree_sitter_jq::language())
+        .set_language(&tree_sitter_jq::LANGUAGE.into())
         .expect("Error loading jq grammar");
     let tree = parser.parse(code, None).unwrap();
 
@@ -41,7 +41,7 @@ pub(crate) fn parse(code: &str) -> (HashMap<String, Filter>, Filter) {
 pub(crate) fn parse_defs(code: &str) -> HashMap<String, Filter> {
     let mut parser = tree_sitter::Parser::new();
     parser
-        .set_language(tree_sitter_jq::language())
+        .set_language(&tree_sitter_jq::LANGUAGE.into())
         .expect("Error loading jq grammar");
     let tree = parser.parse(code, None).unwrap();
 
@@ -270,7 +270,7 @@ pub(crate) fn parse_filter<'a>(
                     (cond, then)
                 })
                 .collect();
-            
+
             let else_ = if root.child_count() == 5 {
                 Filter::Dot
             } else {
@@ -363,5 +363,62 @@ pub(crate) fn parse_filter<'a>(
             );
             Filter::Dot
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::filter::Filter;
+
+    use super::*;
+
+    #[test]
+    fn test_parse() {
+        let code = r#"
+            def add(a; b): a + b;
+            add(1; 2)
+        "#;
+
+        let (defs, filter) = parse(code);
+
+        assert_eq!(
+            defs.get("add").unwrap().clone(),
+            Filter::Bound(
+                vec!["a".to_string(), "b".to_string()],
+                Box::new(Filter::BinOp(
+                    Box::new(Filter::Call("a".to_string(), None)),
+                    crate::filter::BinOp::Add,
+                    Box::new(Filter::Call("b".to_string(), None))
+                ))
+            )
+        );
+
+        assert_eq!(
+            filter,
+            Filter::Call(
+                "add".to_string(),
+                Some(vec![Filter::Number(1.0), Filter::Number(2.0)])
+            )
+        );
+    }
+
+    #[test]
+    fn test_parse_filter() {
+        let code = r#"
+            1 + 2
+        "#;
+
+        let (defs, filter) = parse(code);
+
+        assert_eq!(defs, HashMap::new());
+        
+        assert_eq!(
+            filter,
+            Filter::BinOp(
+                Box::new(Filter::Number(1.0)),
+                crate::filter::BinOp::Add,
+                Box::new(Filter::Number(2.0))
+            )
+        );
     }
 }

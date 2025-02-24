@@ -8,7 +8,7 @@ use itertools::Itertools;
 
 use crate::{parse_defs, JQError, Json};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Filter {
     Dot,                                               // .
     Pipe(Box<Filter>, Box<Filter>),                    // <f_1> | <f_2>
