@@ -70,6 +70,7 @@ pub(crate) fn parse_filter<'a>(
     root: Node<'a>,
     defs: &mut HashMap<String, Filter>,
 ) -> Filter {
+    log::trace!("{}: {}", root.kind(), &code[root.range().start_byte..root.range().end_byte]);
     match root.kind() {
         "dot" => Filter::Dot,
         "sequence_expression" => {
@@ -129,6 +130,7 @@ pub(crate) fn parse_filter<'a>(
             "false" => Filter::Boolean(false),
             "null" => Filter::Null,
             "empty" => Filter::Empty,
+            "error" => Filter::Error,
             s => Filter::Call(s.to_string(), None),
         },
         "variable" => {
@@ -158,7 +160,7 @@ pub(crate) fn parse_filter<'a>(
         }
         "object" => {
             let mut pairs: Vec<(Filter, Filter)> = vec![];
-            for i in 1..root.child_count() - 1 {
+            for i in (1..root.child_count() - 1).step_by(2) {
                 let pair = root.child(i).unwrap();
                 let key = parse_filter(code, pair.child(0).expect("pairs should have a key"), defs);
                 let value = parse_filter(

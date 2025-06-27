@@ -25,7 +25,7 @@ pub enum Filter {
     UnOp(UnOp, Box<Filter>),                           // <op> <f>
     BinOp(Box<Filter>, BinOp, Box<Filter>),            // <f_1> <op> <f_2>
     Empty,                                             // Empty
-    Error(Option<String>),                             // Error, Error("message")
+    Error,                                             // Error
     Call(String, Option<Vec<Filter>>),                 // <s>(<f_1>, <f_2>...)
     IfThenElse(Box<Filter>, Box<Filter>, Box<Filter>), // if <f_1> then <f_2> else <f_3>
     Bound(Vec<String>, Box<Filter>),                   // \<s_1>, <s_2>... <f>
@@ -94,8 +94,7 @@ impl Display for Filter {
                 write!(f, "{} {} {}", filter, bin_op, filter1)
             }
             Filter::Empty => write!(f, "empty"),
-            Filter::Error(None) => write!(f, "error"),
-            Filter::Error(Some(s)) => write!(f, "error(\"{}\")", s),
+            Filter::Error => write!(f, "error"),
             Filter::Call(name, filters) => {
                 write!(f, "{}", name)?;
                 if let Some(filters) = filters {
@@ -148,6 +147,8 @@ impl Display for UnOp {
         }
     }
 }
+
+
 
 impl Filter {
     pub fn filter(
@@ -359,7 +360,7 @@ impl Filter {
                     .collect::<Vec<_>>()
             }
             Filter::Empty => vec![],
-            Filter::Error(_) => todo!(),
+            Filter::Error => vec![Err(JQError::Unknown)],
             Filter::Call(name, filters_) => match filters_ {
                 Some(args) => {
                     // Find the filter with the given name
@@ -426,7 +427,7 @@ impl Filter {
             | Filter::Number(_)
             | Filter::String(_)
             | Filter::Empty
-            | Filter::Error(_) => self.clone(),
+            | Filter::Error => self.clone(),
             Filter::Pipe(filter, filter1) => Filter::Pipe(
                 Box::new(filter.substitute(var, arg)),
                 Box::new(filter1.substitute(var, arg)),
