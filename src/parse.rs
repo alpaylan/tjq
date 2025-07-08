@@ -3,6 +3,7 @@ use std::{collections::HashMap, vec};
 use tree_sitter::Node;
 
 use crate::filter::Filter;
+use crate::printer::{print_ast, print_node_details};
 
 pub(crate) fn parse(code: &str) -> (HashMap<String, Filter>, Filter) {
     let mut parser = tree_sitter::Parser::new();
@@ -12,6 +13,9 @@ pub(crate) fn parse(code: &str) -> (HashMap<String, Filter>, Filter) {
     let tree = parser.parse(code, None).unwrap();
 
     assert_eq!(tree.root_node().kind(), "program");
+
+    print_ast(tree.root_node(), code, 0); // print AST
+    //print_node_details(tree.root_node(), code, 0);
 
     let mut defs = HashMap::new();
 
@@ -343,8 +347,18 @@ pub(crate) fn parse_filter<'a>(
             defs.insert(name.clone(), Filter::Bound(args, Box::new(body)));
             Filter::Dot
         }
-        "function_expression"
-        | "binding_expression"
+
+        "function_expression"  => {
+            let name = code[root.child(1).unwrap().range().start_byte
+                ..root.child(1).unwrap().range().end_byte]
+                .to_string();
+            println!("func expr");
+            println!({name});
+            
+            Filter::Dot
+        }
+        |
+         "binding_expression"
         | "optional_expression"
         | "reduce_expression"
         | "assignment_expression"

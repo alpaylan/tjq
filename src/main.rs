@@ -13,6 +13,8 @@ use serde_json::Value;
 use shape::*;
 mod parse;
 use parse::*;
+mod printer;
+use printer::*;
 
 #[derive(Parser)]
 struct CLI {
