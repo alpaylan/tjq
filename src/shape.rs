@@ -298,14 +298,12 @@ impl Constraint {
 }
 type Constraints = Vec<Constraint>;
 
-
-
 #[derive(Debug)]
 struct TypeEnv {
-    equalities: HashMap<usize, Shape>,      // Var -> Resolved
-    subtypes: Vec<(Shape, Shape)>,        // T1 <: T2
+    equalities: HashMap<usize, Shape>, // Var -> Resolved
+    subtypes: Vec<(Shape, Shape)>,     // T1 <: T2
     implications: Vec<(Constraint, Constraint)>,
-    inequalities: Vec<(Shape, Shape)>,    // T1 != T2
+    inequalities: Vec<(Shape, Shape)>, // T1 != T2
     facts: HashSet<Constraint>,
 }
 
@@ -336,23 +334,25 @@ fn solve(constraints: Vec<Constraint>, ctx: &Context) -> Result<TypeEnv, TypeErr
 
     while let Some(c) = worklist.pop() {
         match c {
-            Constraint::Comparison { t1, rel: Comparison::Equal, t2 } => {
-                match (t1, t2) {
-                    (Shape::TVar(t1), Shape::TVar(t2)) => {
-                        match t1.cmp(&t2) {
-                            Ordering::Less => env.equalities.insert(t2, Shape::TVar(t1)),
-                            Ordering::Equal => continue,
-                            Ordering::Greater => env.equalities.insert(t1, Shape::TVar(t2)),
-                        };
-                    }
-                    (Shape::TVar(t), t2) => {
-                        env.equalities.insert(t, t2);
-                    }
-                    (t1, Shape::TVar(t)) => {
-                        env.equalities.insert(t, t1);
-                    }
-                    _ => todo!()
+            Constraint::Comparison {
+                t1,
+                rel: Comparison::Equal,
+                t2,
+            } => match (t1, t2) {
+                (Shape::TVar(t1), Shape::TVar(t2)) => {
+                    match t1.cmp(&t2) {
+                        Ordering::Less => env.equalities.insert(t2, Shape::TVar(t1)),
+                        Ordering::Equal => continue,
+                        Ordering::Greater => env.equalities.insert(t1, Shape::TVar(t2)),
+                    };
                 }
+                (Shape::TVar(t), t2) => {
+                    env.equalities.insert(t, t2);
+                }
+                (t1, Shape::TVar(t)) => {
+                    env.equalities.insert(t, t1);
+                }
+                _ => todo!(),
             },
             Constraint::Comparison { t1, rel, t2 } => todo!(),
             Constraint::Subtyping { t1, rel, t2 } => match rel {
@@ -375,7 +375,6 @@ fn solve(constraints: Vec<Constraint>, ctx: &Context) -> Result<TypeEnv, TypeErr
 
     Ok(env)
 }
-
 
 // impl Display for Constraints {
 //     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -1397,8 +1396,9 @@ impl Shape {
                                 (Shape::Null, s) | (s, Shape::Null) => s,
                                 // str + str
                                 (Shape::String(s1), Shape::String(s2)) => match (s1, s2) {
-                                    (None, None) => Shape::String(None),
-                                    (Some(s1), None) | (None, Some(s1)) => Shape::String(Some(s1)),
+                                    (None, None) | (Some(_), None) | (None, Some(_)) => {
+                                        Shape::String(None)
+                                    }
                                     (Some(s1), Some(s2)) => {
                                         Shape::String(Some(format!("{s1}{s2}")))
                                     }
@@ -1486,8 +1486,9 @@ impl Shape {
                                 }
                                 // num + num
                                 (Shape::Number(n1), Shape::Number(n2)) => match (n1, n2) {
-                                    (None, None) => Shape::Number(None),
-                                    (Some(_), None) | (None, Some(_)) => Shape::Number(None),
+                                    (None, None) | (Some(_), None) | (None, Some(_)) => {
+                                        Shape::Number(None)
+                                    }
                                     (Some(n1), Some(n2)) => Shape::Number(Some(n1 + n2)),
                                 },
                                 (Shape::Number(_), Shape::TVar(t))
@@ -2336,8 +2337,9 @@ mod tests {
             )]),
         );
 
+        println!("Filter: {filter}");
         let (shape, results) = Shape::new(&filter, &builtin_filters());
-
+        println!("Shape: {shape}");
         assert_eq!(
             shape,
             Shape::Array(
@@ -2404,7 +2406,7 @@ mod tests {
         );
 
         let (shape, results) = Shape::new(&filter, &builtin_filters());
-
+        println!("Shape: {shape}");
         assert_eq!(
             shape,
             Shape::Array(
@@ -2443,7 +2445,7 @@ mod constraint_tests {
         let o = context.fresh();
         let constraints = Shape::compute_shape(&filter, &mut context, i, o);
         println!(
-            "====================\n{}",
+            "===========test_subtyping=========\n{}",
             constraints
                 .iter()
                 .map(|c| c.to_string())
@@ -2460,7 +2462,7 @@ mod constraint_tests {
         let o = context.fresh();
         let constraints = Shape::compute_shape(&filter, &mut context, i, o);
         println!(
-            "====================\n{}",
+            "===========test_subtyping2=========\n{}",
             constraints
                 .iter()
                 .map(|c| c.to_string())
@@ -2477,7 +2479,7 @@ mod constraint_tests {
         let o = context.fresh();
         let constraints = Shape::compute_shape(&filter, &mut context, i, o);
         println!(
-            "====================\n{}",
+            "==========test_subtyping3==========\n{}",
             constraints
                 .iter()
                 .map(|c| c.to_string())
@@ -2494,7 +2496,7 @@ mod constraint_tests {
         let o = context.fresh();
         let constraints = Shape::compute_shape(&filter, &mut context, i, o);
         println!(
-            "====================\n{}",
+            "==========test_subtyping4==========\n{}",
             constraints
                 .iter()
                 .map(|c| c.to_string())
@@ -2511,7 +2513,7 @@ mod constraint_tests {
         let o = context.fresh();
         let constraints = Shape::compute_shape(&filter, &mut context, i, o);
         println!(
-            "====================\n{}",
+            "==========test_subtyping5==========\n{}",
             constraints
                 .iter()
                 .map(|c| c.to_string())
