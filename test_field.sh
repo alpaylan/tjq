@@ -2,4 +2,4 @@
 
 
 
-./target/debug/tjq --expression="  . | .["can"] " --input='{"can" : 123}'
+./target/debug/tjq --expression="  . | 1 as $deneme | $deneme + 2 " --input='{"can" : 123}'

@@ -350,43 +350,40 @@ pub(crate) fn parse_filter<'a>(
 
         "function_expression"  => {
             println!("Child count: {}", root.child_count());
-            // for i in 0..root.child_count() {
-            //     let child = root.child(i).unwrap();
-            //     let text = &code[child.range().start_byte..child.range().end_byte];
-            //     println!("Child {}: {} = '{}'", i, child.kind(), text);
-            // }
-            // since this is a local scope i will use an extension hash map with addition to the outer scope
-            // why? -> shadowing for func names/defs
-            // ok recurse parse filter call with a local defs 
-            // use a new filter to utilize local defs without pushing to global
+                for i in 0..root.child_count() {
+        let child = root.child(i).unwrap();
+        let text = &code[child.range().start_byte..child.range().end_byte];
+        println!("Child {}: {} = '{}'", i, child.kind(), text);
+    }
+    
 
-            let mut local_defs = defs.clone();
-   
-            let func_def = parse_filter(
-                code,
-                root.child(0)
-                    .expect("function expression should have a function definition"),
-                &mut local_defs,
-            );
-            
-            let expr = parse_filter(
-                code,
-                root.child(1)
-                    .expect("function expression should have a body"),
-                &mut local_defs,
-            );
-            
-            let local_only: HashMap<String, Filter> = local_defs.iter()
-                .filter(|(k, _)| !defs.contains_key(*k))
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            
-            if !local_only.is_empty() {
-                Filter::LocalScope(local_only, Box::new(expr))
-            } else {
-                expr
+    
+    let mut final_expr = Filter::Dot;
+    
+    for i in 0..root.child_count() {
+        let child = root.child(i).unwrap();
+        
+        match child.kind() {
+            "function_definition" => {
+                let _ = parse_filter(code, child, defs);
+            }
+            "ERROR" | ";" | "(" | ")" | "comment" => {
+                // Skip punctuation and errors
+                continue;
+            }
+            _ => {
+                // Parse as the final expression
+                final_expr = parse_filter(code, child, defs);
             }
         }
+    }
+    
+    // Return the final expression
+    final_expr
+
+             }
+                    
+      
         |
          "binding_expression" => {
             // alrighty binding
@@ -394,7 +391,15 @@ pub(crate) fn parse_filter<'a>(
 
             Filter::Dot
          }
-         "optional_expression"
+         "optional_expression" => {
+                let identifier = parse_filter(
+                code,
+                root.child(1)
+                    .expect("field access should have the second child as its field"),
+                defs,
+            );
+            Filter::ObjIndex(identifier.to_string())
+         }
         | "reduce_expression"
         | "assignment_expression"
         | "field_expression"

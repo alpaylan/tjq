@@ -77,12 +77,12 @@ def tostring: "\(.)";
 # Generators
 def range(from; to): range(from; to; 1);
 def range(to): range(0; to);
-# todo(function_expression): def repeat(f): def rec: f, rec; rec;
-# todo(function_expression): def recurse(f): def rec: ., (f | rec); rec;
+def repeat(f): def rec: f, rec; rec;
+def recurse(f): def rec: ., (f | rec); rec;
 # todo(function_expression): def recurse: recurse(.[]?);
-# todo(function_expression): def recurse(f; cond): recurse(f | select(cond));
-# todo(function_expression): def while(cond; update): def rec: if cond then ., (update | rec) else empty end; rec;
-# todo(function_expression): def until(cond; update): def rec: if cond then . else update | rec end; rec;
+def recurse(f; cond): recurse(f | select(cond));
+def while(cond; update): def rec: if cond then ., (update | rec) else empty end; rec;
+def until(cond; update): def rec: if cond then . else update | rec end; rec;
 
 # Iterators
 def map(f): [.[] | f];
