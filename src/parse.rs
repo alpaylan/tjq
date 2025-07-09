@@ -349,17 +349,52 @@ pub(crate) fn parse_filter<'a>(
         }
 
         "function_expression"  => {
-            let name = code[root.child(1).unwrap().range().start_byte
-                ..root.child(1).unwrap().range().end_byte]
-                .to_string();
-            println!("func expr");
-            println!({name});
+            println!("Child count: {}", root.child_count());
+            // for i in 0..root.child_count() {
+            //     let child = root.child(i).unwrap();
+            //     let text = &code[child.range().start_byte..child.range().end_byte];
+            //     println!("Child {}: {} = '{}'", i, child.kind(), text);
+            // }
+            // since this is a local scope i will use an extension hash map with addition to the outer scope
+            // why? -> shadowing for func names/defs
+            // ok recurse parse filter call with a local defs 
+            // use a new filter to utilize local defs without pushing to global
+
+            let mut local_defs = defs.clone();
+   
+            let func_def = parse_filter(
+                code,
+                root.child(0)
+                    .expect("function expression should have a function definition"),
+                &mut local_defs,
+            );
             
-            Filter::Dot
+            let expr = parse_filter(
+                code,
+                root.child(1)
+                    .expect("function expression should have a body"),
+                &mut local_defs,
+            );
+            
+            let local_only: HashMap<String, Filter> = local_defs.iter()
+                .filter(|(k, _)| !defs.contains_key(*k))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            
+            if !local_only.is_empty() {
+                Filter::LocalScope(local_only, Box::new(expr))
+            } else {
+                expr
+            }
         }
         |
-         "binding_expression"
-        | "optional_expression"
+         "binding_expression" => {
+            // alrighty binding
+            // .name asd $nick e.g
+
+            Filter::Dot
+         }
+         "optional_expression"
         | "reduce_expression"
         | "assignment_expression"
         | "field_expression"

@@ -1114,6 +1114,7 @@ impl Shape {
                 cs
             }
             Filter::Bound(items, filter) => todo!(),
+            Filter::LocalScope(_, _) => todo!(),
         }
     }
 
@@ -1727,6 +1728,9 @@ impl Shape {
             Filter::Bound(items, filter) => {
                 // todo: understand this better
                 Shape::build_shape(filter, shapes, ctx, filters)
+            }
+            Filter::LocalScope(_, expr) => {
+                Shape::build_shape(expr, shapes, ctx, filters)
             }
         }
     }

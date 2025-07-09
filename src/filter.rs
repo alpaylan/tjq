@@ -29,6 +29,7 @@ pub enum Filter {
     Call(String, Option<Vec<Filter>>),                 // <s>(<f_1>, <f_2>...)
     IfThenElse(Box<Filter>, Box<Filter>, Box<Filter>), // if <f_1> then <f_2> else <f_3>
     Bound(Vec<String>, Box<Filter>),                   // \<s_1>, <s_2>... <f>
+    LocalScope(HashMap<String, Filter>, Box<Filter>),  // local_defs, <f>
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,6 +116,10 @@ impl Display for Filter {
             Filter::Bound(_, filter) => {
                 write!(f, " {}", filter)
             }
+            Filter::LocalScope(local_defs, expr ) => {
+                write!(f, "{})", expr)
+            }
+
         }
     }
 }
@@ -407,11 +412,18 @@ impl Filter {
                     .collect()
             }
             Filter::Bound(items, filter) => {
-                for item in items {
-                    todo!()
-                }
+                // for item in items {
+                //     todo!()
+                // }
 
                 Filter::filter(json, filter, filters, variable_ctx)
+            }
+            Filter::LocalScope(local_defs, expr) => {
+                let mut scoped_filters = filters.clone();
+                for (name, local_filter) in local_defs {
+                    scoped_filters.insert(name.clone(), local_filter.clone());
+                }
+                Filter::filter(json, expr, &scoped_filters, variable_ctx)
             }
         }
     }
@@ -473,12 +485,23 @@ impl Filter {
                     )
                 }
             }
+            Filter::LocalScope(local_defs, expr) => {
+            if local_defs.contains_key(var) {
+                self.clone() 
+            } else {
+                let new_local_defs = local_defs.iter()
+                    .map(|(name, filter)| (name.clone(), filter.substitute(var, arg)))
+                    .collect();
+                Filter::LocalScope(new_local_defs, Box::new(expr.substitute(var, arg)))
+            }
+            }
             Filter::IfThenElse(filter, filter1, filter2) => Filter::IfThenElse(
                 Box::new(filter.substitute(var, arg)),
                 Box::new(filter1.substitute(var, arg)),
                 Box::new(filter2.substitute(var, arg)),
             ),
             Filter::Bound(items, filter) => todo!(),
+            
         }
     }
 }
