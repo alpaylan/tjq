@@ -80,9 +80,9 @@ def range(to): range(0; to);
 def repeat(f): def rec: f, rec; rec;
 def recurse(f): def rec: ., (f | rec); rec;
 # todo(function_expression): def recurse: recurse(.[]?);
-def recurse(f; cond): recurse(f | select(cond));
-def while(cond; update): def rec: if cond then ., (update | rec) else empty end; rec;
-def until(cond; update): def rec: if cond then . else update | rec end; rec;
+# def recurse(f; cond): recurse(f | select(cond));
+# def while(cond; update): def rec: if cond then ., (update | rec) else empty end; rec;
+# def until(cond; update): def rec: if cond then . else update | rec end; rec;
 
 # Iterators
 def map(f): [.[] | f];

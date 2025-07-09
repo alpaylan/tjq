@@ -241,7 +241,8 @@ pub(crate) fn parse_filter<'a>(
         "true" => Filter::Boolean(true),
         "false" => Filter::Boolean(false),
         "null" => Filter::Null,
-        "parenthesized_expression" => parse_filter(
+        "parenthesized_expression" =>
+         parse_filter(
             code,
             root.child(1)
                 .expect("paranthesized expression should have a value"),
@@ -349,56 +350,58 @@ pub(crate) fn parse_filter<'a>(
         }
 
         "function_expression"  => {
-            println!("Child count: {}", root.child_count());
-                for i in 0..root.child_count() {
-        let child = root.child(i).unwrap();
-        let text = &code[child.range().start_byte..child.range().end_byte];
-        println!("Child {}: {} = '{}'", i, child.kind(), text);
-    }
+            // println!("Child count: {}", root.child_count());
+            // for i in 0..root.child_count() {
+            //     let child = root.child(i).unwrap();
+            //     let text = &code[child.range().start_byte..child.range().end_byte];
+            //     println!("Child {}: {} = '{}'", i, child.kind(), text);
+            // }
     
+            let mut final_expr = Filter::Dot;
+            
+            for i in 0..root.child_count() {
+                let child = root.child(i).unwrap();
+                
+                match child.kind() {
+                    "function_definition" => {
+                        let _ = parse_filter(code, child, defs);
+                    }
+                    _ => {
+                        final_expr = parse_filter(code, child, defs);
+                    }
+                }
+            }
+    
+            final_expr
 
-    
-    let mut final_expr = Filter::Dot;
-    
-    for i in 0..root.child_count() {
-        let child = root.child(i).unwrap();
-        
-        match child.kind() {
-            "function_definition" => {
-                let _ = parse_filter(code, child, defs);
-            }
-            "ERROR" | ";" | "(" | ")" | "comment" => {
-                // Skip punctuation and errors
-                continue;
-            }
-            _ => {
-                // Parse as the final expression
-                final_expr = parse_filter(code, child, defs);
-            }
-        }
     }
-    
-    // Return the final expression
-    final_expr
-
-             }
                     
       
         |
          "binding_expression" => {
-            // alrighty binding
-            // .name asd $nick e.g
+            // .name as $nick e.g
 
             Filter::Dot
          }
          "optional_expression" => {
+            println!("Child count: {}", root.child_count());
+            for i in 0..root.child_count() {
+                let child = root.child(i).unwrap();
+                let text = &code[child.range().start_byte..child.range().end_byte];
+                println!("Child {}: {} = '{}'", i, child.kind(), text);
+            }
+            let field = root
+                    .child(0)
+                    .expect("optional expression should have the first child as its field");
+            
                 let identifier = parse_filter(
                 code,
-                root.child(1)
+                field.child(1)
                     .expect("field access should have the second child as its field"),
                 defs,
             );
             Filter::ObjIndex(identifier.to_string())
+            
          }
         | "reduce_expression"
         | "assignment_expression"
