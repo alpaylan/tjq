@@ -31,6 +31,14 @@ struct CLI {
 }
 
 fn main() {
+    tracing_subscriber::fmt()
+        .with_target(false)
+        .with_thread_ids(true)
+        .with_thread_names(true)
+        .with_file(true)
+        .with_line_number(true)
+        .init();
+
     let args = CLI::parse();
     let expression = args
         .expression
@@ -58,8 +66,8 @@ fn main() {
     let json =
         Json::from_serde_value(serde_json::from_str::<Value>(json.as_str()).expect("invalid JSON"));
 
-    log::info!("input: '{}'", json);
-    log::info!("filter: '{}'", filter);
+    tracing::info!("input: '{}'", json);
+    tracing::info!("filter: '{}'", filter);
 
     let mut filters = builtin_filters();
     filters.extend(defs);

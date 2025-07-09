@@ -1,5 +1,6 @@
 use std::{collections::HashMap, vec};
 
+use tracing_subscriber::EnvFilter;
 use tree_sitter::Node;
 
 use crate::filter::Filter;
@@ -15,7 +16,7 @@ pub(crate) fn parse(code: &str) -> (HashMap<String, Filter>, Filter) {
     assert_eq!(tree.root_node().kind(), "program");
 
     print_ast(tree.root_node(), code, 0); // print AST
-    //print_node_details(tree.root_node(), code, 0);
+                                          //print_node_details(tree.root_node(), code, 0);
 
     let mut defs = HashMap::new();
 
@@ -23,7 +24,8 @@ pub(crate) fn parse(code: &str) -> (HashMap<String, Filter>, Filter) {
         let child = tree.root_node().child(i).unwrap();
         match child.kind() {
             "function_definition" => {
-                let _ = parse_filter(code, child, &mut defs);
+                let f = parse_filter(code, child, &mut defs);
+                tracing::trace!("Parsed function definition: {}", f);
             }
             "comment" => {}
             _ => {
@@ -74,7 +76,11 @@ pub(crate) fn parse_filter<'a>(
     root: Node<'a>,
     defs: &mut HashMap<String, Filter>,
 ) -> Filter {
-    log::trace!("{}: {}", root.kind(), &code[root.range().start_byte..root.range().end_byte]);
+    tracing::trace!(
+        "{}: {}",
+        root.kind(),
+        &code[root.range().start_byte..root.range().end_byte]
+    );
     match root.kind() {
         "dot" => Filter::Dot,
         "sequence_expression" => {
@@ -138,7 +144,7 @@ pub(crate) fn parse_filter<'a>(
             s => Filter::Call(s.to_string(), None),
         },
         "variable" => {
-            log::warn!("todo: variables are not yet supported");
+            tracing::warn!("todo: variables are not yet supported");
             unimplemented!(
                 "todo: variables are not yet supported, encountered '{}'",
                 &code[root.range().start_byte..root.range().end_byte]
@@ -241,8 +247,7 @@ pub(crate) fn parse_filter<'a>(
         "true" => Filter::Boolean(true),
         "false" => Filter::Boolean(false),
         "null" => Filter::Null,
-        "parenthesized_expression" =>
-         parse_filter(
+        "parenthesized_expression" => parse_filter(
             code,
             root.child(1)
                 .expect("paranthesized expression should have a value"),
@@ -345,45 +350,51 @@ pub(crate) fn parse_filter<'a>(
                     .expect("function definition should have a body"),
                 defs,
             );
+            tracing::trace!(
+                "Parsed function definition: {}({}) -> {}",
+                name,
+                args.join(", "),
+                body
+            );
             defs.insert(name.clone(), Filter::Bound(args, Box::new(body)));
             Filter::Dot
         }
 
-        "function_expression"  => {
-            // println!("Child count: {}", root.child_count());
-            // for i in 0..root.child_count() {
-            //     let child = root.child(i).unwrap();
-            //     let text = &code[child.range().start_byte..child.range().end_byte];
-            //     println!("Child {}: {} = '{}'", i, child.kind(), text);
-            // }
-    
-            let mut final_expr = Filter::Dot;
-            
+        "function_expression" => {
+            println!("Child count: {}", root.child_count());
             for i in 0..root.child_count() {
                 let child = root.child(i).unwrap();
-                
+                let text = &code[child.range().start_byte..child.range().end_byte];
+                println!("Child {}: {} = '{}'", i, child.kind(), text);
+            }
+
+            let mut final_expr = Filter::Dot;
+
+            let mut inner_defs = HashMap::new();
+
+            for i in 0..root.child_count() {
+                let child = root.child(i).unwrap();
+
                 match child.kind() {
                     "function_definition" => {
-                        let _ = parse_filter(code, child, defs);
+                        let _ = parse_filter(code, child, &mut inner_defs);
                     }
                     _ => {
-                        final_expr = parse_filter(code, child, defs);
+                        final_expr = parse_filter(code, child, &mut inner_defs);
                     }
                 }
             }
-    
-            final_expr
 
-    }
-                    
-      
-        |
-         "binding_expression" => {
+            let result = Filter::FunctionExpression(inner_defs, Box::new(final_expr));
+            tracing::trace!("Parsed function expression:\n{}", result);
+            result
+        }
+        "binding_expression" => {
             // .name as $nick e.g
 
             Filter::Dot
-         }
-         "optional_expression" => {
+        }
+        "optional_expression" => {
             println!("Child count: {}", root.child_count());
             for i in 0..root.child_count() {
                 let child = root.child(i).unwrap();
@@ -391,23 +402,23 @@ pub(crate) fn parse_filter<'a>(
                 println!("Child {}: {} = '{}'", i, child.kind(), text);
             }
             let field = root
-                    .child(0)
-                    .expect("optional expression should have the first child as its field");
-            
-                let identifier = parse_filter(
+                .child(0)
+                .expect("optional expression should have the first child as its field");
+
+            let identifier = parse_filter(
                 code,
-                field.child(1)
+                field
+                    .child(1)
                     .expect("field access should have the second child as its field"),
                 defs,
             );
             Filter::ObjIndex(identifier.to_string())
-            
-         }
-        | "reduce_expression"
+        }
+        "reduce_expression"
         | "assignment_expression"
         | "field_expression"
         | "foreach_expression" => {
-            log::warn!("todo: {} are not yet supported", root.kind());
+            tracing::warn!("todo: {} are not yet supported", root.kind());
             unimplemented!(
                 "todo: '{}' are not yet supported, encountered '{}'",
                 root.kind(),
@@ -415,7 +426,7 @@ pub(crate) fn parse_filter<'a>(
             );
         }
         _ => {
-            log::warn!(
+            tracing::warn!(
                 "unknown filter {} {}",
                 root.kind(),
                 code[root.range().start_byte..root.range().end_byte].to_string()
@@ -470,7 +481,7 @@ mod tests {
         let (defs, filter) = parse(code);
 
         assert_eq!(defs, HashMap::new());
-        
+
         assert_eq!(
             filter,
             Filter::BinOp(
@@ -480,4 +491,142 @@ mod tests {
             )
         );
     }
+
+    #[test]
+    fn test_parse_function_definition() {
+        let code = r#"
+            (def asd:  .[] ;  .) | asd
+        "#;
+        let (defs, filter) = parse(code);
+        assert_eq!(
+            defs.get("main").unwrap().clone(),
+            Filter::Bound(
+                vec![],
+                Box::new(Filter::FunctionExpression(
+                    HashMap::from([
+                        (
+                            "add".to_string(),
+                            Filter::Bound(
+                                vec!["a".to_string(), "b".to_string()],
+                                Box::new(Filter::BinOp(
+                                    Box::new(Filter::Call("a".to_string(), None)),
+                                    crate::filter::BinOp::Add,
+                                    Box::new(Filter::Call("b".to_string(), None))
+                                ))
+                            )
+                        ),
+                        (
+                            "sub".to_string(),
+                            Filter::Bound(
+                                vec!["a".to_string(), "b".to_string()],
+                                Box::new(Filter::BinOp(
+                                    Box::new(Filter::Call("a".to_string(), None)),
+                                    crate::filter::BinOp::Sub,
+                                    Box::new(Filter::Call("b".to_string(), None))
+                                ))
+                            )
+                        ),
+                        (
+                            "mul".to_string(),
+                            Filter::Bound(
+                                vec!["a".to_string(), "b".to_string()],
+                                Box::new(Filter::BinOp(
+                                    Box::new(Filter::Call("a".to_string(), None)),
+                                    crate::filter::BinOp::Mul,
+                                    Box::new(Filter::Call("b".to_string(), None))
+                                ))
+                            )
+                        ),
+                    ]),
+                    Box::new(Filter::Call(
+                        "add".to_string(),
+                        Some(vec![Filter::Number(1.0), Filter::Number(2.0)])
+                    ))
+                ))
+            )
+        );
+        assert_eq!(
+            filter,
+            Filter::Call(
+                "sub".to_string(),
+                Some(vec![Filter::Number(3.0), Filter::Number(1.0)])
+            )
+        );
+    }
+
+    #[test]
+    fn test_parse_variable() {
+        let filter = EnvFilter::from_default_env();
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_thread_ids(true)
+            .with_thread_names(true)
+            .with_file(true)
+            .with_line_number(true)
+            .init();
+
+        let code = r#"
+            def add(a; b): a + b;
+                def sub(a; b): a - b;
+                def mul(a; b): a * b;
+                add(1; 2);
+            sub(3; 1)
+        "#;
+        let (defs, filter) = parse(code);
+        assert_eq!(
+            defs.get("main").unwrap().clone(),
+            Filter::Bound(
+                vec![],
+                Box::new(Filter::FunctionExpression(
+                    HashMap::from([
+                        (
+                            "add".to_string(),
+                            Filter::Bound(
+                                vec!["a".to_string(), "b".to_string()],
+                                Box::new(Filter::BinOp(
+                                    Box::new(Filter::Call("a".to_string(), None)),
+                                    crate::filter::BinOp::Add,
+                                    Box::new(Filter::Call("b".to_string(), None))
+                                ))
+                            )
+                        ),
+                        (
+                            "sub".to_string(),
+                            Filter::Bound(
+                                vec!["a".to_string(), "b".to_string()],
+                                Box::new(Filter::BinOp(
+                                    Box::new(Filter::Call("a".to_string(), None)),
+                                    crate::filter::BinOp::Sub,
+                                    Box::new(Filter::Call("b".to_string(), None))
+                                ))
+                            )
+                        ),
+                        (
+                            "mul".to_string(),
+                            Filter::Bound(
+                                vec!["a".to_string(), "b".to_string()],
+                                Box::new(Filter::BinOp(
+                                    Box::new(Filter::Call("a".to_string(), None)),
+                                    crate::filter::BinOp::Mul,
+                                    Box::new(Filter::Call("b".to_string(), None))
+                                ))
+                            )
+                        ),
+                    ]),
+                    Box::new(Filter::Call(
+                        "add".to_string(),
+                        Some(vec![Filter::Number(1.0), Filter::Number(2.0)])
+                    ))
+                ))
+            )
+        );
+        assert_eq!(
+            filter,
+            Filter::Call(
+                "sub".to_string(),
+                Some(vec![Filter::Number(3.0), Filter::Number(1.0)])
+            )
+        );
+    }
+
 }

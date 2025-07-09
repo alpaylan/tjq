@@ -136,7 +136,7 @@ impl ShapeContext {
 
         self.shapes.iter_mut().for_each(|(k, v)| {
             if let Shape::TVar(t) = v {
-                log::debug!("Checking {t} == {k}");
+                tracing::debug!("Checking {t} == {k}");
                 if t == k {
                     *v = Shape::Blob;
                 }
@@ -155,7 +155,7 @@ impl ShapeContext {
         while let Some(t) = sorted.pop() {
             let shape = self.shapes.get(&t).unwrap().clone();
             if let Shape::TVar(t_) = shape {
-                log::debug!("Normalizing {t} -> {t_}");
+                tracing::debug!("Normalizing {t} -> {t_}");
                 if t == t_ {
                     self.shapes.insert(t, Shape::Blob);
                 } else {
@@ -407,8 +407,8 @@ impl Shape {
         ctx.shapes.insert(0, Shape::TVar(0));
 
         let mut results = Shape::build_shape(f, vec![Shape::TVar(0)], &mut ctx, filters);
-        log::debug!("type context: {:?}", ctx.shapes);
-        log::debug!("result types: {:?}", results);
+        tracing::debug!("type context: {:?}", ctx.shapes);
+        tracing::debug!("result types: {:?}", results);
         ctx.normalize();
 
         for result in results.iter_mut() {
@@ -439,7 +439,7 @@ impl Shape {
     }
 
     pub fn normalize(&self, shapes: &HashMap<usize, Shape>) -> Shape {
-        log::debug!("normalizing {self}");
+        tracing::debug!("normalizing {self}");
         match self {
             Shape::TVar(t) => {
                 let shape = shapes.get(t).unwrap().clone();
@@ -904,7 +904,7 @@ impl Shape {
                     crate::filter::BinOp::Div => todo!(),
                     crate::filter::BinOp::Mod => todo!(),
                     crate::filter::BinOp::Eq => {
-                        log::debug!("{output_type} == true ==> {left_type} == {right_type}");
+                        tracing::debug!("{output_type} == true ==> {left_type} == {right_type}");
                         cs.push(Constraint::Conditional {
                             c1: Box::new(Constraint::Comparison {
                                 t1: Shape::TVar(output_type),
@@ -1114,7 +1114,7 @@ impl Shape {
                 cs
             }
             Filter::Bound(items, filter) => todo!(),
-            Filter::LocalScope(_, _) => todo!(),
+            Filter::FunctionExpression(_, _) => todo!(),
         }
     }
 
@@ -1384,9 +1384,9 @@ impl Shape {
                 crate::BinOp::Add => {
                     let s1 = Shape::build_shape(l, shapes.clone(), ctx, filters);
                     let s2 = Shape::build_shape(r, shapes, ctx, filters);
-                    log::debug!("computing {l} + {r}");
-                    log::trace!("s1: {s1:?}");
-                    log::trace!("s2: {s2:?}");
+                    tracing::debug!("computing {l} + {r}");
+                    tracing::trace!("s1: {s1:?}");
+                    tracing::trace!("s2: {s2:?}");
 
                     let result = s1
                         .into_iter()
@@ -1510,7 +1510,7 @@ impl Shape {
                             }
                         })
                         .collect();
-                    log::debug!("result: {result:?}");
+                    tracing::debug!("result: {result:?}");
                     result
                 }
                 crate::BinOp::Sub => {
@@ -1519,7 +1519,7 @@ impl Shape {
                     s1.into_iter()
                         .zip(s2)
                         .map(|(l, r)| {
-                            log::debug!("computing {l} - {r}");
+                            tracing::debug!("computing {l} - {r}");
                             match (l, r) {
                                 // arr - arr
                                 (Shape::Array(shape1, u1), Shape::Array(shape2, u2)) => {
@@ -1559,7 +1559,7 @@ impl Shape {
                                     Shape::Number(None)
                                 }
                                 (l, r) => {
-                                    log::debug!("mismatch: {l} - {r}");
+                                    tracing::debug!("mismatch: {l} - {r}");
                                     Shape::Mismatch(Box::new(l), Box::new(r))
                                 }
                             }
@@ -1729,9 +1729,7 @@ impl Shape {
                 // todo: understand this better
                 Shape::build_shape(filter, shapes, ctx, filters)
             }
-            Filter::LocalScope(_, expr) => {
-                Shape::build_shape(expr, shapes, ctx, filters)
-            }
+            Filter::FunctionExpression(_, expr) => todo!(),
         }
     }
 

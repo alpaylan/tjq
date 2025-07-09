@@ -25,7 +25,7 @@
         //         .collect();
             
         //     if !local_only.is_empty() {
-        //         Filter::LocalScope(local_only, Box::new(expr))
+        //         Filter::FunctionExpression(local_only, Box::new(expr))
         //     } else {
         //         expr
         //     }
