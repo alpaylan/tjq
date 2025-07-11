@@ -1115,6 +1115,10 @@ impl Shape {
             }
             Filter::Bound(items, filter) => todo!(),
             Filter::FunctionExpression(_, _) => todo!(),
+            Filter::BindingExpression(_, _) => todo!(),
+            Filter::Variable(_) => todo!(),
+            Filter::ReduceExpression(_,_,_) => todo!(),
+
         }
     }
 
@@ -1730,6 +1734,10 @@ impl Shape {
                 Shape::build_shape(filter, shapes, ctx, filters)
             }
             Filter::FunctionExpression(_, expr) => todo!(),
+            Filter::BindingExpression(_, _ ) => todo!(),
+            Filter::Variable(_) => todo!(),
+            Filter::ReduceExpression(_,_,_) => todo!(),
+
         }
     }
 
