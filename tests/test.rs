@@ -427,5 +427,23 @@ fn test_long_test5() {
 }
 
 
+#[test]
+fn test_short_test11() {
+    // 1) invoke the tester
+    let name = String::from("test11");
+    let actual = tester("short", &name);
 
+    let expected_path = Path::new("tests")
+        .join("short")
+        .join(name)
+        .join("out.json");
+    let expected: Vec<Value> = serde_json::from_str(
+        &fs::read_to_string(&expected_path)
+            .expect("failed to read expected"),
+    )
+    .expect("expected file is not a JSON array");
+
+    // 3) compare
+    assert_eq!(actual, expected, "Mismatch in short/test1");
+}
 

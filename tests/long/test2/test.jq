@@ -12,6 +12,6 @@ def calc:
         | map(abs)
         | add
     }
-  | .res;
+  | .res | [.];
 
 calc
