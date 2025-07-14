@@ -1,0 +1,1 @@
+.[-1] | reduce .[] as $item (0; if($item > 5 ) then . + 1 else . end)

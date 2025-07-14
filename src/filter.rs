@@ -506,7 +506,7 @@ impl Filter {
             let init_results = Filter::filter(json, init, global_definitions, variable_ctx);
             let acc = match &init_results[0] {
                 Ok(Json::Number(n)) => *n,
-                _ => panic!("reduce init must produce a number"),
+                _ => panic!("reduce init must produce a number(other types are not implemented yet)"),
             };
             let mut acc = acc;
 

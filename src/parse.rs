@@ -443,15 +443,14 @@ pub(crate) fn parse_filter<'a>(
             Filter::ReduceExpression(var_def, Box::new(init), Box::new(update))
 
         }
-        "assignment_expression"
-        | "field_expression"
+        "assignment_expression" => {Filter::Dot}
         | "foreach_expression" => {
-            tracing::warn!("todo: {} are not yet supported", root.kind());
-            unimplemented!(
-                "todo: '{}' are not yet supported, encountered '{}'",
-                root.kind(),
-                &code[root.range().start_byte..root.range().end_byte]
-            );
+            
+
+            Filter::Dot
+        }
+        | "field_expression" => {
+          Filter::Dot
         }
         _ => {
             tracing::warn!(
