@@ -295,6 +295,9 @@ impl Compiler {
             Filter::IfThenElse(filter, filter1, filter2) => todo!(),
             Filter::Bound(items, filter) => todo!(),
             Filter::FunctionExpression(hash_map, filter) => todo!(),
+            Filter::BindingExpression(filter, filter1) => todo!(),
+            Filter::Variable(_) => todo!(),
+            Filter::ReduceExpression(hash_map, filter, filter1) => todo!(),
         }
     }
 }
@@ -307,7 +310,7 @@ impl Program {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    
 
     // #[test]
     // fn example_compile_dot() {

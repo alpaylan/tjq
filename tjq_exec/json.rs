@@ -54,11 +54,14 @@ where
     T: Into<Json>,
 {
     fn from(value: Vec<(&str, T)>) -> Self {
-        Json::Object(value.into_iter().map(|(k, v)| (k.to_string(), v.into())).collect())
+        Json::Object(
+            value
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.into()))
+                .collect(),
+        )
     }
 }
-
-
 
 impl<T> From<Option<T>> for Json
 where
@@ -137,7 +140,7 @@ impl Ord for Json {
                         other => return other,
                     }
                 }
-                
+
                 a1.len().cmp(&a2.len())
             }
             (Json::Array(_), _) => std::cmp::Ordering::Less,

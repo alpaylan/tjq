@@ -1,6 +1,6 @@
 use std::fmt::{self, Display, Formatter};
 
-use crate::filter::{UnOp, BinOp};
+use crate::filter::{BinOp, UnOp};
 use crate::json::Json;
 
 #[derive(Debug, Clone, PartialEq)]

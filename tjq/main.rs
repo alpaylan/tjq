@@ -1,12 +1,11 @@
-
 use std::collections::HashMap;
 
-use serde_json::Value;
 use clap::Parser;
 use clap_derive::Parser;
+use serde_json::Value;
 use tjq_exec::{Filter, Json};
-use tjq_semantics::Shape;
 use tjq_parser::{parse, parse_defs};
+use tjq_semantics::Shape;
 
 #[derive(Parser)]
 struct CLI {
@@ -22,13 +21,11 @@ struct CLI {
     verbose: bool,
 }
 
-
 pub fn builtin_filters() -> HashMap<String, Filter> {
     // read defs.jq
-    let defs = parse_defs(include_str!("defs.jq"));
-    defs
+    
+    parse_defs(include_str!("defs.jq"))
 }
-
 
 fn main() {
     tracing_subscriber::fmt()

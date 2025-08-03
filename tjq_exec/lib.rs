@@ -1,5 +1,4 @@
 mod bytecode;
-pub use bytecode::*;
 
 mod error;
 pub use error::*;

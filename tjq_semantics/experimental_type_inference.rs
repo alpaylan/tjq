@@ -1,3 +1,4 @@
+#![allow(unused_variables)]
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
@@ -358,7 +359,7 @@ pub fn compute_shape(
             }]
         }
         Filter::Array(filters) => {
-            let (mut cs, output_types) = filters
+            let (cs, output_types) = filters
                 .iter()
                 .map(|f| {
                     let output_type = ctx.fresh();
@@ -636,6 +637,9 @@ pub fn compute_shape(
         }
         Filter::Bound(items, filter) => todo!(),
         Filter::FunctionExpression(_, _) => todo!(),
+        Filter::BindingExpression(filter, filter1) => todo!(),
+        Filter::Variable(_) => todo!(),
+        Filter::ReduceExpression(hash_map, filter, filter1) => todo!(),
     }
 }
 
@@ -645,7 +649,7 @@ mod constraint_tests {
 
     use crate::experimental_type_inference::{compute_shape, solve};
 
-    use super::{Context, Shape};
+    use super::Context;
 
     #[test]
     fn test_subtyping() {

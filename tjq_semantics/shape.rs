@@ -1,6 +1,6 @@
 use std::{
     cmp::Ordering,
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fmt::{self, Display, Formatter},
 };
 
@@ -156,7 +156,7 @@ impl ShapeContext {
 
         let dependencies = shapes
             .iter()
-            .map(|(k, v)| (k.clone(), v.dependencies()))
+            .map(|(k, v)| (*k, v.dependencies()))
             .collect::<HashMap<_, _>>();
 
         let mut sorted = toposort(dependencies);
@@ -515,7 +515,7 @@ impl Shape {
                     Shape::Blob => {
                         let new_type_var = ctx.fresh();
                         ctx.shapes
-                            .insert(new_type_var.clone(), Shape::TVar(new_type_var.clone()));
+                            .insert(new_type_var, Shape::TVar(new_type_var));
                         // todo: check this
                         Shape::TVar(new_type_var)
                     }
@@ -525,12 +525,12 @@ impl Shape {
                         // <'I> + {s: <'T>}
                         let current_shape = Shape::merge_shapes(
                             current_shape,
-                            Shape::Object(vec![(s.clone(), Shape::TVar(new_type_var.clone()))]),
+                            Shape::Object(vec![(s.clone(), Shape::TVar(new_type_var))]),
                             ctx,
                         );
                         ctx.shapes.insert(t, current_shape);
                         ctx.shapes
-                            .insert(new_type_var.clone(), Shape::TVar(new_type_var.clone()));
+                            .insert(new_type_var, Shape::TVar(new_type_var));
                         Shape::TVar(new_type_var)
                     }
                     Shape::Null => Shape::Null,
@@ -575,7 +575,7 @@ impl Shape {
                     Shape::Blob => {
                         let new_type_var = ctx.fresh();
                         ctx.shapes
-                            .insert(new_type_var.clone(), Shape::TVar(new_type_var.clone()));
+                            .insert(new_type_var, Shape::TVar(new_type_var));
                         Shape::TVar(new_type_var)
                     }
                     Shape::TVar(t) => {
@@ -584,13 +584,13 @@ impl Shape {
                         // <'I> + {s: <'T>}
                         let current_shape = Shape::merge_shapes(
                             current_shape,
-                            Shape::Array(Box::new(Shape::TVar(new_type_var.clone())), Some(*u)),
+                            Shape::Array(Box::new(Shape::TVar(new_type_var)), Some(*u)),
                             ctx,
                         );
 
                         ctx.shapes.insert(t, current_shape);
                         ctx.shapes
-                            .insert(new_type_var.clone(), Shape::TVar(new_type_var.clone()));
+                            .insert(new_type_var, Shape::TVar(new_type_var));
 
                         Shape::TVar(new_type_var)
                     }
@@ -631,7 +631,7 @@ impl Shape {
                     Shape::Blob => {
                         let new_type_var = ctx.fresh();
                         ctx.shapes
-                            .insert(new_type_var.clone(), Shape::TVar(new_type_var.clone()));
+                            .insert(new_type_var, Shape::TVar(new_type_var));
                         vec![Shape::TVar(new_type_var)]
                     }
                     Shape::TVar(t) => {
@@ -639,12 +639,12 @@ impl Shape {
                         let current_shape = ctx.shapes.get(&t).unwrap().clone();
                         let current_shape = Shape::merge_shapes(
                             current_shape,
-                            Shape::Array(Box::new(Shape::TVar(new_type_var.clone())), None),
+                            Shape::Array(Box::new(Shape::TVar(new_type_var)), None),
                             ctx,
                         );
                         ctx.shapes.insert(t, current_shape);
                         ctx.shapes
-                            .insert(new_type_var.clone(), Shape::TVar(new_type_var.clone()));
+                            .insert(new_type_var, Shape::TVar(new_type_var));
 
                         vec![Shape::TVar(new_type_var)]
                     }
@@ -1065,7 +1065,7 @@ impl Shape {
                 Some(args) => {
                     let filter = filters
                         .get(name)
-                        .expect(format!("filter {name} not found").as_str());
+                        .unwrap_or_else(|| panic!("filter {name} not found"));
                     if let Filter::Bound(vars, filter) = filter {
                         let mut filter = *filter.clone();
                         for (var, arg) in vars.iter().zip(args.iter()) {
@@ -1103,10 +1103,9 @@ impl Shape {
                 Shape::build_shape(filter, shapes, ctx, filters)
             }
             Filter::FunctionExpression(_, expr) => todo!(),
-            Filter::BindingExpression(_, _ ) => todo!(),
+            Filter::BindingExpression(_, _) => todo!(),
             Filter::Variable(_) => todo!(),
-            Filter::ReduceExpression(_,_,_) => todo!(),
-
+            Filter::ReduceExpression(_, _, _) => todo!(),
         }
     }
 
@@ -1117,7 +1116,7 @@ impl Shape {
                 let current_shape = ctx.shapes.get(&t).unwrap().clone();
                 match current_shape {
                     Shape::Blob => {
-                        ctx.shapes.insert(t.clone(), s.clone());
+                        ctx.shapes.insert(t, s.clone());
                         s
                     }
                     Shape::TVar(t1) => {
@@ -1128,7 +1127,7 @@ impl Shape {
                     }
                     _ => {
                         let current_shape = Shape::merge_shapes(current_shape, s.clone(), ctx);
-                        ctx.shapes.insert(t.clone(), current_shape.clone());
+                        ctx.shapes.insert(t, current_shape.clone());
                         current_shape
                     }
                 }
@@ -1357,7 +1356,7 @@ impl Shape {
             }
             Shape::Mismatch(s1, s2) => Some(ShapeMismatch::new(path, *s1.clone(), *s2.clone())),
             Shape::Union(s1, s2) => {
-                let (matches, mismatches): (Vec<_>, Vec<_>) = vec![s1, s2]
+                let (matches, mismatches): (Vec<_>, Vec<_>) = [s1, s2]
                     .iter()
                     .map(|s| Shape::check(s, j.clone(), path.clone()))
                     .partition(Option::is_none);
@@ -1410,7 +1409,7 @@ impl Shape {
             }
             Shape::Mismatch(s1, s2) => Some(ShapeMismatch::new(path, *s1.clone(), *s2.clone())),
             Shape::Union(s1, s2) => {
-                let (_, mismatches): (Vec<_>, Vec<_>) = vec![s1, s2]
+                let (_, mismatches): (Vec<_>, Vec<_>) = [s1, s2]
                     .iter()
                     .map(|s| s.check_self(path.clone()))
                     .partition(Option::is_none);
@@ -1427,7 +1426,7 @@ mod tests {
     use std::collections::HashMap;
     use tjq_exec::{BinOp, Filter, Json, UnOp};
 
-fn builtin_filters() -> HashMap<String, Filter> {
+    fn builtin_filters() -> HashMap<String, Filter> {
         let map = Filter::Bound(
             vec!["f".into()],
             Box::new(Filter::Array(vec![Filter::Pipe(
@@ -1522,7 +1521,7 @@ fn builtin_filters() -> HashMap<String, Filter> {
 
         filters
     }
-    
+
     #[test]
     fn test_plus1() {
         let json = Json::Number(1.0);
