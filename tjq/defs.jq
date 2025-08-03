@@ -117,10 +117,10 @@ def all: all(.[]; .);
 def any: any(.[]; .);
 
 # Walking
-# todo(function_expression): def walk(f): def rec: (.[]? |= rec) | f; rec;
+# todo(assignment expression) def walk(f): def rec: (.[]? |= rec) | f; rec;
 
 # todo(function_expression): def flatten: [recurse(arrays[]) | select(isarray | not)];
-# todo(variables): def flatten($d): if $d > 0 then map(if isarray then flatten($d-1) else [.] end) | add end;
+def flatten($d): if $d > 0 then map(if isarray then flatten($d-1) else [.] end) | add end;
 
 # Regular expressions
 # todo(add): def capture_of_match: map(select(.name) | { (.name): .string} ) | add + {};

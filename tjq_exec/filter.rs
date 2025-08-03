@@ -31,6 +31,11 @@ pub enum Filter {
     IfThenElse(Box<Filter>, Box<Filter>, Box<Filter>),        // if <f_1> then <f_2> else <f_3>
     Bound(Vec<String>, Box<Filter>),                          // \<s_1>, <s_2>... <f>
     FunctionExpression(HashMap<String, Filter>, Box<Filter>), // local_defs, <f>
+    BindingExpression(Box<Filter>,  Box<Filter>),             //
+    Variable(String),                                          // $var
+    ReduceExpression(HashMap<String, Filter> , Box<Filter>, Box<Filter>)
+
+
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +60,7 @@ pub enum UnOp {
     Neg, // -
     Not, // not
 }
+
 
 impl Display for Filter {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -123,6 +129,17 @@ impl Display for Filter {
                 }
                 write!(f, "{})", expr)
             }
+            Filter::BindingExpression(filter, pattern) => {
+                write!(f, "{} as {}", filter, pattern)
+            }
+            Filter::Variable(s) => write!(f, "${s}"),
+            Filter::ReduceExpression(var_def , expr, num) => {
+                for (name, local_filter) in var_def {
+                    write!(f, "variable")?;
+                }
+                write!(f, "{}", expr)
+            }
+            
         }
     }
 }
@@ -155,6 +172,34 @@ impl Display for UnOp {
         }
     }
 }
+
+fn destructure_pattern(
+    val: &Json,
+    pat: &Filter,
+    variable_ctx: &mut HashMap<String, Filter>,
+) {
+    match pat {
+        Filter::Variable(name) => {
+            let lit = match val {
+                Json::Null       => Filter::Null,
+                Json::Boolean(b) => Filter::Boolean(*b),
+                Json::Number(n)  => Filter::Number(*n),
+                Json::String(s)  => Filter::String(s.clone()),
+                Json::Array(_) => todo!(),
+                Json::Object(_) => todo!(),
+               
+            };
+            variable_ctx.insert(name.clone(), lit);
+        }
+        Filter::Array(pats) => todo!(), //match these patterns
+
+        Filter::Object(pairs) => todo!(),
+
+        _ => {}
+        
+    }
+}
+
 
 impl Filter {
     pub fn filter(
@@ -434,7 +479,69 @@ impl Filter {
                 }
                 Filter::filter(json, expr, &scoped_filters, variable_ctx)
             }
-        }
+            Filter::BindingExpression(lhs, pat) => {
+                    let bind_vals = Filter::filter(json, lhs, global_definitions, variable_ctx);
+                    let orig = json.clone();
+                    bind_vals
+                        .into_iter()
+                        .map(|res| match res {
+                            Ok(j) => {
+                                destructure_pattern(&j, pat, variable_ctx);
+                                Ok(orig.clone())   
+                            }
+                            Err(e) => Err(e),
+                        })
+                        .collect()
+                }
+
+            Filter::Variable(name) => {
+                if let Some(bound_f) = variable_ctx.get(name) {
+                let bound_clone = bound_f.clone();
+                Filter::filter(json, &bound_clone, global_definitions, variable_ctx)
+                } 
+            else {
+                vec![Err(JQError::FilterNotDefined(name.clone(), 0))]
+                }   
+            }
+            Filter::ReduceExpression(var_def, init, update) => {
+            let init_results = Filter::filter(json, init, global_definitions, variable_ctx);
+            let acc = match &init_results[0] {
+                Ok(Json::Number(n)) => *n,
+                _ => panic!("reduce init must produce a number(other types are not implemented yet)"),
+            };
+            let mut acc = acc;
+
+            for (var_name, src_filter) in var_def {
+                let elems = Filter::filter(json, &src_filter, global_definitions, variable_ctx);
+                for e in elems {
+                    let elem_json = e.clone().unwrap(); 
+
+                    let lit = match elem_json {
+                        Json::Number(n)  => Filter::Number(n),
+                        Json::Boolean(b) => Filter::Boolean(b),
+                        Json::String(s)  => Filter::String(s),
+                        Json::Null       => Filter::Null,
+                        _ => panic!("reduce only supports primitives for now"),
+                    };
+                    variable_ctx.insert(var_name.clone(), lit);
+
+                        let upd_results = Filter::filter(
+                            &Json::Number(acc),
+                            update,
+                            global_definitions,
+                            variable_ctx,
+                        );
+                        acc = match &upd_results[0] {
+                            Ok(Json::Number(n)) => *n,
+                            _ => panic!("reduce update must produce a number"),
+                        };
+                    }
+                }
+
+                        vec![Ok(Json::Number(acc))]
+                    }    
+                        
+                }
     }
 
     pub fn substitute(&self, var: &str, arg: &Filter) -> Filter {
@@ -511,6 +618,9 @@ impl Filter {
                 Box::new(filter2.substitute(var, arg)),
             ),
             Filter::Bound(items, filter) => todo!(),
+            Filter::BindingExpression(_, _) => todo!(),
+            Filter::Variable(_) => todo!(),
+            Filter::ReduceExpression(_,_,_) => todo!(),
         }
     }
 }

@@ -20,7 +20,7 @@ pub fn parse(code: &str) -> (HashMap<String, Filter>, Filter) {
                                           //print_node_details(tree.root_node(), code, 0);
 
     let mut defs = HashMap::new();
-
+    
     for i in 0..tree.root_node().child_count() - 1 {
         let child = tree.root_node().child(i).unwrap();
         match child.kind() {
@@ -72,6 +72,7 @@ pub fn parse_defs(code: &str) -> HashMap<String, Filter> {
     defs
 }
 
+
 pub(crate) fn parse_filter<'a>(
     code: &str,
     root: Node<'a>,
@@ -82,6 +83,7 @@ pub(crate) fn parse_filter<'a>(
         root.kind(),
         &code[root.range().start_byte..root.range().end_byte]
     );
+    
     match root.kind() {
         "dot" => Filter::Dot,
         "sequence_expression" => {
@@ -145,11 +147,9 @@ pub(crate) fn parse_filter<'a>(
             s => Filter::Call(s.to_string(), None),
         },
         "variable" => {
-            tracing::warn!("todo: variables are not yet supported");
-            unimplemented!(
-                "todo: variables are not yet supported, encountered '{}'",
-                &code[root.range().start_byte..root.range().end_byte]
-            );
+            let name = &code[root.range().start_byte + 1 .. root.range().end_byte];
+            Filter::Variable(name.to_string())
+            
         }
         "array" => {
             if root.child_count() == 2 {
@@ -254,6 +254,16 @@ pub(crate) fn parse_filter<'a>(
                 .expect("paranthesized expression should have a value"),
             defs,
         ),
+        // "paranthesized_expression" => {
+        //     let mut inner_defs = defs.clone();
+
+        //     parse_filter(code,
+        //          root.child(1)
+        //                 .expect("paranthesized expression should have a value"),
+        //          &mut inner_defs,
+                 
+        // )
+        // }
         "if_expression" => {
             let cond = parse_filter(
                 code,
@@ -362,15 +372,8 @@ pub(crate) fn parse_filter<'a>(
         }
 
         "function_expression" => {
-            println!("Child count: {}", root.child_count());
-            for i in 0..root.child_count() {
-                let child = root.child(i).unwrap();
-                let text = &code[child.range().start_byte..child.range().end_byte];
-                println!("Child {}: {} = '{}'", i, child.kind(), text);
-            }
-
+    
             let mut final_expr = Filter::Dot;
-
             let mut inner_defs = HashMap::new();
 
             for i in 0..root.child_count() {
@@ -391,17 +394,21 @@ pub(crate) fn parse_filter<'a>(
             result
         }
         "binding_expression" => {
-            // .name as $nick e.g
 
-            Filter::Dot
+            // println!("Child count: {}", root.child_count());
+            // for i in 0..root.child_count() {
+            //     let child = root.child(i).unwrap();
+            //     let text = &code[child.range().start_byte..child.range().end_byte];
+            //     println!("Child {}: {} = '{}'", i, child.kind(), text);
+            // }
+
+            let lhs = parse_filter(code, root.child(0).unwrap(), defs);
+            let pat = parse_filter(code, root.child(2).unwrap(), defs);
+            Filter::BindingExpression(Box::new(lhs), Box::new(pat))
+
         }
         "optional_expression" => {
-            println!("Child count: {}", root.child_count());
-            for i in 0..root.child_count() {
-                let child = root.child(i).unwrap();
-                let text = &code[child.range().start_byte..child.range().end_byte];
-                println!("Child {}: {} = '{}'", i, child.kind(), text);
-            }
+
             let field = root
                 .child(0)
                 .expect("optional expression should have the first child as its field");
@@ -415,16 +422,36 @@ pub(crate) fn parse_filter<'a>(
             );
             Filter::ObjIndex(identifier.to_string())
         }
-        "reduce_expression"
-        | "assignment_expression"
-        | "field_expression"
+        "reduce_expression" => {
+            // println!("Child count: {}", root.child_count());
+            // for i in 0..root.child_count() {
+            //     let child = root.child(i).unwrap();
+            //     let text = &code[child.range().start_byte..child.range().end_byte];
+            //     println!("Child {}: {} = '{}'", i, child.kind(), text);
+            // }
+            let bind = root.child(1).unwrap();
+            let source_node = bind.child(0).unwrap();
+            let var_node    = bind.child(2).unwrap();
+            let source = parse_filter(code, source_node, defs);
+            
+            let var_name = &code[var_node.range().start_byte + 1 .. var_node.range().end_byte];
+            let mut var_def = HashMap::new();
+            var_def.insert(var_name.to_string(), source.clone());
+
+            let init   = parse_filter(code, root.child(3).unwrap(), defs);
+            let update = parse_filter(code, root.child(5).unwrap(), defs);
+
+            Filter::ReduceExpression(var_def, Box::new(init), Box::new(update))
+
+        }
+        "assignment_expression" => {Filter::Dot}
         | "foreach_expression" => {
-            tracing::warn!("todo: {} are not yet supported", root.kind());
-            unimplemented!(
-                "todo: '{}' are not yet supported, encountered '{}'",
-                root.kind(),
-                &code[root.range().start_byte..root.range().end_byte]
-            );
+            
+
+            Filter::Dot
+        }
+        | "field_expression" => {
+          Filter::Dot
         }
         _ => {
             tracing::warn!(

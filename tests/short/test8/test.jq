@@ -1,0 +1,1 @@
+. | split(",\\s*"; "") | map(ltrimstr(" ") | rtrimstr(" ")) #csv parser
