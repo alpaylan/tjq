@@ -1,18 +1,12 @@
-mod error;
 
+use std::collections::HashMap;
+
+use serde_json::Value;
 use clap::Parser;
 use clap_derive::Parser;
-
-use error::*;
-mod filter;
-use filter::*;
-mod json;
-use json::*;
-mod shape;
-use serde_json::Value;
-use shape::*;
-mod parse;
-use parse::*;
+use tjq_exec::{Filter, Json};
+use tjq_semantics::Shape;
+use tjq_parser::{parse, parse_defs};
 
 #[derive(Parser)]
 struct CLI {
@@ -28,7 +22,23 @@ struct CLI {
     verbose: bool,
 }
 
+
+pub fn builtin_filters() -> HashMap<String, Filter> {
+    // read defs.jq
+    let defs = parse_defs(include_str!("defs.jq"));
+    defs
+}
+
+
 fn main() {
+    tracing_subscriber::fmt()
+        .with_target(false)
+        .with_thread_ids(true)
+        .with_thread_names(true)
+        .with_file(true)
+        .with_line_number(true)
+        .init();
+
     let args = CLI::parse();
     let expression = args
         .expression
@@ -56,8 +66,8 @@ fn main() {
     let json =
         Json::from_serde_value(serde_json::from_str::<Value>(json.as_str()).expect("invalid JSON"));
 
-    log::info!("input: '{}'", json);
-    log::info!("filter: '{}'", filter);
+    tracing::info!("input: '{}'", json);
+    tracing::info!("filter: '{}'", filter);
 
     let mut filters = builtin_filters();
     filters.extend(defs);

@@ -6,29 +6,36 @@ use std::{
 
 use itertools::Itertools;
 
-use crate::{parse_defs, JQError, Json};
+use crate::error::JQError;
+use crate::json::Json;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Filter {
-    Dot,                                               // .
-    Pipe(Box<Filter>, Box<Filter>),                    // <f_1> | <f_2>
-    Comma(Box<Filter>, Box<Filter>),                   // <f_1>, <f_2>
-    ObjIndex(String),                                  // .<s>
-    ArrayIndex(isize),                                 // .[<n>]
-    ArrayIterator,                                     // .[]
-    Null,                                              // null
-    Boolean(bool),                                     // true | false
-    Number(f64),                                       // 1, 2..
-    String(String),                                    // "abc"
-    Array(Vec<Filter>),                                // [...]
-    Object(Vec<(Filter, Filter)>),                     // {...}
-    UnOp(UnOp, Box<Filter>),                           // <op> <f>
-    BinOp(Box<Filter>, BinOp, Box<Filter>),            // <f_1> <op> <f_2>
-    Empty,                                             // Empty
-    Error,                                             // Error
-    Call(String, Option<Vec<Filter>>),                 // <s>(<f_1>, <f_2>...)
-    IfThenElse(Box<Filter>, Box<Filter>, Box<Filter>), // if <f_1> then <f_2> else <f_3>
-    Bound(Vec<String>, Box<Filter>),                   // \<s_1>, <s_2>... <f>
+    Dot,                                                      // .
+    Pipe(Box<Filter>, Box<Filter>),                           // <f_1> | <f_2>
+    Comma(Box<Filter>, Box<Filter>),                          // <f_1>, <f_2>
+    ObjIndex(String),                                         // .<s>
+    ArrayIndex(isize),                                        // .[<n>]
+    ArrayIterator,                                            // .[]
+    Null,                                                     // null
+    Boolean(bool),                                            // true | false
+    Number(f64),                                              // 1, 2..
+    String(String),                                           // "abc"
+    Array(Vec<Filter>),                                       // [...]
+    Object(Vec<(Filter, Filter)>),                            // {...}
+    UnOp(UnOp, Box<Filter>),                                  // <op> <f>
+    BinOp(Box<Filter>, BinOp, Box<Filter>),                   // <f_1> <op> <f_2>
+    Empty,                                                    // Empty
+    Error,                                                    // Error
+    Call(String, Option<Vec<Filter>>),                        // <s>(<f_1>, <f_2>...)
+    IfThenElse(Box<Filter>, Box<Filter>, Box<Filter>),        // if <f_1> then <f_2> else <f_3>
+    Bound(Vec<String>, Box<Filter>),                          // \<s_1>, <s_2>... <f>
+    FunctionExpression(HashMap<String, Filter>, Box<Filter>), // local_defs, <f>
+    BindingExpression(Box<Filter>,  Box<Filter>),             //
+    Variable(String),                                          // $var
+    ReduceExpression(HashMap<String, Filter> , Box<Filter>, Box<Filter>)
+
+
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +60,7 @@ pub enum UnOp {
     Neg, // -
     Not, // not
 }
+
 
 impl Display for Filter {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -115,6 +123,23 @@ impl Display for Filter {
             Filter::Bound(_, filter) => {
                 write!(f, " {}", filter)
             }
+            Filter::FunctionExpression(local_defs, expr) => {
+                for (name, local_filter) in local_defs {
+                    write!(f, "def {name}: {local_filter}; ")?;
+                }
+                write!(f, "{})", expr)
+            }
+            Filter::BindingExpression(filter, pattern) => {
+                write!(f, "{} as {}", filter, pattern)
+            }
+            Filter::Variable(s) => write!(f, "${s}"),
+            Filter::ReduceExpression(var_def , expr, num) => {
+                for (name, local_filter) in var_def {
+                    write!(f, "variable")?;
+                }
+                write!(f, "{}", expr)
+            }
+            
         }
     }
 }
@@ -148,27 +173,53 @@ impl Display for UnOp {
     }
 }
 
+fn destructure_pattern(
+    val: &Json,
+    pat: &Filter,
+    variable_ctx: &mut HashMap<String, Filter>,
+) {
+    match pat {
+        Filter::Variable(name) => {
+            let lit = match val {
+                Json::Null       => Filter::Null,
+                Json::Boolean(b) => Filter::Boolean(*b),
+                Json::Number(n)  => Filter::Number(*n),
+                Json::String(s)  => Filter::String(s.clone()),
+                Json::Array(_) => todo!(),
+                Json::Object(_) => todo!(),
+               
+            };
+            variable_ctx.insert(name.clone(), lit);
+        }
+        Filter::Array(pats) => todo!(), //match these patterns
+
+        Filter::Object(pairs) => todo!(),
+
+        _ => {}
+        
+    }
+}
 
 
 impl Filter {
     pub fn filter(
         json: &Json,
         filter: &Filter,
-        filters: &HashMap<String, Filter>,
+        global_definitions: &HashMap<String, Filter>,
         variable_ctx: &mut HashMap<String, Filter>,
     ) -> Vec<Result<Json, JQError>> {
         match filter {
             Filter::Dot => vec![Ok(json.clone())],
-            Filter::Pipe(f1, f2) => Filter::filter(json, f1, filters, variable_ctx)
+            Filter::Pipe(f1, f2) => Filter::filter(json, f1, global_definitions, variable_ctx)
                 .into_iter()
                 .flat_map(|result| {
-                    result.map(|json| Filter::filter(&json, f2, filters, variable_ctx))
+                    result.map(|json| Filter::filter(&json, f2, global_definitions, variable_ctx))
                 })
                 .flatten()
                 .collect::<Vec<_>>(),
             Filter::Comma(f1, f2) => [
-                Filter::filter(json, f1, filters, variable_ctx),
-                Filter::filter(json, f2, filters, variable_ctx),
+                Filter::filter(json, f1, global_definitions, variable_ctx),
+                Filter::filter(json, f2, global_definitions, variable_ctx),
             ]
             .concat(),
             Filter::ObjIndex(s) => vec![match json {
@@ -205,7 +256,7 @@ impl Filter {
             Filter::Array(arr) => {
                 let results = arr
                     .iter()
-                    .flat_map(|f| Filter::filter(json, f, filters, variable_ctx))
+                    .flat_map(|f| Filter::filter(json, f, global_definitions, variable_ctx))
                     .collect::<Vec<_>>();
                 let (results, errs): (Vec<_>, Vec<_>) =
                     results.into_iter().partition(Result::is_ok);
@@ -223,8 +274,8 @@ impl Filter {
                     .iter()
                     .map(|(f1, f2)| {
                         (
-                            Filter::filter(json, f1, filters, variable_ctx),
-                            Filter::filter(json, f2, filters, variable_ctx),
+                            Filter::filter(json, f1, global_definitions, variable_ctx),
+                            Filter::filter(json, f2, global_definitions, variable_ctx),
                         )
                     })
                     .collect();
@@ -275,7 +326,7 @@ impl Filter {
                 }
             }
             Filter::UnOp(un_op, f) => {
-                let results = Filter::filter(json, f, filters, variable_ctx);
+                let results = Filter::filter(json, f, global_definitions, variable_ctx);
                 results
                     .into_iter()
                     .map(|result| match result {
@@ -294,8 +345,8 @@ impl Filter {
                     .collect()
             }
             Filter::BinOp(l, bin_op, r) => {
-                let ls = Filter::filter(json, l, filters, variable_ctx);
-                let rs = Filter::filter(json, r, filters, variable_ctx);
+                let ls = Filter::filter(json, l, global_definitions, variable_ctx);
+                let rs = Filter::filter(json, r, global_definitions, variable_ctx);
 
                 itertools::iproduct!(ls, rs)
                     .map(|(l, r)| match (l, r) {
@@ -364,7 +415,7 @@ impl Filter {
             Filter::Call(name, filters_) => match filters_ {
                 Some(args) => {
                     // Find the filter with the given name
-                    let filter = filters
+                    let filter = global_definitions
                         .get(name)
                         .expect(format!("Filter '{name}' not found").as_str());
                     // The filter should have the same number of arguments as the number of arguments passed
@@ -373,7 +424,7 @@ impl Filter {
                             return vec![Err(JQError::FilterNotDefined(name.clone(), args.len()))];
                         }
                         // Bind the arguments to the parameters
-                        let mut filters = filters.clone();
+                        let mut filters = global_definitions.clone();
                         for (param, arg) in params.iter().zip(args.iter()) {
                             filters.insert(param.clone(), arg.clone());
                         }
@@ -383,22 +434,30 @@ impl Filter {
                     }
                 }
                 None => {
-                    let filter = filters
-                        .get(name)
-                        .expect(format!("Filter '{name}' not found").as_str());
-                    Filter::filter(json, filter, filters, variable_ctx)
+                    let filter = global_definitions.get(name).ok_or_else(|| {
+                        JQError::FilterNotDefined(
+                            name.to_string(),
+                            filters_.as_ref().map_or(0, |f| f.len()),
+                        )
+                    });
+                    match filter {
+                        Err(err) => vec![Err(err.clone())],
+                        Ok(filter) => {
+                            Filter::filter(json, filter, global_definitions, variable_ctx)
+                        }
+                    }
                 }
             },
             Filter::IfThenElse(filter, filter1, filter2) => {
-                let results = Filter::filter(json, filter, filters, variable_ctx);
+                let results = Filter::filter(json, filter, global_definitions, variable_ctx);
                 results
                     .into_iter()
                     .map(|result| {
                         result.map(|json_| {
                             if let Json::Boolean(true) = json_ {
-                                Filter::filter(json, filter1, filters, variable_ctx)
+                                Filter::filter(json, filter1, global_definitions, variable_ctx)
                             } else {
-                                Filter::filter(json, filter2, filters, variable_ctx)
+                                Filter::filter(json, filter2, global_definitions, variable_ctx)
                             }
                         })
                     })
@@ -407,13 +466,82 @@ impl Filter {
                     .collect()
             }
             Filter::Bound(items, filter) => {
-                for item in items {
-                    todo!()
+                // for item in items {
+                //     todo!()
+                // }
+
+                Filter::filter(json, filter, global_definitions, variable_ctx)
+            }
+            Filter::FunctionExpression(local_defs, expr) => {
+                let mut scoped_filters = global_definitions.clone();
+                for (name, local_filter) in local_defs {
+                    scoped_filters.insert(name.clone(), local_filter.clone());
+                }
+                Filter::filter(json, expr, &scoped_filters, variable_ctx)
+            }
+            Filter::BindingExpression(lhs, pat) => {
+                    let bind_vals = Filter::filter(json, lhs, global_definitions, variable_ctx);
+                    let orig = json.clone();
+                    bind_vals
+                        .into_iter()
+                        .map(|res| match res {
+                            Ok(j) => {
+                                destructure_pattern(&j, pat, variable_ctx);
+                                Ok(orig.clone())   
+                            }
+                            Err(e) => Err(e),
+                        })
+                        .collect()
                 }
 
-                Filter::filter(json, filter, filters, variable_ctx)
+            Filter::Variable(name) => {
+                if let Some(bound_f) = variable_ctx.get(name) {
+                let bound_clone = bound_f.clone();
+                Filter::filter(json, &bound_clone, global_definitions, variable_ctx)
+                } 
+            else {
+                vec![Err(JQError::FilterNotDefined(name.clone(), 0))]
+                }   
             }
-        }
+            Filter::ReduceExpression(var_def, init, update) => {
+            let init_results = Filter::filter(json, init, global_definitions, variable_ctx);
+            let acc = match &init_results[0] {
+                Ok(Json::Number(n)) => *n,
+                _ => panic!("reduce init must produce a number(other types are not implemented yet)"),
+            };
+            let mut acc = acc;
+
+            for (var_name, src_filter) in var_def {
+                let elems = Filter::filter(json, &src_filter, global_definitions, variable_ctx);
+                for e in elems {
+                    let elem_json = e.clone().unwrap(); 
+
+                    let lit = match elem_json {
+                        Json::Number(n)  => Filter::Number(n),
+                        Json::Boolean(b) => Filter::Boolean(b),
+                        Json::String(s)  => Filter::String(s),
+                        Json::Null       => Filter::Null,
+                        _ => panic!("reduce only supports primitives for now"),
+                    };
+                    variable_ctx.insert(var_name.clone(), lit);
+
+                        let upd_results = Filter::filter(
+                            &Json::Number(acc),
+                            update,
+                            global_definitions,
+                            variable_ctx,
+                        );
+                        acc = match &upd_results[0] {
+                            Ok(Json::Number(n)) => *n,
+                            _ => panic!("reduce update must produce a number"),
+                        };
+                    }
+                }
+
+                        vec![Ok(Json::Number(acc))]
+                    }    
+                        
+                }
     }
 
     pub fn substitute(&self, var: &str, arg: &Filter) -> Filter {
@@ -473,28 +601,140 @@ impl Filter {
                     )
                 }
             }
+            Filter::FunctionExpression(local_defs, expr) => {
+                if local_defs.contains_key(var) {
+                    self.clone()
+                } else {
+                    let new_local_defs = local_defs
+                        .iter()
+                        .map(|(name, filter)| (name.clone(), filter.substitute(var, arg)))
+                        .collect();
+                    Filter::FunctionExpression(new_local_defs, Box::new(expr.substitute(var, arg)))
+                }
+            }
             Filter::IfThenElse(filter, filter1, filter2) => Filter::IfThenElse(
                 Box::new(filter.substitute(var, arg)),
                 Box::new(filter1.substitute(var, arg)),
                 Box::new(filter2.substitute(var, arg)),
             ),
             Filter::Bound(items, filter) => todo!(),
+            Filter::BindingExpression(_, _) => todo!(),
+            Filter::Variable(_) => todo!(),
+            Filter::ReduceExpression(_,_,_) => todo!(),
         }
     }
 }
 
-pub fn builtin_filters() -> HashMap<String, Filter> {
-    // read defs.jq
-    let defs = parse_defs(include_str!("defs.jq"));
-    defs
+impl From<&str> for Filter {
+    fn from(s: &str) -> Self {
+        Filter::String(s.to_string())
+    }
 }
 
 #[cfg(test)]
 mod tests {
 
-    use std::vec;
+    use std::{collections::HashMap, vec};
 
-    use crate::{filter::builtin_filters, BinOp, Filter, Json};
+    use tracing_subscriber::EnvFilter;
+
+    use crate::{BinOp, Filter, Json, UnOp};
+
+    fn builtin_filters() -> HashMap<String, Filter> {
+        let map = Filter::Bound(
+            vec!["f".into()],
+            Box::new(Filter::Array(vec![Filter::Pipe(
+                Box::new(Filter::ArrayIterator),
+                Box::new(Filter::Call("f".to_string(), None)),
+            )])),
+        );
+
+        let abs = Filter::Bound(
+            vec![],
+            Box::new(Filter::IfThenElse(
+                Box::new(Filter::BinOp(
+                    Box::new(Filter::Dot),
+                    BinOp::Lt,
+                    Box::new(Filter::Number(0.0)),
+                )),
+                Box::new(Filter::UnOp(UnOp::Neg, Box::new(Filter::Dot))),
+                Box::new(Filter::Dot),
+            )),
+        );
+
+        let isboolean = Filter::Bound(
+            vec![],
+            Box::new(Filter::BinOp(
+                Box::new(Filter::BinOp(
+                    Box::new(Filter::Dot),
+                    BinOp::Eq,
+                    Box::new(Filter::Boolean(true)),
+                )),
+                BinOp::Or,
+                Box::new(Filter::BinOp(
+                    Box::new(Filter::Dot),
+                    BinOp::Eq,
+                    Box::new(Filter::Boolean(false)),
+                )),
+            )),
+        );
+
+        // def type:
+        //     if . == null then "null"
+        //     elif isboolean then "boolean"
+        //     elif . < "" then "number"
+        //     elif . < [] then "string"
+        //     elif . < {} then "array"
+        //     else             "object" end;
+        let type_ = Filter::Bound(
+            vec![],
+            Box::new(Filter::IfThenElse(
+                Box::new(Filter::BinOp(
+                    Box::new(Filter::Dot),
+                    BinOp::Eq,
+                    Box::new(Filter::Null),
+                )),
+                Box::new(Filter::String("null".to_string())),
+                Box::new(Filter::IfThenElse(
+                    Box::new(Filter::Call("isboolean".to_string(), None)),
+                    Box::new(Filter::String("boolean".to_string())),
+                    Box::new(Filter::IfThenElse(
+                        Box::new(Filter::BinOp(
+                            Box::new(Filter::Dot),
+                            BinOp::Lt,
+                            Box::new(Filter::String("".to_string())),
+                        )),
+                        Box::new(Filter::String("number".to_string())),
+                        Box::new(Filter::IfThenElse(
+                            Box::new(Filter::BinOp(
+                                Box::new(Filter::Dot),
+                                BinOp::Lt,
+                                Box::new(Filter::Array(vec![])),
+                            )),
+                            Box::new(Filter::String("string".to_string())),
+                            Box::new(Filter::IfThenElse(
+                                Box::new(Filter::BinOp(
+                                    Box::new(Filter::Dot),
+                                    BinOp::Lt,
+                                    Box::new(Filter::Object(vec![])),
+                                )),
+                                Box::new(Filter::String("array".to_string())),
+                                Box::new(Filter::String("object".to_string())),
+                            )),
+                        )),
+                    )),
+                )),
+            )),
+        );
+
+        let mut filters = HashMap::new();
+        filters.insert("map".to_string(), map);
+        filters.insert("abs".to_string(), abs);
+        filters.insert("isboolean".to_string(), isboolean);
+        filters.insert("type".to_string(), type_);
+
+        filters
+    }
 
     #[test]
     fn test_plus() {
@@ -668,5 +908,75 @@ mod tests {
         for result in results {
             println!("Result: {}", result.unwrap());
         }
+    }
+
+    #[test]
+    fn test_interpret_function_definition() {
+        let filter = EnvFilter::from_default_env();
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_thread_ids(true)
+            .with_thread_names(true)
+            .with_file(true)
+            .with_line_number(true)
+            .init();
+
+        let mut defs = HashMap::new();
+        defs.insert(
+            "main".to_string(),
+            Filter::Bound(
+                vec![],
+                Box::new(Filter::FunctionExpression(
+                    HashMap::from([
+                        (
+                            "add".to_string(),
+                            Filter::Bound(
+                                vec!["a".to_string(), "b".to_string()],
+                                Box::new(Filter::BinOp(
+                                    Box::new(Filter::Call("a".to_string(), None)),
+                                    BinOp::Add,
+                                    Box::new(Filter::Call("b".to_string(), None)),
+                                )),
+                            ),
+                        ),
+                        (
+                            "sub".to_string(),
+                            Filter::Bound(
+                                vec!["a".to_string(), "b".to_string()],
+                                Box::new(Filter::BinOp(
+                                    Box::new(Filter::Call("a".to_string(), None)),
+                                    BinOp::Sub,
+                                    Box::new(Filter::Call("b".to_string(), None)),
+                                )),
+                            ),
+                        ),
+                        (
+                            "mul".to_string(),
+                            Filter::Bound(
+                                vec!["a".to_string(), "b".to_string()],
+                                Box::new(Filter::BinOp(
+                                    Box::new(Filter::Call("a".to_string(), None)),
+                                    BinOp::Mul,
+                                    Box::new(Filter::Call("b".to_string(), None)),
+                                )),
+                            ),
+                        ),
+                    ]),
+                    Box::new(Filter::Call(
+                        "add".to_string(),
+                        Some(vec![Filter::Number(1.0), Filter::Number(2.0)]),
+                    )),
+                )),
+            ),
+        );
+
+        let filter = Filter::Call("main".to_string(), None);
+        let results = Filter::filter(&Json::Null, &filter, &defs, &mut Default::default());
+        assert_eq!(
+            results,
+            vec![Ok(Json::Number(3.0))],
+            "Expected 3.0, got: {:?}",
+            results
+        );
     }
 }

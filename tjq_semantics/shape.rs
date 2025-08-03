@@ -4,7 +4,7 @@ use std::{
     fmt::{self, Display, Formatter},
 };
 
-use crate::{Filter, Json};
+use tjq_exec::{BinOp, Filter, Json, UnOp};
 use topological_sort::TopologicalSort;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -20,9 +20,19 @@ pub enum Shape {
     Object(Vec<(String, Shape)>),
     Mismatch(Box<Shape>, Box<Shape>),
     Union(Box<Shape>, Box<Shape>),
-    Stream(Vec<Shape>),
 }
 
+pub enum Type {
+    Arrow(Box<Shape>, Box<Shape>), // A -> B
+}
+
+// . : |- A -> A
+// 3 : |- A -> number<3>
+// f1 | f2 : (f1 : A -> B), (f2 : A -> C) |- (A -> C)
+
+// 3 + .
+// 3 + . : number
+// 3 + . : (null -> number<3>) | (number -> number)
 #[derive(Debug, Clone, PartialEq)]
 pub enum Access {
     Field(String),
@@ -108,7 +118,6 @@ impl Display for Shape {
             }
             Shape::Mismatch(s1, s2) => write!(f, "({s1} >< {s2})"),
             Shape::Union(s1, s2) => write!(f, "({s1} | {s2})"),
-            Shape::Stream(shapes) => todo!(),
         }
     }
 }
@@ -136,7 +145,7 @@ impl ShapeContext {
 
         self.shapes.iter_mut().for_each(|(k, v)| {
             if let Shape::TVar(t) = v {
-                log::debug!("Checking {t} == {k}");
+                tracing::debug!("Checking {t} == {k}");
                 if t == k {
                     *v = Shape::Blob;
                 }
@@ -155,7 +164,7 @@ impl ShapeContext {
         while let Some(t) = sorted.pop() {
             let shape = self.shapes.get(&t).unwrap().clone();
             if let Shape::TVar(t_) = shape {
-                log::debug!("Normalizing {t} -> {t_}");
+                tracing::debug!("Normalizing {t} -> {t_}");
                 if t == t_ {
                     self.shapes.insert(t, Shape::Blob);
                 } else {
@@ -187,227 +196,14 @@ pub enum Subtyping {
     Incompatible,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq)]
-pub enum Comparison {
-    Equal,
-    NotEqual,
-    GreaterThan,
-    GreaterThanOrEqual,
-    LessThan,
-    LessThanOrEqual,
-}
-
-impl Display for Comparison {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self {
-            Comparison::Equal => write!(f, "=="),
-            Comparison::NotEqual => write!(f, "!="),
-            Comparison::GreaterThan => write!(f, ">"),
-            Comparison::GreaterThanOrEqual => write!(f, ">="),
-            Comparison::LessThan => write!(f, "<"),
-            Comparison::LessThanOrEqual => write!(f, "<="),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum Constraint {
-    Subtyping {
-        t1: Shape,
-        rel: Subtyping,
-        t2: Shape,
-    },
-    Comparison {
-        t1: Shape,
-        rel: Comparison,
-        t2: Shape,
-    },
-    Conditional {
-        c1: Box<Constraint>,
-        c2: Box<Constraint>,
-    },
-    Or(Vec<Constraint>),
-    And(Vec<Constraint>),
-    Error,
-}
-
-impl Display for Constraint {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self {
-            Constraint::Subtyping { t1, rel, t2 } => match rel {
-                Subtyping::Subtype => write!(f, "{} <: {}", t1, t2),
-                Subtyping::Supertype => write!(f, "{} <: {}", t2, t1),
-                Subtyping::Incompatible => unreachable!(),
-            },
-            Constraint::Conditional { c1, c2 } => {
-                write!(f, "{} ==> {}", c1, c2)
-            }
-            Constraint::Comparison { t1, rel, t2 } => {
-                write!(f, "{} {} {}", t1, rel, t2)
-            }
-            Constraint::Or(cs) => {
-                write!(f, "(")?;
-                for (i, c) in cs.iter().enumerate() {
-                    if i != 0 {
-                        write!(f, " | ")?;
-                    }
-                    write!(f, "{}", c)?;
-                }
-                write!(f, ")")
-            }
-            Constraint::And(constraints) => {
-                write!(f, "(")?;
-                for (i, c) in constraints.iter().enumerate() {
-                    if i != 0 {
-                        write!(f, " & ")?;
-                    }
-                    write!(f, "{}", c)?;
-                }
-                write!(f, ")")
-            }
-            Constraint::Error => {
-                write!(f, "error")
-            }
-        }
-    }
-}
-
-impl Constraint {
-    pub fn dependencies(&self) -> Vec<usize> {
-        match self {
-            Constraint::Subtyping { t1, t2, .. } => {
-                let mut deps = t1.dependencies();
-                deps.extend(t2.dependencies());
-                deps
-            }
-            Constraint::Comparison { t1, t2, .. } => {
-                let mut deps = t1.dependencies();
-                deps.extend(t2.dependencies());
-                deps
-            }
-            Constraint::Conditional { c1, c2 } => {
-                let mut deps = c1.dependencies();
-                deps.extend(c2.dependencies());
-                deps
-            }
-            Constraint::Or(cs) => cs.iter().flat_map(|c| c.dependencies()).collect(),
-            Constraint::And(cs) => cs.iter().flat_map(|c| c.dependencies()).collect(),
-            Constraint::Error => vec![],
-        }
-    }
-}
-type Constraints = Vec<Constraint>;
-
-#[derive(Debug)]
-struct TypeEnv {
-    equalities: HashMap<usize, Shape>, // Var -> Resolved
-    subtypes: Vec<(Shape, Shape)>,     // T1 <: T2
-    implications: Vec<(Constraint, Constraint)>,
-    inequalities: Vec<(Shape, Shape)>, // T1 != T2
-    facts: HashSet<Constraint>,
-}
-
-impl TypeEnv {
-    pub fn new() -> Self {
-        TypeEnv {
-            equalities: HashMap::new(),
-            subtypes: vec![],
-            implications: vec![],
-            inequalities: vec![],
-            facts: HashSet::new(),
-        }
-    }
-}
-
-struct TypeError {
-    message: String,
-}
-
-fn solve(constraints: Vec<Constraint>, ctx: &Context) -> Result<TypeEnv, TypeError> {
-    let mut env = TypeEnv::new();
-
-    for i in 0..ctx.vars {
-        env.equalities.insert(i, Shape::TVar(i));
-    }
-
-    let mut worklist = constraints;
-
-    while let Some(c) = worklist.pop() {
-        match c {
-            Constraint::Comparison {
-                t1,
-                rel: Comparison::Equal,
-                t2,
-            } => match (t1, t2) {
-                (Shape::TVar(t1), Shape::TVar(t2)) => {
-                    match t1.cmp(&t2) {
-                        Ordering::Less => env.equalities.insert(t2, Shape::TVar(t1)),
-                        Ordering::Equal => continue,
-                        Ordering::Greater => env.equalities.insert(t1, Shape::TVar(t2)),
-                    };
-                }
-                (Shape::TVar(t), t2) => {
-                    env.equalities.insert(t, t2);
-                }
-                (t1, Shape::TVar(t)) => {
-                    env.equalities.insert(t, t1);
-                }
-                _ => todo!(),
-            },
-            Constraint::Comparison { t1, rel, t2 } => todo!(),
-            Constraint::Subtyping { t1, rel, t2 } => match rel {
-                Subtyping::Subtype => {
-                    env.subtypes.push((t1, t2));
-                }
-                Subtyping::Supertype => {
-                    env.subtypes.push((t2, t1));
-                }
-                Subtyping::Incompatible => todo!(),
-            },
-            Constraint::Conditional { c1, c2 } => env.implications.push((*c1, *c2)),
-            Constraint::Or(constraints) => todo!(),
-            Constraint::And(constraints) => todo!(),
-            Constraint::Error => todo!(),
-        }
-    }
-
-    println!("TypeEnv: {:?}", env.equalities);
-
-    Ok(env)
-}
-
-// impl Display for Constraints {
-//     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-//         for c in &self.constraints {
-//             write!(f, "{}\n", c)?;
-//         }
-//         Ok(())
-//     }
-// }
-
-pub struct Context {
-    pub vars: usize,
-}
-
-impl Context {
-    fn new() -> Self {
-        Context { vars: 0 }
-    }
-
-    fn fresh(&mut self) -> usize {
-        self.vars += 1;
-        self.vars
-    }
-}
-
 impl Shape {
     pub fn new(f: &Filter, filters: &HashMap<String, Filter>) -> (Shape, Vec<Shape>) {
         let mut ctx = ShapeContext::new();
         ctx.shapes.insert(0, Shape::TVar(0));
 
         let mut results = Shape::build_shape(f, vec![Shape::TVar(0)], &mut ctx, filters);
-        log::debug!("type context: {:?}", ctx.shapes);
-        log::debug!("result types: {:?}", results);
+        tracing::debug!("type context: {:?}", ctx.shapes);
+        tracing::debug!("result types: {:?}", results);
         ctx.normalize();
 
         for result in results.iter_mut() {
@@ -433,12 +229,11 @@ impl Shape {
                 .into_iter()
                 .chain(s2.dependencies())
                 .collect(),
-            Shape::Stream(shapes) => todo!(),
         }
     }
 
     pub fn normalize(&self, shapes: &HashMap<usize, Shape>) -> Shape {
-        log::debug!("normalizing {self}");
+        tracing::debug!("normalizing {self}");
         match self {
             Shape::TVar(t) => {
                 let shape = shapes.get(t).unwrap().clone();
@@ -474,7 +269,6 @@ impl Shape {
                 Box::new(s1.normalize(shapes)),
                 Box::new(s2.normalize(shapes)),
             ),
-            Shape::Stream(shapes) => todo!(),
         }
     }
 
@@ -680,7 +474,6 @@ impl Shape {
                     }
                 }
             },
-            Shape::Stream(shapes) => todo!(),
         }
     }
 
@@ -696,423 +489,6 @@ impl Shape {
                     .map(|(k, v)| (k, Shape::from_json(v)))
                     .collect(),
             ),
-        }
-    }
-
-    pub fn compute_shape(
-        f: &Filter,
-        ctx: &mut Context,
-        input_type: usize,
-        output_type: usize,
-    ) -> Constraints {
-        match f {
-            Filter::Dot => {
-                vec![Constraint::Comparison {
-                    t1: Shape::TVar(input_type),
-                    rel: Comparison::Equal,
-                    t2: Shape::TVar(output_type),
-                }]
-            }
-            Filter::Pipe(f1, f2) => {
-                let mid_type = ctx.fresh();
-                let mut cs = vec![];
-
-                cs.extend(Self::compute_shape(f1, ctx, input_type, mid_type));
-                cs.extend(Self::compute_shape(f2, ctx, mid_type, output_type));
-
-                cs
-            }
-            Filter::Comma(f1, f2) => {
-                let left_output_type = ctx.fresh();
-                let right_output_type = ctx.fresh();
-
-                let mut cs = vec![];
-                cs.extend(Self::compute_shape(f1, ctx, input_type, left_output_type));
-                cs.extend(Self::compute_shape(f2, ctx, input_type, right_output_type));
-
-                // output_type = left_output_type, right_output_type
-                cs.push(Constraint::Comparison {
-                    t1: Shape::Stream(vec![
-                        Shape::TVar(left_output_type),
-                        Shape::TVar(right_output_type),
-                    ]),
-                    rel: Comparison::Equal,
-                    t2: Shape::TVar(output_type),
-                });
-
-                cs
-            }
-            Filter::ObjIndex(s) => {
-                // input_type <: { s: output_type }
-                vec![Constraint::Subtyping {
-                    t1: Shape::TVar(input_type),
-                    rel: Subtyping::Subtype,
-                    t2: Shape::Object(vec![(s.clone(), Shape::TVar(output_type))]),
-                }]
-            }
-            Filter::ArrayIndex(n) => {
-                // input_type <: [output_type]
-                if *n >= 0 {
-                    vec![Constraint::Subtyping {
-                        t1: Shape::TVar(input_type),
-                        rel: Subtyping::Subtype,
-                        t2: Shape::Tuple(
-                            [
-                                vec![Shape::Blob; *n as usize],
-                                vec![Shape::TVar(output_type)],
-                            ]
-                            .concat(),
-                        ),
-                    }]
-                } else {
-                    vec![
-                        Constraint::Subtyping {
-                            t1: Shape::TVar(input_type),
-                            rel: Subtyping::Subtype,
-                            t2: Shape::Array(Box::new(Shape::Blob), Some(*n)),
-                        },
-                        Constraint::Comparison {
-                            t1: Shape::TVar(output_type),
-                            rel: Comparison::Equal,
-                            t2: Shape::Null,
-                        },
-                    ]
-                }
-            }
-            Filter::ArrayIterator => {
-                // todo: figure out object iteration
-                // output_type <: [input_type]
-
-                // this is the type of a single element of the output stream
-                let single_output_type = ctx.fresh();
-
-                vec![
-                    // input must have been an array of the single_output_type
-                    // [single_output_type] = input_type
-                    Constraint::Subtyping {
-                        t1: Shape::TVar(input_type),
-                        rel: Subtyping::Subtype,
-                        t2: Shape::Array(Box::new(Shape::TVar(single_output_type)), None),
-                    },
-                    // output must be a stream of the single_output_type
-                    // output_type = S<single_output_type>
-                    Constraint::Subtyping {
-                        t1: Shape::TVar(single_output_type),
-                        rel: Subtyping::Subtype,
-                        t2: Shape::Stream(vec![Shape::TVar(single_output_type)]),
-                    },
-                ]
-            }
-            Filter::Null => {
-                // output_type = null
-                vec![Constraint::Comparison {
-                    t1: Shape::TVar(output_type),
-                    rel: Comparison::Equal,
-                    t2: Shape::Null,
-                }]
-            }
-            Filter::Boolean(b) => {
-                // output_type = bool
-                vec![Constraint::Comparison {
-                    t1: Shape::TVar(output_type),
-                    rel: Comparison::Equal,
-                    t2: Shape::Bool(Some(*b)),
-                }]
-            }
-            Filter::Number(n) => {
-                // output_type = number
-                vec![Constraint::Comparison {
-                    t1: Shape::TVar(output_type),
-                    rel: Comparison::Equal,
-                    t2: Shape::Number(Some(*n)),
-                }]
-            }
-            Filter::String(s) => {
-                // output_type = string
-                vec![Constraint::Comparison {
-                    t1: Shape::TVar(output_type),
-                    rel: Comparison::Equal,
-                    t2: Shape::String(Some(s.clone())),
-                }]
-            }
-            Filter::Array(filters) => {
-                let (mut cs, output_types) = filters
-                    .iter()
-                    .map(|f| {
-                        let output_type = ctx.fresh();
-                        (
-                            Self::compute_shape(f, ctx, input_type, output_type),
-                            Shape::TVar(output_type),
-                        )
-                    })
-                    .fold((vec![], vec![]), |(mut cs, mut output_types), (c, t)| {
-                        cs.extend(c);
-                        output_types.push(t);
-                        (cs, output_types)
-                    });
-
-                cs.push(Constraint::Comparison {
-                    t1: Shape::Array(Box::new(Shape::Stream(output_types)), None),
-                    rel: Comparison::Equal,
-                    t2: Shape::TVar(output_type),
-                });
-
-                cs
-            }
-            Filter::Object(items) => {
-                let (mut cs, output_types) = items
-                    .iter()
-                    .map(|(k, f)| {
-                        let output_type = ctx.fresh();
-                        let cs = Self::compute_shape(f, ctx, input_type, output_type);
-                        if let Filter::String(s) = k {
-                            (cs, (s.clone(), Shape::TVar(output_type)))
-                        } else {
-                            panic!("Unsupported object key type, expected string, found {k:?}")
-                        }
-                    })
-                    .fold((vec![], vec![]), |(mut cs, mut output_types), (c, t)| {
-                        cs.extend(c);
-                        output_types.push(t);
-                        (cs, output_types)
-                    });
-
-                cs.push(Constraint::Comparison {
-                    t1: Shape::Object(output_types),
-                    rel: Comparison::Equal,
-                    t2: Shape::TVar(output_type),
-                });
-
-                cs
-            }
-            Filter::UnOp(un_op, filter) => todo!(),
-            Filter::BinOp(filter, bin_op, filter1) => {
-                let left_type = ctx.fresh();
-                let right_type = ctx.fresh();
-
-                let mut cs = vec![];
-                cs.extend(Self::compute_shape(filter, ctx, input_type, left_type));
-                cs.extend(Self::compute_shape(filter1, ctx, input_type, right_type));
-
-                match bin_op {
-                    crate::filter::BinOp::Add => {
-                        todo!()
-                    }
-                    crate::filter::BinOp::Sub => todo!(),
-                    crate::filter::BinOp::Mul => todo!(),
-                    crate::filter::BinOp::Div => todo!(),
-                    crate::filter::BinOp::Mod => todo!(),
-                    crate::filter::BinOp::Eq => {
-                        log::debug!("{output_type} == true ==> {left_type} == {right_type}");
-                        cs.push(Constraint::Conditional {
-                            c1: Box::new(Constraint::Comparison {
-                                t1: Shape::TVar(output_type),
-                                rel: Comparison::Equal,
-                                t2: Shape::Bool(Some(true)),
-                            }),
-                            c2: Box::new(Constraint::Comparison {
-                                t1: Shape::TVar(left_type),
-                                rel: Comparison::Equal,
-                                t2: Shape::TVar(right_type),
-                            }),
-                        });
-
-                        cs.push(Constraint::Conditional {
-                            c1: Box::new(Constraint::Comparison {
-                                t1: Shape::TVar(output_type),
-                                rel: Comparison::Equal,
-                                t2: Shape::Bool(Some(false)),
-                            }),
-                            c2: Box::new(Constraint::Comparison {
-                                t1: Shape::TVar(left_type),
-                                rel: Comparison::NotEqual,
-                                t2: Shape::TVar(right_type),
-                            }),
-                        });
-
-                        cs.push(Constraint::Subtyping {
-                            t1: Shape::TVar(output_type),
-                            rel: Subtyping::Subtype,
-                            t2: Shape::Bool(None),
-                        });
-
-                        cs
-                    }
-                    crate::filter::BinOp::Ne => todo!(),
-                    crate::filter::BinOp::Gt => todo!(),
-                    crate::filter::BinOp::Ge => todo!(),
-                    crate::filter::BinOp::Lt => todo!(),
-                    crate::filter::BinOp::Le => todo!(),
-                    crate::filter::BinOp::And => todo!(),
-                    crate::filter::BinOp::Or => {
-                        // if the output is true, then either left or right must be true
-                        cs.push(Constraint::Conditional {
-                            c1: Box::new(Constraint::Comparison {
-                                t1: Shape::TVar(output_type),
-                                rel: Comparison::Equal,
-                                t2: Shape::Bool(Some(true)),
-                            }),
-                            c2: Box::new(Constraint::Or(vec![
-                                Constraint::Comparison {
-                                    t1: Shape::TVar(left_type),
-                                    rel: Comparison::Equal,
-                                    t2: Shape::Bool(Some(true)),
-                                },
-                                Constraint::Comparison {
-                                    t1: Shape::TVar(right_type),
-                                    rel: Comparison::Equal,
-                                    t2: Shape::Bool(Some(true)),
-                                },
-                            ])),
-                        });
-
-                        // if the output is false, then both left and right must be false
-                        cs.push(Constraint::Conditional {
-                            c1: Box::new(Constraint::Comparison {
-                                t1: Shape::TVar(output_type),
-                                rel: Comparison::Equal,
-                                t2: Shape::Bool(Some(false)),
-                            }),
-                            c2: Box::new(Constraint::And(vec![
-                                Constraint::Comparison {
-                                    t1: Shape::TVar(left_type),
-                                    rel: Comparison::Equal,
-                                    t2: Shape::Bool(Some(false)),
-                                },
-                                Constraint::Comparison {
-                                    t1: Shape::TVar(right_type),
-                                    rel: Comparison::Equal,
-                                    t2: Shape::Bool(Some(false)),
-                                },
-                            ])),
-                        });
-
-                        // left and right and output must be of type bool
-                        cs.push(Constraint::Subtyping {
-                            t1: Shape::TVar(output_type),
-                            rel: Subtyping::Subtype,
-                            t2: Shape::Bool(None),
-                        });
-
-                        cs.push(Constraint::Subtyping {
-                            t1: Shape::TVar(left_type),
-                            rel: Subtyping::Subtype,
-                            t2: Shape::Bool(None),
-                        });
-
-                        cs.push(Constraint::Subtyping {
-                            t1: Shape::TVar(right_type),
-                            rel: Subtyping::Subtype,
-                            t2: Shape::Bool(None),
-                        });
-
-                        cs
-                    }
-                }
-            }
-            Filter::Empty => todo!(),
-            Filter::Error => {
-                // output_type = error
-                vec![Constraint::Error]
-            }
-            Filter::Call(_, filters) => todo!(),
-            Filter::IfThenElse(if_, then, else_) => {
-                let mut cs = vec![];
-
-                let if_type = ctx.fresh();
-
-                cs.extend(Self::compute_shape(if_, ctx, input_type, if_type));
-
-                // if expression must evaluate to a boolean
-                cs.push(Constraint::Subtyping {
-                    t1: Shape::TVar(if_type),
-                    rel: Subtyping::Subtype,
-                    t2: Shape::Bool(None),
-                });
-
-                let then_type = ctx.fresh();
-                let then_cs = Self::compute_shape(then, ctx, input_type, then_type);
-                // if the if expression is true, then the then expression must be of type then_type
-                cs.push(Constraint::Conditional {
-                    c1: Box::new(Constraint::Comparison {
-                        t1: Shape::TVar(if_type),
-                        rel: Comparison::Equal,
-                        t2: Shape::Bool(Some(true)),
-                    }),
-                    c2: Box::new(Constraint::Subtyping {
-                        t1: Shape::TVar(then_type),
-                        rel: Subtyping::Subtype,
-                        t2: Shape::TVar(output_type),
-                    }),
-                });
-                // if the if expression is true, then the then expression should constrain the types.
-                cs.push(Constraint::Conditional {
-                    c1: Box::new(Constraint::Comparison {
-                        t1: Shape::TVar(if_type),
-                        rel: Comparison::Equal,
-                        t2: Shape::Bool(Some(true)),
-                    }),
-                    c2: Box::new(Constraint::And(then_cs.clone())),
-                });
-
-                // if the if expression is false, then the else expression must be of type else_type
-                let else_type = ctx.fresh();
-                cs.push(Constraint::Conditional {
-                    c1: Box::new(Constraint::Comparison {
-                        t1: Shape::TVar(if_type),
-                        rel: Comparison::Equal,
-                        t2: Shape::Bool(Some(false)),
-                    }),
-                    c2: Box::new(Constraint::Subtyping {
-                        t1: Shape::TVar(else_type),
-                        rel: Subtyping::Subtype,
-                        t2: Shape::TVar(output_type),
-                    }),
-                });
-                // if the if expression is false, then the else expression should constrain the types.
-                let else_cs = Self::compute_shape(else_, ctx, input_type, else_type);
-                cs.push(Constraint::Conditional {
-                    c1: Box::new(Constraint::Comparison {
-                        t1: Shape::TVar(if_type),
-                        rel: Comparison::Equal,
-                        t2: Shape::Bool(Some(false)),
-                    }),
-                    c2: Box::new(Constraint::And(else_cs.clone())),
-                });
-
-                // if the if expression is unknown, then the then and else expressions will be unioned
-                cs.push(Constraint::Conditional {
-                    c1: Box::new(Constraint::Comparison {
-                        t1: Shape::TVar(if_type),
-                        rel: Comparison::Equal,
-                        t2: Shape::Bool(None),
-                    }),
-                    c2: Box::new(Constraint::Subtyping {
-                        t1: Shape::Union(
-                            Box::new(Shape::TVar(then_type)),
-                            Box::new(Shape::TVar(else_type)),
-                        ),
-                        rel: Subtyping::Subtype,
-                        t2: Shape::TVar(output_type),
-                    }),
-                });
-
-                // if the if expression is unknown, then the then and else expressions should constrain the types.
-                cs.push(Constraint::Conditional {
-                    c1: Box::new(Constraint::Comparison {
-                        t1: Shape::TVar(if_type),
-                        rel: Comparison::Equal,
-                        t2: Shape::Bool(None),
-                    }),
-                    c2: Box::new(Constraint::Or(vec![
-                        Constraint::And(then_cs),
-                        Constraint::And(else_cs),
-                    ])),
-                });
-
-                cs
-            }
-            Filter::Bound(items, filter) => todo!(),
         }
     }
 
@@ -1191,7 +567,6 @@ impl Shape {
                     }
                     Shape::Mismatch(s1, s2) => todo!(),
                     Shape::Union(s1, s2) => todo!(),
-                    Shape::Stream(shapes) => todo!(),
                 })
                 .collect(),
             Filter::ArrayIndex(u) => shapes
@@ -1248,7 +623,6 @@ impl Shape {
                     ),
                     Shape::Mismatch(s1, s2) => todo!(),
                     Shape::Union(s1, s2) => todo!(),
-                    Shape::Stream(shapes) => todo!(),
                 })
                 .collect(),
             Filter::ArrayIterator => shapes
@@ -1295,7 +669,6 @@ impl Shape {
                     Shape::Object(vec) => vec.into_iter().map(|(_, shape)| shape).collect(),
                     Shape::Mismatch(s1, s2) => todo!(),
                     Shape::Union(s1, s2) => todo!(),
-                    Shape::Stream(shapes) => todo!(),
                 })
                 .collect(),
             Filter::Null => vec![Shape::Null],
@@ -1343,7 +716,7 @@ impl Shape {
                 })
                 .collect(),
             Filter::UnOp(op, filter) => match op {
-                crate::UnOp::Not => {
+                UnOp::Not => {
                     let s = Shape::build_shape(filter, shapes, ctx, filters);
                     s.into_iter()
                         .map(|s| match s {
@@ -1360,7 +733,7 @@ impl Shape {
                         })
                         .collect()
                 }
-                crate::UnOp::Neg => {
+                UnOp::Neg => {
                     let s = Shape::build_shape(filter, shapes, ctx, filters);
                     s.into_iter()
                         .map(|s| match s {
@@ -1379,12 +752,12 @@ impl Shape {
                 }
             },
             Filter::BinOp(l, op, r) => match op {
-                crate::BinOp::Add => {
+                BinOp::Add => {
                     let s1 = Shape::build_shape(l, shapes.clone(), ctx, filters);
                     let s2 = Shape::build_shape(r, shapes, ctx, filters);
-                    log::debug!("computing {l} + {r}");
-                    log::trace!("s1: {s1:?}");
-                    log::trace!("s2: {s2:?}");
+                    tracing::debug!("computing {l} + {r}");
+                    tracing::trace!("s1: {s1:?}");
+                    tracing::trace!("s2: {s2:?}");
 
                     let result = s1
                         .into_iter()
@@ -1510,16 +883,16 @@ impl Shape {
                             }
                         })
                         .collect();
-                    log::debug!("result: {result:?}");
+                    tracing::debug!("result: {result:?}");
                     result
                 }
-                crate::BinOp::Sub => {
+                BinOp::Sub => {
                     let s1 = Shape::build_shape(l, shapes.clone(), ctx, filters);
                     let s2 = Shape::build_shape(r, shapes, ctx, filters);
                     s1.into_iter()
                         .zip(s2)
                         .map(|(l, r)| {
-                            log::debug!("computing {l} - {r}");
+                            tracing::debug!("computing {l} - {r}");
                             match (l, r) {
                                 // arr - arr
                                 (Shape::Array(shape1, u1), Shape::Array(shape2, u2)) => {
@@ -1559,14 +932,14 @@ impl Shape {
                                     Shape::Number(None)
                                 }
                                 (l, r) => {
-                                    log::debug!("mismatch: {l} - {r}");
+                                    tracing::debug!("mismatch: {l} - {r}");
                                     Shape::Mismatch(Box::new(l), Box::new(r))
                                 }
                             }
                         })
                         .collect()
                 }
-                crate::BinOp::Mul => {
+                BinOp::Mul => {
                     let s1 = Shape::build_shape(l, shapes.clone(), ctx, filters);
                     let s2 = Shape::build_shape(r, shapes, ctx, filters);
 
@@ -1629,7 +1002,7 @@ impl Shape {
                         })
                         .collect()
                 }
-                crate::BinOp::Div | crate::BinOp::Mod => {
+                BinOp::Div | BinOp::Mod => {
                     let s1 = Shape::build_shape(l, shapes.clone(), ctx, filters);
                     let s2 = Shape::build_shape(r, shapes, ctx, filters);
 
@@ -1642,8 +1015,8 @@ impl Shape {
                                     (None, None) => Shape::Number(None),
                                     (Some(n1), None) | (None, Some(n1)) => Shape::Number(Some(n1)),
                                     (Some(n1), Some(n2)) => match op {
-                                        crate::BinOp::Div => Shape::Number(Some(n1 / n2)),
-                                        crate::BinOp::Mod => Shape::Number(Some(n1 % n2)),
+                                        BinOp::Div => Shape::Number(Some(n1 / n2)),
+                                        BinOp::Mod => Shape::Number(Some(n1 % n2)),
                                         _ => unreachable!(),
                                     },
                                 },
@@ -1664,14 +1037,14 @@ impl Shape {
                         })
                         .collect()
                 }
-                crate::BinOp::Gt
-                | crate::BinOp::Ge
-                | crate::BinOp::Lt
-                | crate::BinOp::Le
-                | crate::BinOp::And
-                | crate::BinOp::Or
-                | crate::BinOp::Eq
-                | crate::BinOp::Ne => {
+                BinOp::Gt
+                | BinOp::Ge
+                | BinOp::Lt
+                | BinOp::Le
+                | BinOp::And
+                | BinOp::Or
+                | BinOp::Eq
+                | BinOp::Ne => {
                     let s1 = Shape::build_shape(l, shapes.clone(), ctx, filters);
                     let s2 = Shape::build_shape(r, shapes, ctx, filters);
 
@@ -1729,6 +1102,11 @@ impl Shape {
                 // todo: understand this better
                 Shape::build_shape(filter, shapes, ctx, filters)
             }
+            Filter::FunctionExpression(_, expr) => todo!(),
+            Filter::BindingExpression(_, _ ) => todo!(),
+            Filter::Variable(_) => todo!(),
+            Filter::ReduceExpression(_,_,_) => todo!(),
+
         }
     }
 
@@ -1996,7 +1374,6 @@ impl Shape {
                     Some(mismatch)
                 }
             }
-            Shape::Stream(shapes) => todo!(),
         }
     }
 
@@ -2040,19 +1417,112 @@ impl Shape {
 
                 mismatches.into_iter().next().flatten()
             }
-            Shape::Stream(shapes) => todo!(),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::shape::{Access, Shape, ShapeMismatch};
     use std::collections::HashMap;
+    use tjq_exec::{BinOp, Filter, Json, UnOp};
 
-    use crate::{
-        filter::builtin_filters, parse, shape::Access, BinOp, Filter, Json, Shape, ShapeMismatch,
-    };
+fn builtin_filters() -> HashMap<String, Filter> {
+        let map = Filter::Bound(
+            vec!["f".into()],
+            Box::new(Filter::Array(vec![Filter::Pipe(
+                Box::new(Filter::ArrayIterator),
+                Box::new(Filter::Call("f".to_string(), None)),
+            )])),
+        );
 
+        let abs = Filter::Bound(
+            vec![],
+            Box::new(Filter::IfThenElse(
+                Box::new(Filter::BinOp(
+                    Box::new(Filter::Dot),
+                    BinOp::Lt,
+                    Box::new(Filter::Number(0.0)),
+                )),
+                Box::new(Filter::UnOp(UnOp::Neg, Box::new(Filter::Dot))),
+                Box::new(Filter::Dot),
+            )),
+        );
+
+        let isboolean = Filter::Bound(
+            vec![],
+            Box::new(Filter::BinOp(
+                Box::new(Filter::BinOp(
+                    Box::new(Filter::Dot),
+                    BinOp::Eq,
+                    Box::new(Filter::Boolean(true)),
+                )),
+                BinOp::Or,
+                Box::new(Filter::BinOp(
+                    Box::new(Filter::Dot),
+                    BinOp::Eq,
+                    Box::new(Filter::Boolean(false)),
+                )),
+            )),
+        );
+
+        // def type:
+        //     if . == null then "null"
+        //     elif isboolean then "boolean"
+        //     elif . < "" then "number"
+        //     elif . < [] then "string"
+        //     elif . < {} then "array"
+        //     else             "object" end;
+        let type_ = Filter::Bound(
+            vec![],
+            Box::new(Filter::IfThenElse(
+                Box::new(Filter::BinOp(
+                    Box::new(Filter::Dot),
+                    BinOp::Eq,
+                    Box::new(Filter::Null),
+                )),
+                Box::new(Filter::String("null".to_string())),
+                Box::new(Filter::IfThenElse(
+                    Box::new(Filter::Call("isboolean".to_string(), None)),
+                    Box::new(Filter::String("boolean".to_string())),
+                    Box::new(Filter::IfThenElse(
+                        Box::new(Filter::BinOp(
+                            Box::new(Filter::Dot),
+                            BinOp::Lt,
+                            Box::new(Filter::String("".to_string())),
+                        )),
+                        Box::new(Filter::String("number".to_string())),
+                        Box::new(Filter::IfThenElse(
+                            Box::new(Filter::BinOp(
+                                Box::new(Filter::Dot),
+                                BinOp::Lt,
+                                Box::new(Filter::Array(vec![])),
+                            )),
+                            Box::new(Filter::String("string".to_string())),
+                            Box::new(Filter::IfThenElse(
+                                Box::new(Filter::BinOp(
+                                    Box::new(Filter::Dot),
+                                    BinOp::Lt,
+                                    Box::new(Filter::Object(vec![])),
+                                )),
+                                Box::new(Filter::String("array".to_string())),
+                                Box::new(Filter::String("object".to_string())),
+                            )),
+                        )),
+                    )),
+                )),
+            )),
+        );
+
+        let mut filters = HashMap::new();
+        filters.insert("map".to_string(), map);
+        filters.insert("abs".to_string(), abs);
+        filters.insert("isboolean".to_string(), isboolean);
+        filters.insert("type".to_string(), type_);
+
+        filters
+    }
+    
     #[test]
     fn test_plus1() {
         let json = Json::Number(1.0);
@@ -2268,7 +1738,15 @@ mod tests {
         let json3 = Json::Array(vec![Json::Number(-1.0), Json::String("world".to_string())]);
         let json4 = Json::Array(vec![Json::String("hello".to_string()), Json::Boolean(true)]);
 
-        let (_, filter) = parse("map(. * 2)");
+        // map(. * 2)
+        let filter = Filter::Call(
+            "map".to_string(),
+            Some(vec![Filter::BinOp(
+                Box::new(Filter::Dot),
+                BinOp::Mul,
+                Box::new(Filter::Number(2.0)),
+            )]),
+        );
 
         let (shape, results) = Shape::new(&filter, &builtin_filters());
         assert_eq!(
@@ -2428,98 +1906,5 @@ mod tests {
         let results = shape.check(json, vec![]);
 
         assert_eq!(results, None);
-    }
-}
-
-#[cfg(test)]
-mod constraint_tests {
-    use crate::{parse, shape::solve};
-
-    use super::{Context, Shape};
-
-    #[test]
-    fn test_subtyping() {
-        let (_, filter) = parse(".a | .b");
-        let mut context = Context::new();
-        let i = context.fresh();
-        let o = context.fresh();
-        let constraints = Shape::compute_shape(&filter, &mut context, i, o);
-        println!(
-            "===========test_subtyping=========\n{}",
-            constraints
-                .iter()
-                .map(|c| c.to_string())
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-    }
-
-    #[test]
-    fn test_subtyping2() {
-        let (_, filter) = parse(r#"{ "a": .a, "b": .b}"#);
-        let mut context = Context::new();
-        let i = context.fresh();
-        let o = context.fresh();
-        let constraints = Shape::compute_shape(&filter, &mut context, i, o);
-        println!(
-            "===========test_subtyping2=========\n{}",
-            constraints
-                .iter()
-                .map(|c| c.to_string())
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-    }
-
-    #[test]
-    fn test_subtyping3() {
-        let (_, filter) = parse(r#".[3]"#);
-        let mut context = Context::new();
-        let i = context.fresh();
-        let o = context.fresh();
-        let constraints = Shape::compute_shape(&filter, &mut context, i, o);
-        println!(
-            "==========test_subtyping3==========\n{}",
-            constraints
-                .iter()
-                .map(|c| c.to_string())
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-    }
-
-    #[test]
-    fn test_subtyping4() {
-        let (_, filter) = parse(r#". == true or . == false"#);
-        let mut context = Context::new();
-        let i = context.fresh();
-        let o = context.fresh();
-        let constraints = Shape::compute_shape(&filter, &mut context, i, o);
-        println!(
-            "==========test_subtyping4==========\n{}",
-            constraints
-                .iter()
-                .map(|c| c.to_string())
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-    }
-
-    #[test]
-    fn test_subtyping5() {
-        let (_, filter) = parse(r#"if . == true or . == false then 1 else error end"#);
-        let mut context = Context::new();
-        let i = context.fresh();
-        let o = context.fresh();
-        let constraints = Shape::compute_shape(&filter, &mut context, i, o);
-        println!(
-            "==========test_subtyping5==========\n{}",
-            constraints
-                .iter()
-                .map(|c| c.to_string())
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-        let _ = solve(constraints, &context);
     }
 }

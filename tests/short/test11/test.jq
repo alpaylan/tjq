@@ -1,0 +1,1 @@
+def double: . * 2; def triple: . * 3;   double | triple 

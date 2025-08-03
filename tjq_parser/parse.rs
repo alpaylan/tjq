@@ -1,10 +1,13 @@
 use std::{collections::HashMap, vec};
 
+use tracing_subscriber::EnvFilter;
 use tree_sitter::Node;
 
-use crate::filter::Filter;
+use tjq_exec::{BinOp, Filter, UnOp};
 
-pub(crate) fn parse(code: &str) -> (HashMap<String, Filter>, Filter) {
+use crate::printer::{print_ast, print_node_details};
+
+pub fn parse(code: &str) -> (HashMap<String, Filter>, Filter) {
     let mut parser = tree_sitter::Parser::new();
     parser
         .set_language(&tree_sitter_jq::LANGUAGE.into())
@@ -13,13 +16,17 @@ pub(crate) fn parse(code: &str) -> (HashMap<String, Filter>, Filter) {
 
     assert_eq!(tree.root_node().kind(), "program");
 
-    let mut defs = HashMap::new();
+    print_ast(tree.root_node(), code, 0); // print AST
+                                          //print_node_details(tree.root_node(), code, 0);
 
+    let mut defs = HashMap::new();
+    
     for i in 0..tree.root_node().child_count() - 1 {
         let child = tree.root_node().child(i).unwrap();
         match child.kind() {
             "function_definition" => {
-                let _ = parse_filter(code, child, &mut defs);
+                let f = parse_filter(code, child, &mut defs);
+                tracing::trace!("Parsed function definition: {}", f);
             }
             "comment" => {}
             _ => {
@@ -38,7 +45,7 @@ pub(crate) fn parse(code: &str) -> (HashMap<String, Filter>, Filter) {
     (defs, f)
 }
 
-pub(crate) fn parse_defs(code: &str) -> HashMap<String, Filter> {
+pub fn parse_defs(code: &str) -> HashMap<String, Filter> {
     let mut parser = tree_sitter::Parser::new();
     parser
         .set_language(&tree_sitter_jq::LANGUAGE.into())
@@ -65,12 +72,18 @@ pub(crate) fn parse_defs(code: &str) -> HashMap<String, Filter> {
     defs
 }
 
+
 pub(crate) fn parse_filter<'a>(
     code: &str,
     root: Node<'a>,
     defs: &mut HashMap<String, Filter>,
 ) -> Filter {
-    log::trace!("{}: {}", root.kind(), &code[root.range().start_byte..root.range().end_byte]);
+    tracing::trace!(
+        "{}: {}",
+        root.kind(),
+        &code[root.range().start_byte..root.range().end_byte]
+    );
+    
     match root.kind() {
         "dot" => Filter::Dot,
         "sequence_expression" => {
@@ -134,11 +147,9 @@ pub(crate) fn parse_filter<'a>(
             s => Filter::Call(s.to_string(), None),
         },
         "variable" => {
-            log::warn!("todo: variables are not yet supported");
-            unimplemented!(
-                "todo: variables are not yet supported, encountered '{}'",
-                &code[root.range().start_byte..root.range().end_byte]
-            );
+            let name = &code[root.range().start_byte + 1 .. root.range().end_byte];
+            Filter::Variable(name.to_string())
+            
         }
         "array" => {
             if root.child_count() == 2 {
@@ -202,19 +213,19 @@ pub(crate) fn parse_filter<'a>(
             let op = match &code
                 [root.child(1).unwrap().range().start_byte..root.child(1).unwrap().range().end_byte]
             {
-                "+" => crate::filter::BinOp::Add,
-                "-" => crate::filter::BinOp::Sub,
-                "*" => crate::filter::BinOp::Mul,
-                "/" => crate::filter::BinOp::Div,
-                "%" => crate::filter::BinOp::Mod,
-                ">" => crate::filter::BinOp::Gt,
-                "<" => crate::filter::BinOp::Lt,
-                ">=" => crate::filter::BinOp::Ge,
-                "<=" => crate::filter::BinOp::Le,
-                "==" => crate::filter::BinOp::Eq,
-                "!=" => crate::filter::BinOp::Ne,
-                "and" => crate::filter::BinOp::And,
-                "or" => crate::filter::BinOp::Or,
+                "+" => BinOp::Add,
+                "-" => BinOp::Sub,
+                "*" => BinOp::Mul,
+                "/" => BinOp::Div,
+                "%" => BinOp::Mod,
+                ">" => BinOp::Gt,
+                "<" => BinOp::Lt,
+                ">=" => BinOp::Ge,
+                "<=" => BinOp::Le,
+                "==" => BinOp::Eq,
+                "!=" => BinOp::Ne,
+                "and" => BinOp::And,
+                "or" => BinOp::Or,
                 _ => panic!("unknown binary operator"),
             };
             Filter::BinOp(Box::new(lhs), op, Box::new(rhs))
@@ -228,8 +239,8 @@ pub(crate) fn parse_filter<'a>(
             let op = match &code
                 [root.child(0).unwrap().range().start_byte..root.child(0).unwrap().range().end_byte]
             {
-                "-" => crate::filter::UnOp::Neg,
-                "not" => crate::filter::UnOp::Not,
+                "-" => UnOp::Neg,
+                "not" => UnOp::Not,
                 _ => panic!("unknown unary operator"),
             };
             Filter::UnOp(op, Box::new(rhs))
@@ -243,6 +254,16 @@ pub(crate) fn parse_filter<'a>(
                 .expect("paranthesized expression should have a value"),
             defs,
         ),
+        // "paranthesized_expression" => {
+        //     let mut inner_defs = defs.clone();
+
+        //     parse_filter(code,
+        //          root.child(1)
+        //                 .expect("paranthesized expression should have a value"),
+        //          &mut inner_defs,
+                 
+        // )
+        // }
         "if_expression" => {
             let cond = parse_filter(
                 code,
@@ -340,25 +361,100 @@ pub(crate) fn parse_filter<'a>(
                     .expect("function definition should have a body"),
                 defs,
             );
+            tracing::trace!(
+                "Parsed function definition: {}({}) -> {}",
+                name,
+                args.join(", "),
+                body
+            );
             defs.insert(name.clone(), Filter::Bound(args, Box::new(body)));
             Filter::Dot
         }
-        "function_expression"
-        | "binding_expression"
-        | "optional_expression"
-        | "reduce_expression"
-        | "assignment_expression"
-        | "field_expression"
-        | "foreach_expression" => {
-            log::warn!("todo: {} are not yet supported", root.kind());
-            unimplemented!(
-                "todo: '{}' are not yet supported, encountered '{}'",
-                root.kind(),
-                &code[root.range().start_byte..root.range().end_byte]
+
+        "function_expression" => {
+    
+            let mut final_expr = Filter::Dot;
+            let mut inner_defs = HashMap::new();
+
+            for i in 0..root.child_count() {
+                let child = root.child(i).unwrap();
+
+                match child.kind() {
+                    "function_definition" => {
+                        let _ = parse_filter(code, child, &mut inner_defs);
+                    }
+                    _ => {
+                        final_expr = parse_filter(code, child, &mut inner_defs);
+                    }
+                }
+            }
+
+            let result = Filter::FunctionExpression(inner_defs, Box::new(final_expr));
+            tracing::trace!("Parsed function expression:\n{}", result);
+            result
+        }
+        "binding_expression" => {
+
+            // println!("Child count: {}", root.child_count());
+            // for i in 0..root.child_count() {
+            //     let child = root.child(i).unwrap();
+            //     let text = &code[child.range().start_byte..child.range().end_byte];
+            //     println!("Child {}: {} = '{}'", i, child.kind(), text);
+            // }
+
+            let lhs = parse_filter(code, root.child(0).unwrap(), defs);
+            let pat = parse_filter(code, root.child(2).unwrap(), defs);
+            Filter::BindingExpression(Box::new(lhs), Box::new(pat))
+
+        }
+        "optional_expression" => {
+
+            let field = root
+                .child(0)
+                .expect("optional expression should have the first child as its field");
+
+            let identifier = parse_filter(
+                code,
+                field
+                    .child(1)
+                    .expect("field access should have the second child as its field"),
+                defs,
             );
+            Filter::ObjIndex(identifier.to_string())
+        }
+        "reduce_expression" => {
+            // println!("Child count: {}", root.child_count());
+            // for i in 0..root.child_count() {
+            //     let child = root.child(i).unwrap();
+            //     let text = &code[child.range().start_byte..child.range().end_byte];
+            //     println!("Child {}: {} = '{}'", i, child.kind(), text);
+            // }
+            let bind = root.child(1).unwrap();
+            let source_node = bind.child(0).unwrap();
+            let var_node    = bind.child(2).unwrap();
+            let source = parse_filter(code, source_node, defs);
+            
+            let var_name = &code[var_node.range().start_byte + 1 .. var_node.range().end_byte];
+            let mut var_def = HashMap::new();
+            var_def.insert(var_name.to_string(), source.clone());
+
+            let init   = parse_filter(code, root.child(3).unwrap(), defs);
+            let update = parse_filter(code, root.child(5).unwrap(), defs);
+
+            Filter::ReduceExpression(var_def, Box::new(init), Box::new(update))
+
+        }
+        "assignment_expression" => {Filter::Dot}
+        | "foreach_expression" => {
+            
+
+            Filter::Dot
+        }
+        | "field_expression" => {
+          Filter::Dot
         }
         _ => {
-            log::warn!(
+            tracing::warn!(
                 "unknown filter {} {}",
                 root.kind(),
                 code[root.range().start_byte..root.range().end_byte].to_string()
@@ -370,7 +466,7 @@ pub(crate) fn parse_filter<'a>(
 
 #[cfg(test)]
 mod tests {
-    use crate::filter::Filter;
+    use Filter;
 
     use super::*;
 
@@ -389,7 +485,7 @@ mod tests {
                 vec!["a".to_string(), "b".to_string()],
                 Box::new(Filter::BinOp(
                     Box::new(Filter::Call("a".to_string(), None)),
-                    crate::filter::BinOp::Add,
+                    BinOp::Add,
                     Box::new(Filter::Call("b".to_string(), None))
                 ))
             )
@@ -413,13 +509,99 @@ mod tests {
         let (defs, filter) = parse(code);
 
         assert_eq!(defs, HashMap::new());
-        
+
         assert_eq!(
             filter,
             Filter::BinOp(
                 Box::new(Filter::Number(1.0)),
-                crate::filter::BinOp::Add,
+                BinOp::Add,
                 Box::new(Filter::Number(2.0))
+            )
+        );
+    }
+
+    #[test]
+    fn test_parse_function_definition() {
+        let code = r#"
+            (def f:  .[] ;  .) | f
+        "#;
+        let (defs, filter) = parse(code);
+        assert!(defs.is_empty());
+        assert_eq!(
+            filter,
+            Filter::Pipe(
+                Box::new(Filter::FunctionExpression(
+                    HashMap::from([("f".to_string(), Filter::Bound(vec![], Box::new(Filter::ArrayIterator)))]),
+                    Box::new(Filter::Dot)
+                )),
+                Box::new(Filter::Call("f".to_string(), None))
+            )
+        );
+    }
+
+    #[test]
+    fn test_parse_variable() {
+        let code = r#"
+            def main:
+                def add(a; b): a + b;
+                def sub(a; b): a - b;
+                def mul(a; b): a * b;
+                add(1; 2);
+            sub(3; 1)
+        "#;
+        let (defs, filter) = parse(code);
+        assert_eq!(
+            defs.get("main").unwrap().clone(),
+            Filter::Bound(
+                vec![],
+                Box::new(Filter::FunctionExpression(
+                    HashMap::from([
+                        (
+                            "add".to_string(),
+                            Filter::Bound(
+                                vec!["a".to_string(), "b".to_string()],
+                                Box::new(Filter::BinOp(
+                                    Box::new(Filter::Call("a".to_string(), None)),
+                                    BinOp::Add,
+                                    Box::new(Filter::Call("b".to_string(), None))
+                                ))
+                            )
+                        ),
+                        (
+                            "sub".to_string(),
+                            Filter::Bound(
+                                vec!["a".to_string(), "b".to_string()],
+                                Box::new(Filter::BinOp(
+                                    Box::new(Filter::Call("a".to_string(), None)),
+                                    BinOp::Sub,
+                                    Box::new(Filter::Call("b".to_string(), None))
+                                ))
+                            )
+                        ),
+                        (
+                            "mul".to_string(),
+                            Filter::Bound(
+                                vec!["a".to_string(), "b".to_string()],
+                                Box::new(Filter::BinOp(
+                                    Box::new(Filter::Call("a".to_string(), None)),
+                                    BinOp::Mul,
+                                    Box::new(Filter::Call("b".to_string(), None))
+                                ))
+                            )
+                        ),
+                    ]),
+                    Box::new(Filter::Call(
+                        "add".to_string(),
+                        Some(vec![Filter::Number(1.0), Filter::Number(2.0)])
+                    ))
+                ))
+            )
+        );
+        assert_eq!(
+            filter,
+            Filter::Call(
+                "sub".to_string(),
+                Some(vec![Filter::Number(3.0), Filter::Number(1.0)])
             )
         );
     }

@@ -195,6 +195,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13dc2df351e3202783a1fe0d44375f7295ffb4049267b0f3018346dc122a1d94"
 
 [[package]]
+name = "matchers"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8263075bb86c5a1b1427b5ae862e8889656f126e9f77c484496e8b47cf5c5558"
+dependencies = [
+ "regex-automata 0.1.10",
+]
+
+[[package]]
 name = "memchr"
 version = "2.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -229,6 +238,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b15813163c1d831bf4a13c3610c05c0d03b39feb07f7e09fa234dac9b15aaf39"
 
 [[package]]
+name = "pin-project-lite"
+version = "0.2.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3b3cff922bd51709b605d9ead9aa71031d81447142d828eb4a6eba76fe619f9b"
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.95"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -254,8 +269,17 @@ checksum = "b544ef1b4eac5dc2db33ea63606ae9ffcfac26c1416a2806ae0bf5f56b201191"
 dependencies = [
  "aho-corasick",
  "memchr",
- "regex-automata",
- "regex-syntax",
+ "regex-automata 0.4.9",
+ "regex-syntax 0.8.5",
+]
+
+[[package]]
+name = "regex-automata"
+version = "0.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c230d73fb8d8c1b9c0b3135c5142a8acee3a0558fb8db5cf1cb65f8d7862132"
+dependencies = [
+ "regex-syntax 0.6.29",
 ]
 
 [[package]]
@@ -266,8 +290,14 @@ checksum = "809e8dc61f6de73b46c85f4c96486310fe304c434cfa43669d7b40f711150908"
 dependencies = [
  "aho-corasick",
  "memchr",
- "regex-syntax",
+ "regex-syntax 0.8.5",
 ]
+
+[[package]]
+name = "regex-syntax"
+version = "0.6.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f162c6dd7b008981e4d40210aca20b4bd0f9b60ca9271061b07f78537722f2e1"
 
 [[package]]
 name = "regex-syntax"
@@ -380,7 +410,32 @@ dependencies = [
 
 [[package]]
 name = "tjq"
-version = "0.0.1"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "clap_derive",
+ "itertools",
+ "log",
+ "serde_json",
+ "tjq_exec",
+ "tjq_parser",
+ "tjq_semantics",
+ "topological-sort",
+ "trace",
+ "tracing",
+ "tracing-subscriber",
+ "tree-sitter",
+ "tree-sitter-jq",
+]
+
+[[package]]
+name = "tjq-lsp"
+version = "0.1.0"
+
+[[package]]
+name = "tjq_exec"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -390,6 +445,45 @@ dependencies = [
  "serde_json",
  "topological-sort",
  "trace",
+ "tracing",
+ "tracing-subscriber",
+ "tree-sitter",
+ "tree-sitter-jq",
+]
+
+[[package]]
+name = "tjq_parser"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "clap_derive",
+ "itertools",
+ "log",
+ "serde_json",
+ "tjq_exec",
+ "topological-sort",
+ "trace",
+ "tracing",
+ "tracing-subscriber",
+ "tree-sitter",
+ "tree-sitter-jq",
+]
+
+[[package]]
+name = "tjq_semantics"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "clap_derive",
+ "itertools",
+ "log",
+ "serde_json",
+ "tjq_exec",
+ "topological-sort",
+ "trace",
+ "tracing",
  "tracing-subscriber",
  "tree-sitter",
  "tree-sitter-jq",
@@ -410,6 +504,28 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 1.0.109",
+]
+
+[[package]]
+name = "tracing"
+version = "0.1.41"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "784e0ac535deb450455cbfa28a6f0df145ea1bb7ae51b821cf5e7927fdcfbdd0"
+dependencies = [
+ "pin-project-lite",
+ "tracing-attributes",
+ "tracing-core",
+]
+
+[[package]]
+name = "tracing-attributes"
+version = "0.1.30"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "81383ab64e72a7a8b8e13130c49e3dab29def6d0c7d76a03087b3cf71c5c6903"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.104",
 ]
 
 [[package]]
@@ -439,10 +555,14 @@ version = "0.3.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e8189decb5ac0fa7bc8b96b7cb9b2701d60d48805aca84a238004d665fcc4008"
 dependencies = [
+ "matchers",
  "nu-ansi-term",
+ "once_cell",
+ "regex",
  "sharded-slab",
  "smallvec",
  "thread_local",
+ "tracing",
  "tracing-core",
  "tracing-log",
 ]
@@ -455,7 +575,7 @@ checksum = "a7cf18d43cbf0bfca51f657132cc616a5097edc4424d538bae6fa60142eaf9f0"
 dependencies = [
  "cc",
  "regex",
- "regex-syntax",
+ "regex-syntax 0.8.5",
  "serde_json",
  "streaming-iterator",
  "tree-sitter-language",

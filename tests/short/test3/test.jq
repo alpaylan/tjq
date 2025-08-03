@@ -1,0 +1,1 @@
+.[-1] | reduce .[] as $item (0; if($item ==0  ) then . + 1 else . end) | if(. !=0) then true else false end

@@ -77,12 +77,12 @@ def tostring: "\(.)";
 # Generators
 def range(from; to): range(from; to; 1);
 def range(to): range(0; to);
-# todo(function_expression): def repeat(f): def rec: f, rec; rec;
-# todo(function_expression): def recurse(f): def rec: ., (f | rec); rec;
+def repeat(f): def rec: f, rec; rec;
+def recurse(f): def rec: ., (f | rec); rec;
 # todo(function_expression): def recurse: recurse(.[]?);
-# todo(function_expression): def recurse(f; cond): recurse(f | select(cond));
-# todo(function_expression): def while(cond; update): def rec: if cond then ., (update | rec) else empty end; rec;
-# todo(function_expression): def until(cond; update): def rec: if cond then . else update | rec end; rec;
+# def recurse(f; cond): recurse(f | select(cond));
+# def while(cond; update): def rec: if cond then ., (update | rec) else empty end; rec;
+# def until(cond; update): def rec: if cond then . else update | rec end; rec;
 
 # Iterators
 def map(f): [.[] | f];
@@ -117,10 +117,10 @@ def all: all(.[]; .);
 def any: any(.[]; .);
 
 # Walking
-# todo(function_expression): def walk(f): def rec: (.[]? |= rec) | f; rec;
+# todo(assignment expression) def walk(f): def rec: (.[]? |= rec) | f; rec;
 
 # todo(function_expression): def flatten: [recurse(arrays[]) | select(isarray | not)];
-# todo(variables): def flatten($d): if $d > 0 then map(if isarray then flatten($d-1) else [.] end) | add end;
+def flatten($d): if $d > 0 then map(if isarray then flatten($d-1) else [.] end) | add end;
 
 # Regular expressions
 # todo(add): def capture_of_match: map(select(.name) | { (.name): .string} ) | add + {};
