@@ -769,8 +769,9 @@ impl Shape {
                                 (Shape::Null, s) | (s, Shape::Null) => s,
                                 // str + str
                                 (Shape::String(s1), Shape::String(s2)) => match (s1, s2) {
-                                    (None, None) => Shape::String(None),
-                                    (Some(s1), None) | (None, Some(s1)) => Shape::String(Some(s1)),
+                                    (None, None) | (Some(_), None) | (None, Some(_)) => {
+                                        Shape::String(None)
+                                    }
                                     (Some(s1), Some(s2)) => {
                                         Shape::String(Some(format!("{s1}{s2}")))
                                     }
@@ -858,8 +859,9 @@ impl Shape {
                                 }
                                 // num + num
                                 (Shape::Number(n1), Shape::Number(n2)) => match (n1, n2) {
-                                    (None, None) => Shape::Number(None),
-                                    (Some(_), None) | (None, Some(_)) => Shape::Number(None),
+                                    (None, None) | (Some(_), None) | (None, Some(_)) => {
+                                        Shape::Number(None)
+                                    }
                                     (Some(n1), Some(n2)) => Shape::Number(Some(n1 + n2)),
                                 },
                                 (Shape::Number(_), Shape::TVar(t))
@@ -1813,8 +1815,9 @@ fn builtin_filters() -> HashMap<String, Filter> {
             )]),
         );
 
+        println!("Filter: {filter}");
         let (shape, results) = Shape::new(&filter, &builtin_filters());
-
+        println!("Shape: {shape}");
         assert_eq!(
             shape,
             Shape::Array(
@@ -1881,7 +1884,7 @@ fn builtin_filters() -> HashMap<String, Filter> {
         );
 
         let (shape, results) = Shape::new(&filter, &builtin_filters());
-
+        println!("Shape: {shape}");
         assert_eq!(
             shape,
             Shape::Array(
