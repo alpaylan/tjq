@@ -3,10 +3,11 @@ use std::{collections::HashMap, vec};
 use tracing_subscriber::EnvFilter;
 use tree_sitter::Node;
 
-use crate::filter::Filter;
+use tjq_exec::{BinOp, Filter, UnOp};
+
 use crate::printer::{print_ast, print_node_details};
 
-pub(crate) fn parse(code: &str) -> (HashMap<String, Filter>, Filter) {
+pub fn parse(code: &str) -> (HashMap<String, Filter>, Filter) {
     let mut parser = tree_sitter::Parser::new();
     parser
         .set_language(&tree_sitter_jq::LANGUAGE.into())
@@ -44,7 +45,7 @@ pub(crate) fn parse(code: &str) -> (HashMap<String, Filter>, Filter) {
     (defs, f)
 }
 
-pub(crate) fn parse_defs(code: &str) -> HashMap<String, Filter> {
+pub fn parse_defs(code: &str) -> HashMap<String, Filter> {
     let mut parser = tree_sitter::Parser::new();
     parser
         .set_language(&tree_sitter_jq::LANGUAGE.into())
@@ -212,19 +213,19 @@ pub(crate) fn parse_filter<'a>(
             let op = match &code
                 [root.child(1).unwrap().range().start_byte..root.child(1).unwrap().range().end_byte]
             {
-                "+" => crate::filter::BinOp::Add,
-                "-" => crate::filter::BinOp::Sub,
-                "*" => crate::filter::BinOp::Mul,
-                "/" => crate::filter::BinOp::Div,
-                "%" => crate::filter::BinOp::Mod,
-                ">" => crate::filter::BinOp::Gt,
-                "<" => crate::filter::BinOp::Lt,
-                ">=" => crate::filter::BinOp::Ge,
-                "<=" => crate::filter::BinOp::Le,
-                "==" => crate::filter::BinOp::Eq,
-                "!=" => crate::filter::BinOp::Ne,
-                "and" => crate::filter::BinOp::And,
-                "or" => crate::filter::BinOp::Or,
+                "+" => BinOp::Add,
+                "-" => BinOp::Sub,
+                "*" => BinOp::Mul,
+                "/" => BinOp::Div,
+                "%" => BinOp::Mod,
+                ">" => BinOp::Gt,
+                "<" => BinOp::Lt,
+                ">=" => BinOp::Ge,
+                "<=" => BinOp::Le,
+                "==" => BinOp::Eq,
+                "!=" => BinOp::Ne,
+                "and" => BinOp::And,
+                "or" => BinOp::Or,
                 _ => panic!("unknown binary operator"),
             };
             Filter::BinOp(Box::new(lhs), op, Box::new(rhs))
@@ -238,8 +239,8 @@ pub(crate) fn parse_filter<'a>(
             let op = match &code
                 [root.child(0).unwrap().range().start_byte..root.child(0).unwrap().range().end_byte]
             {
-                "-" => crate::filter::UnOp::Neg,
-                "not" => crate::filter::UnOp::Not,
+                "-" => UnOp::Neg,
+                "not" => UnOp::Not,
                 _ => panic!("unknown unary operator"),
             };
             Filter::UnOp(op, Box::new(rhs))
@@ -438,7 +439,7 @@ pub(crate) fn parse_filter<'a>(
 
 #[cfg(test)]
 mod tests {
-    use crate::filter::Filter;
+    use Filter;
 
     use super::*;
 
@@ -457,7 +458,7 @@ mod tests {
                 vec!["a".to_string(), "b".to_string()],
                 Box::new(Filter::BinOp(
                     Box::new(Filter::Call("a".to_string(), None)),
-                    crate::filter::BinOp::Add,
+                    BinOp::Add,
                     Box::new(Filter::Call("b".to_string(), None))
                 ))
             )
@@ -486,7 +487,7 @@ mod tests {
             filter,
             Filter::BinOp(
                 Box::new(Filter::Number(1.0)),
-                crate::filter::BinOp::Add,
+                BinOp::Add,
                 Box::new(Filter::Number(2.0))
             )
         );
@@ -495,78 +496,27 @@ mod tests {
     #[test]
     fn test_parse_function_definition() {
         let code = r#"
-            (def asd:  .[] ;  .) | asd
+            (def f:  .[] ;  .) | f
         "#;
         let (defs, filter) = parse(code);
-        assert_eq!(
-            defs.get("main").unwrap().clone(),
-            Filter::Bound(
-                vec![],
-                Box::new(Filter::FunctionExpression(
-                    HashMap::from([
-                        (
-                            "add".to_string(),
-                            Filter::Bound(
-                                vec!["a".to_string(), "b".to_string()],
-                                Box::new(Filter::BinOp(
-                                    Box::new(Filter::Call("a".to_string(), None)),
-                                    crate::filter::BinOp::Add,
-                                    Box::new(Filter::Call("b".to_string(), None))
-                                ))
-                            )
-                        ),
-                        (
-                            "sub".to_string(),
-                            Filter::Bound(
-                                vec!["a".to_string(), "b".to_string()],
-                                Box::new(Filter::BinOp(
-                                    Box::new(Filter::Call("a".to_string(), None)),
-                                    crate::filter::BinOp::Sub,
-                                    Box::new(Filter::Call("b".to_string(), None))
-                                ))
-                            )
-                        ),
-                        (
-                            "mul".to_string(),
-                            Filter::Bound(
-                                vec!["a".to_string(), "b".to_string()],
-                                Box::new(Filter::BinOp(
-                                    Box::new(Filter::Call("a".to_string(), None)),
-                                    crate::filter::BinOp::Mul,
-                                    Box::new(Filter::Call("b".to_string(), None))
-                                ))
-                            )
-                        ),
-                    ]),
-                    Box::new(Filter::Call(
-                        "add".to_string(),
-                        Some(vec![Filter::Number(1.0), Filter::Number(2.0)])
-                    ))
-                ))
-            )
-        );
+        assert!(defs.is_empty());
         assert_eq!(
             filter,
-            Filter::Call(
-                "sub".to_string(),
-                Some(vec![Filter::Number(3.0), Filter::Number(1.0)])
+            Filter::Pipe(
+                Box::new(Filter::FunctionExpression(
+                    HashMap::from([("f".to_string(), Filter::Bound(vec![], Box::new(Filter::ArrayIterator)))]),
+                    Box::new(Filter::Dot)
+                )),
+                Box::new(Filter::Call("f".to_string(), None))
             )
         );
     }
 
     #[test]
     fn test_parse_variable() {
-        let filter = EnvFilter::from_default_env();
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_thread_ids(true)
-            .with_thread_names(true)
-            .with_file(true)
-            .with_line_number(true)
-            .init();
-
         let code = r#"
-            def add(a; b): a + b;
+            def main:
+                def add(a; b): a + b;
                 def sub(a; b): a - b;
                 def mul(a; b): a * b;
                 add(1; 2);
@@ -585,7 +535,7 @@ mod tests {
                                 vec!["a".to_string(), "b".to_string()],
                                 Box::new(Filter::BinOp(
                                     Box::new(Filter::Call("a".to_string(), None)),
-                                    crate::filter::BinOp::Add,
+                                    BinOp::Add,
                                     Box::new(Filter::Call("b".to_string(), None))
                                 ))
                             )
@@ -596,7 +546,7 @@ mod tests {
                                 vec!["a".to_string(), "b".to_string()],
                                 Box::new(Filter::BinOp(
                                     Box::new(Filter::Call("a".to_string(), None)),
-                                    crate::filter::BinOp::Sub,
+                                    BinOp::Sub,
                                     Box::new(Filter::Call("b".to_string(), None))
                                 ))
                             )
@@ -607,7 +557,7 @@ mod tests {
                                 vec!["a".to_string(), "b".to_string()],
                                 Box::new(Filter::BinOp(
                                     Box::new(Filter::Call("a".to_string(), None)),
-                                    crate::filter::BinOp::Mul,
+                                    BinOp::Mul,
                                     Box::new(Filter::Call("b".to_string(), None))
                                 ))
                             )
@@ -628,5 +578,4 @@ mod tests {
             )
         );
     }
-
 }

@@ -1,20 +1,12 @@
-mod error;
 
+use std::collections::HashMap;
+
+use serde_json::Value;
 use clap::Parser;
 use clap_derive::Parser;
-
-use error::*;
-mod filter;
-use filter::*;
-mod json;
-use json::*;
-mod shape;
-use serde_json::Value;
-use shape::*;
-mod parse;
-use parse::*;
-mod printer;
-use printer::*;
+use tjq_exec::{Filter, Json};
+use tjq_semantics::Shape;
+use tjq_parser::{parse, parse_defs};
 
 #[derive(Parser)]
 struct CLI {
@@ -29,6 +21,14 @@ struct CLI {
     #[clap(long)]
     verbose: bool,
 }
+
+
+pub fn builtin_filters() -> HashMap<String, Filter> {
+    // read defs.jq
+    let defs = parse_defs(include_str!("defs.jq"));
+    defs
+}
+
 
 fn main() {
     tracing_subscriber::fmt()

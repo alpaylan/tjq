@@ -10,6 +10,68 @@ pub enum Json {
     Object(Vec<(String, Json)>),
 }
 
+impl From<i32> for Json {
+    fn from(value: i32) -> Self {
+        Json::Number(value as f64)
+    }
+}
+
+impl From<f64> for Json {
+    fn from(value: f64) -> Self {
+        Json::Number(value)
+    }
+}
+
+impl From<String> for Json {
+    fn from(value: String) -> Self {
+        Json::String(value)
+    }
+}
+
+impl From<&str> for Json {
+    fn from(value: &str) -> Self {
+        Json::String(value.to_string())
+    }
+}
+
+impl From<bool> for Json {
+    fn from(value: bool) -> Self {
+        Json::Boolean(value)
+    }
+}
+
+impl<T> From<Vec<T>> for Json
+where
+    T: Into<Json>,
+{
+    fn from(value: Vec<T>) -> Self {
+        Json::Array(value.into_iter().map(Into::into).collect())
+    }
+}
+
+impl<T> From<Vec<(&str, T)>> for Json
+where
+    T: Into<Json>,
+{
+    fn from(value: Vec<(&str, T)>) -> Self {
+        Json::Object(value.into_iter().map(|(k, v)| (k.to_string(), v.into())).collect())
+    }
+}
+
+
+
+impl<T> From<Option<T>> for Json
+where
+    T: Into<Json>,
+{
+    fn from(value: Option<T>) -> Self {
+        match value {
+            Some(v) => v.into(),
+            None => Json::Null,
+        }
+    }
+}
+
 impl Json {
     pub fn boolify(&self) -> bool {
         match self {

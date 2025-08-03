@@ -1,6 +1,7 @@
 use std::fmt::{self, Display, Formatter};
 
-use crate::{filter::UnOp, BinOp, Json};
+use crate::filter::{UnOp, BinOp};
+use crate::json::Json;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum JQError {

@@ -410,7 +410,7 @@ dependencies = [
 
 [[package]]
 name = "tjq"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -418,6 +418,69 @@ dependencies = [
  "itertools",
  "log",
  "serde_json",
+ "tjq_exec",
+ "tjq_parser",
+ "tjq_semantics",
+ "topological-sort",
+ "trace",
+ "tracing",
+ "tracing-subscriber",
+ "tree-sitter",
+ "tree-sitter-jq",
+]
+
+[[package]]
+name = "tjq-lsp"
+version = "0.1.0"
+
+[[package]]
+name = "tjq_exec"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "clap_derive",
+ "itertools",
+ "log",
+ "serde_json",
+ "topological-sort",
+ "trace",
+ "tracing",
+ "tracing-subscriber",
+ "tree-sitter",
+ "tree-sitter-jq",
+]
+
+[[package]]
+name = "tjq_parser"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "clap_derive",
+ "itertools",
+ "log",
+ "serde_json",
+ "tjq_exec",
+ "topological-sort",
+ "trace",
+ "tracing",
+ "tracing-subscriber",
+ "tree-sitter",
+ "tree-sitter-jq",
+]
+
+[[package]]
+name = "tjq_semantics"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "clap_derive",
+ "itertools",
+ "log",
+ "serde_json",
+ "tjq_exec",
  "topological-sort",
  "trace",
  "tracing",

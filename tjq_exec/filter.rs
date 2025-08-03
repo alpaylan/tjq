@@ -6,7 +6,8 @@ use std::{
 
 use itertools::Itertools;
 
-use crate::{parse_defs, JQError, Json};
+use crate::error::JQError;
+use crate::json::Json;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Filter {
@@ -514,20 +515,116 @@ impl Filter {
     }
 }
 
-pub fn builtin_filters() -> HashMap<String, Filter> {
-    // read defs.jq
-    let defs = parse_defs(include_str!("defs.jq"));
-    defs
+impl From<&str> for Filter {
+    fn from(s: &str) -> Self {
+        Filter::String(s.to_string())
+    }
 }
 
 #[cfg(test)]
 mod tests {
 
-    use std::vec;
+    use std::{collections::HashMap, vec};
 
     use tracing_subscriber::EnvFilter;
 
-    use crate::{filter::builtin_filters, parse::parse, BinOp, Filter, Json};
+    use crate::{BinOp, Filter, Json, UnOp};
+
+    fn builtin_filters() -> HashMap<String, Filter> {
+        let map = Filter::Bound(
+            vec!["f".into()],
+            Box::new(Filter::Array(vec![Filter::Pipe(
+                Box::new(Filter::ArrayIterator),
+                Box::new(Filter::Call("f".to_string(), None)),
+            )])),
+        );
+
+        let abs = Filter::Bound(
+            vec![],
+            Box::new(Filter::IfThenElse(
+                Box::new(Filter::BinOp(
+                    Box::new(Filter::Dot),
+                    BinOp::Lt,
+                    Box::new(Filter::Number(0.0)),
+                )),
+                Box::new(Filter::UnOp(UnOp::Neg, Box::new(Filter::Dot))),
+                Box::new(Filter::Dot),
+            )),
+        );
+
+        let isboolean = Filter::Bound(
+            vec![],
+            Box::new(Filter::BinOp(
+                Box::new(Filter::BinOp(
+                    Box::new(Filter::Dot),
+                    BinOp::Eq,
+                    Box::new(Filter::Boolean(true)),
+                )),
+                BinOp::Or,
+                Box::new(Filter::BinOp(
+                    Box::new(Filter::Dot),
+                    BinOp::Eq,
+                    Box::new(Filter::Boolean(false)),
+                )),
+            )),
+        );
+
+        // def type:
+        //     if . == null then "null"
+        //     elif isboolean then "boolean"
+        //     elif . < "" then "number"
+        //     elif . < [] then "string"
+        //     elif . < {} then "array"
+        //     else             "object" end;
+        let type_ = Filter::Bound(
+            vec![],
+            Box::new(Filter::IfThenElse(
+                Box::new(Filter::BinOp(
+                    Box::new(Filter::Dot),
+                    BinOp::Eq,
+                    Box::new(Filter::Null),
+                )),
+                Box::new(Filter::String("null".to_string())),
+                Box::new(Filter::IfThenElse(
+                    Box::new(Filter::Call("isboolean".to_string(), None)),
+                    Box::new(Filter::String("boolean".to_string())),
+                    Box::new(Filter::IfThenElse(
+                        Box::new(Filter::BinOp(
+                            Box::new(Filter::Dot),
+                            BinOp::Lt,
+                            Box::new(Filter::String("".to_string())),
+                        )),
+                        Box::new(Filter::String("number".to_string())),
+                        Box::new(Filter::IfThenElse(
+                            Box::new(Filter::BinOp(
+                                Box::new(Filter::Dot),
+                                BinOp::Lt,
+                                Box::new(Filter::Array(vec![])),
+                            )),
+                            Box::new(Filter::String("string".to_string())),
+                            Box::new(Filter::IfThenElse(
+                                Box::new(Filter::BinOp(
+                                    Box::new(Filter::Dot),
+                                    BinOp::Lt,
+                                    Box::new(Filter::Object(vec![])),
+                                )),
+                                Box::new(Filter::String("array".to_string())),
+                                Box::new(Filter::String("object".to_string())),
+                            )),
+                        )),
+                    )),
+                )),
+            )),
+        );
+
+        let mut filters = HashMap::new();
+        filters.insert("map".to_string(), map);
+        filters.insert("abs".to_string(), abs);
+        filters.insert("isboolean".to_string(), isboolean);
+        filters.insert("type".to_string(), type_);
+
+        filters
+    }
 
     #[test]
     fn test_plus() {
@@ -714,15 +811,56 @@ mod tests {
             .with_line_number(true)
             .init();
 
-        let code = r#"
-            def main:
-                def add(a; b): a + b;
-                def sub(a; b): a - b;
-                def mul(a; b): a * b;
-                add(1; 2);
-            main
-        "#;
-        let (defs, filter) = parse(code);
+        let mut defs = HashMap::new();
+        defs.insert(
+            "main".to_string(),
+            Filter::Bound(
+                vec![],
+                Box::new(Filter::FunctionExpression(
+                    HashMap::from([
+                        (
+                            "add".to_string(),
+                            Filter::Bound(
+                                vec!["a".to_string(), "b".to_string()],
+                                Box::new(Filter::BinOp(
+                                    Box::new(Filter::Call("a".to_string(), None)),
+                                    BinOp::Add,
+                                    Box::new(Filter::Call("b".to_string(), None)),
+                                )),
+                            ),
+                        ),
+                        (
+                            "sub".to_string(),
+                            Filter::Bound(
+                                vec!["a".to_string(), "b".to_string()],
+                                Box::new(Filter::BinOp(
+                                    Box::new(Filter::Call("a".to_string(), None)),
+                                    BinOp::Sub,
+                                    Box::new(Filter::Call("b".to_string(), None)),
+                                )),
+                            ),
+                        ),
+                        (
+                            "mul".to_string(),
+                            Filter::Bound(
+                                vec!["a".to_string(), "b".to_string()],
+                                Box::new(Filter::BinOp(
+                                    Box::new(Filter::Call("a".to_string(), None)),
+                                    BinOp::Mul,
+                                    Box::new(Filter::Call("b".to_string(), None)),
+                                )),
+                            ),
+                        ),
+                    ]),
+                    Box::new(Filter::Call(
+                        "add".to_string(),
+                        Some(vec![Filter::Number(1.0), Filter::Number(2.0)]),
+                    )),
+                )),
+            ),
+        );
+
+        let filter = Filter::Call("main".to_string(), None);
         let results = Filter::filter(&Json::Null, &filter, &defs, &mut Default::default());
         assert_eq!(
             results,

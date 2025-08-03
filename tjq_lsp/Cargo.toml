@@ -1,0 +1,7 @@
+[package]
+name = "tjq-lsp"
+version = "0.1.0"
+edition = "2021"
+
+[lib]  # Optional unless you're customizing the lib name or path
+path = "lib.rs"
