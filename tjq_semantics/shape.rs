@@ -143,14 +143,14 @@ impl ShapeContext {
         // 2. turn all self referential variables into blobs
         // 3. turn all non self referential variables into their actual shape
 
-        self.shapes.iter_mut().for_each(|(k, v)| {
-            if let Shape::TVar(t) = v {
-                tracing::debug!("Checking {t} == {k}");
-                if t == k {
-                    *v = Shape::Blob;
-                }
-            }
-        });
+        // self.shapes.iter_mut().for_each(|(k, v)| {
+        //     if let Shape::TVar(t) = v {
+        //         tracing::debug!("Checking {t} == {k}");
+        //         if t == k {
+        //             *v = Shape::Blob;
+        //         }
+        //     }
+        // });
 
         let shapes = self.shapes.clone();
 
@@ -196,6 +196,16 @@ pub enum Subtyping {
     Incompatible,
 }
 
+impl Display for Subtyping {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Subtyping::Subtype => write!(f, "<:"),
+            Subtyping::Supertype => write!(f, ":>"),
+            Subtyping::Incompatible => write!(f, "<:>"),
+        }
+    }
+}
+
 impl Shape {
     pub fn new(f: &Filter, filters: &HashMap<String, Filter>) -> (Shape, Vec<Shape>) {
         let mut ctx = ShapeContext::new();
@@ -207,6 +217,7 @@ impl Shape {
         ctx.normalize();
 
         for result in results.iter_mut() {
+            tracing::debug!("Normalizing {result}");
             *result = result.normalize(&ctx.shapes).canonicalize();
         }
 
@@ -239,7 +250,8 @@ impl Shape {
                 let shape = shapes.get(t).unwrap().clone();
                 if let Shape::TVar(t_) = &shape {
                     if t == t_ {
-                        Shape::Blob
+                        // Shape::Blob
+                        Shape::TVar(*t_)
                     } else {
                         shape.normalize(shapes)
                     }
@@ -514,8 +526,7 @@ impl Shape {
                 .map(|shape| match shape {
                     Shape::Blob => {
                         let new_type_var = ctx.fresh();
-                        ctx.shapes
-                            .insert(new_type_var, Shape::TVar(new_type_var));
+                        ctx.shapes.insert(new_type_var, Shape::TVar(new_type_var));
                         // todo: check this
                         Shape::TVar(new_type_var)
                     }
@@ -529,8 +540,7 @@ impl Shape {
                             ctx,
                         );
                         ctx.shapes.insert(t, current_shape);
-                        ctx.shapes
-                            .insert(new_type_var, Shape::TVar(new_type_var));
+                        ctx.shapes.insert(new_type_var, Shape::TVar(new_type_var));
                         Shape::TVar(new_type_var)
                     }
                     Shape::Null => Shape::Null,
@@ -574,8 +584,7 @@ impl Shape {
                 .map(|shape| match shape {
                     Shape::Blob => {
                         let new_type_var = ctx.fresh();
-                        ctx.shapes
-                            .insert(new_type_var, Shape::TVar(new_type_var));
+                        ctx.shapes.insert(new_type_var, Shape::TVar(new_type_var));
                         Shape::TVar(new_type_var)
                     }
                     Shape::TVar(t) => {
@@ -589,8 +598,7 @@ impl Shape {
                         );
 
                         ctx.shapes.insert(t, current_shape);
-                        ctx.shapes
-                            .insert(new_type_var, Shape::TVar(new_type_var));
+                        ctx.shapes.insert(new_type_var, Shape::TVar(new_type_var));
 
                         Shape::TVar(new_type_var)
                     }
@@ -630,8 +638,7 @@ impl Shape {
                 .flat_map(|shape| match shape {
                     Shape::Blob => {
                         let new_type_var = ctx.fresh();
-                        ctx.shapes
-                            .insert(new_type_var, Shape::TVar(new_type_var));
+                        ctx.shapes.insert(new_type_var, Shape::TVar(new_type_var));
                         vec![Shape::TVar(new_type_var)]
                     }
                     Shape::TVar(t) => {
@@ -643,8 +650,7 @@ impl Shape {
                             ctx,
                         );
                         ctx.shapes.insert(t, current_shape);
-                        ctx.shapes
-                            .insert(new_type_var, Shape::TVar(new_type_var));
+                        ctx.shapes.insert(new_type_var, Shape::TVar(new_type_var));
 
                         vec![Shape::TVar(new_type_var)]
                     }
@@ -716,23 +722,6 @@ impl Shape {
                 })
                 .collect(),
             Filter::UnOp(op, filter) => match op {
-                UnOp::Not => {
-                    let s = Shape::build_shape(filter, shapes, ctx, filters);
-                    s.into_iter()
-                        .map(|s| match s {
-                            Shape::Bool(b) => Shape::Bool(b.map(|b| !b)),
-                            Shape::TVar(t) => {
-                                let current_shape = ctx.shapes.get(&t).unwrap().clone();
-                                let current_shape =
-                                    Shape::merge_shapes(current_shape, Shape::Bool(None), ctx);
-                                ctx.shapes.insert(t, current_shape);
-
-                                Shape::Bool(None)
-                            }
-                            s => Shape::Mismatch(Box::new(s), Box::new(Shape::Bool(None))),
-                        })
-                        .collect()
-                }
                 UnOp::Neg => {
                     let s = Shape::build_shape(filter, shapes, ctx, filters);
                     s.into_iter()
@@ -1106,6 +1095,7 @@ impl Shape {
             Filter::BindingExpression(_, _) => todo!(),
             Filter::Variable(_) => todo!(),
             Filter::ReduceExpression(_, _, _) => todo!(),
+            Filter::Hole => todo!(),
         }
     }
 
@@ -1425,6 +1415,7 @@ mod tests {
     use crate::shape::{Access, Shape, ShapeMismatch};
     use std::collections::HashMap;
     use tjq_exec::{BinOp, Filter, Json, UnOp};
+    use tjq_parser::parse;
 
     fn builtin_filters() -> HashMap<String, Filter> {
         let map = Filter::Bound(
@@ -1905,5 +1896,142 @@ mod tests {
         let results = shape.check(json, vec![]);
 
         assert_eq!(results, None);
+    }
+
+    fn get_type(expression: &str) -> (Shape, Shape) {
+        tracing_subscriber::fmt()
+            .with_target(false)
+            .with_thread_ids(false)
+            .with_thread_names(false)
+            .with_file(true)
+            .with_line_number(true)
+            .with_level(true)
+            .without_time()
+            .with_max_level(tracing::Level::DEBUG)
+            .init();
+
+        let (_, filter) = parse(expression);
+        let (i, o) = Shape::new(&filter, &builtin_filters());
+        (i.canonicalize(), o[0].canonicalize())
+    }
+
+    #[test]
+    fn test_solver_dot() {
+        let (tin, tout) = get_type(r#"."#);
+        // t: T -> T
+        assert_eq!(tin, Shape::TVar(0));
+        assert_eq!(tout, Shape::TVar(0));
+    }
+
+    #[test]
+    fn test_solver_number() {
+        let (tin, tout) = get_type(r#"3"#);
+        // t: T -> T
+        assert_eq!(tin, Shape::TVar(1));
+        assert_eq!(tout, Shape::Number(Some(3.0)));
+    }
+
+    #[test]
+    fn test_solver_boolean() {
+        let (tin, tout) = get_type(r#"true"#);
+        // t: T -> T
+        assert_eq!(tin, Shape::TVar(1));
+        assert_eq!(tout, Shape::Bool(Some(true)));
+    }
+
+    #[test]
+    fn test_solver_string() {
+        let (tin, tout) = get_type(r#""hello""#);
+        // t: T -> T
+        assert_eq!(tin, Shape::TVar(1));
+        assert_eq!(tout, Shape::String(Some("hello".to_string())));
+    }
+
+    #[test]
+    fn test_solver_array() {
+        let (tin, tout) = get_type(r#"[1, 2, 3]"#);
+        // t: T -> T
+        assert_eq!(tin, Shape::TVar(1));
+        assert_eq!(
+            tout,
+            Shape::Tuple(vec![
+                Shape::Number(Some(1.0)),
+                Shape::Number(Some(2.0)),
+                Shape::Number(Some(3.0))
+            ])
+        );
+    }
+
+    #[test]
+    fn test_solver_object() {
+        let (tin, tout) = get_type(r#"{ "a": 1, "b": 2 }"#);
+        // t: T -> T
+        assert_eq!(tin, Shape::TVar(1));
+        assert_eq!(
+            tout,
+            Shape::Object(vec![
+                ("a".to_string(), Shape::Number(Some(1.0))),
+                ("b".to_string(), Shape::Number(Some(2.0)))
+            ])
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn test_solver_not() {
+        let (tin, tout) = get_type(r#"not"#);
+        // t: T -> T
+        assert_eq!(
+            tin,
+            Shape::Union(Box::new(Shape::Null), Box::new(Shape::Bool(None)))
+        );
+        assert_eq!(
+            tout,
+            Shape::Union(Box::new(Shape::Null), Box::new(Shape::Bool(None)))
+        );
+    }
+
+    #[test]
+    fn test_solver_negation() {
+        let (tin, tout) = get_type(r#"- ."#);
+        // t: T -> T
+        assert_eq!(tin, Shape::Number(None));
+        assert_eq!(tout, Shape::Number(None));
+    }
+
+    #[test]
+    #[ignore = "We cannot actually do type-level computation until we can create constraints that do computation somehow"]
+    fn test_solver_add_definite() {
+        let (tin, tout) = get_type(r#"1 + 1"#);
+        // t: T -> T
+        assert_eq!(tin, Shape::TVar(1));
+        assert_eq!(tout, Shape::Number(Some(2.0)));
+    }
+
+    #[test]
+    #[ignore = "We can't solve subtyping constraints yet"]
+    fn test_solver_math() {
+        let (tin, tout) = get_type(r#". + 1"#);
+        // t: T -> T
+        assert_eq!(
+            tin,
+            Shape::Union(Box::new(Shape::Null), Box::new(Shape::Number(None)))
+        );
+        assert_eq!(tout, Shape::Number(None));
+    }
+
+    #[test]
+    #[ignore]
+    fn test_solver_pipe() {
+        let (tin, tout) = get_type(r#".a | .b"#);
+        // t: { a: { b: T }} -> T
+        assert_eq!(
+            tin,
+            Shape::Object(vec![(
+                "a".to_string(),
+                Shape::Object(vec![("b".to_string(), Shape::TVar(2))])
+            )])
+        );
+        assert_eq!(tout, Shape::TVar(2));
     }
 }

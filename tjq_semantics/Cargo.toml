@@ -22,3 +22,6 @@ tracing = { version = "0.1.41", features = ["std"] }
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 tree-sitter =  "0.25.2"
 tree-sitter-jq = "1.0.2"
+
+[dev-dependencies]
+tjq_parser = { path = "../tjq_parser" }

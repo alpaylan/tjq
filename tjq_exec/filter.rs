@@ -34,6 +34,7 @@ pub enum Filter {
     BindingExpression(Box<Filter>, Box<Filter>),              //
     Variable(String),                                         // $var
     ReduceExpression(HashMap<String, Filter>, Box<Filter>, Box<Filter>),
+    Hole, // Placeholder for a missing value in the AST
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,7 +57,6 @@ pub enum BinOp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnOp {
     Neg, // -
-    Not, // not
 }
 
 impl Display for Filter {
@@ -136,6 +136,7 @@ impl Display for Filter {
                 }
                 write!(f, "{}", expr)
             }
+            Filter::Hole => write!(f, "(_)"),
         }
     }
 }
@@ -164,7 +165,6 @@ impl Display for UnOp {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             UnOp::Neg => write!(f, "-"),
-            UnOp::Not => write!(f, "not"),
         }
     }
 }
@@ -187,6 +187,33 @@ fn destructure_pattern(val: &Json, pat: &Filter, variable_ctx: &mut HashMap<Stri
         Filter::Object(pairs) => todo!(),
 
         _ => {}
+    }
+}
+
+/// Constructor functions for easily constructing filters without boilerplate
+impl Filter {
+    pub fn pipe(f1: Filter, f2: Filter) -> Filter {
+        Filter::Pipe(Box::new(f1), Box::new(f2))
+    }
+
+    pub fn comma(f1: Filter, f2: Filter) -> Filter {
+        Filter::Comma(Box::new(f1), Box::new(f2))
+    }
+
+    pub fn if_then_else(cond: Filter, then: Filter, else_: Filter) -> Filter {
+        Filter::IfThenElse(Box::new(cond), Box::new(then), Box::new(else_))
+    }
+
+    pub fn and(f1: Filter, f2: Filter) -> Filter {
+        Filter::BinOp(Box::new(f1), BinOp::And, Box::new(f2))
+    }
+
+    pub fn or(f1: Filter, f2: Filter) -> Filter {
+        Filter::BinOp(Box::new(f1), BinOp::Or, Box::new(f2))
+    }
+
+    pub fn eq(f1: Filter, f2: Filter) -> Filter {
+        Filter::BinOp(Box::new(f1), BinOp::Eq, Box::new(f2))
     }
 }
 
@@ -322,10 +349,6 @@ impl Filter {
                         Ok(json) => match un_op {
                             UnOp::Neg => match json {
                                 Json::Number(n) => Ok(Json::Number(-n)),
-                                _ => Err(JQError::UnOpTypeError(json, *un_op)),
-                            },
-                            UnOp::Not => match json {
-                                Json::Boolean(b) => Ok(Json::Boolean(!b)),
                                 _ => Err(JQError::UnOpTypeError(json, *un_op)),
                             },
                         },
@@ -465,6 +488,7 @@ impl Filter {
                 for (name, local_filter) in local_defs {
                     scoped_filters.insert(name.clone(), local_filter.clone());
                 }
+                // todo: check this for performance implications
                 Filter::filter(json, expr, &scoped_filters, variable_ctx)
             }
             Filter::BindingExpression(lhs, pat) => {
@@ -481,7 +505,6 @@ impl Filter {
                     })
                     .collect()
             }
-
             Filter::Variable(name) => {
                 if let Some(bound_f) = variable_ctx.get(name) {
                     let bound_clone = bound_f.clone();
@@ -529,6 +552,7 @@ impl Filter {
 
                 vec![Ok(Json::Number(acc))]
             }
+            Filter::Hole => vec![Err(JQError::IncompleteProgram)],
         }
     }
 
@@ -609,6 +633,7 @@ impl Filter {
             Filter::BindingExpression(_, _) => todo!(),
             Filter::Variable(_) => todo!(),
             Filter::ReduceExpression(_, _, _) => todo!(),
+            Filter::Hole => todo!(),
         }
     }
 }

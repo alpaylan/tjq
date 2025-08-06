@@ -12,6 +12,7 @@ pub enum JQError {
     BinOpTypeError(Json, BinOp, Json),
     UnOpTypeError(Json, UnOp),
     FilterNotDefined(String, usize),
+    IncompleteProgram,
     Unknown,
 }
 
@@ -62,9 +63,11 @@ impl Display for JQError {
                     json.debug(),
                     match un_op {
                         UnOp::Neg => "negated",
-                        UnOp::Not => "inverted",
                     }
                 )
+            }
+            JQError::IncompleteProgram => {
+                write!(f, "Incomplete program")
             }
         }
     }

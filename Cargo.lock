@@ -481,6 +481,7 @@ dependencies = [
  "log",
  "serde_json",
  "tjq_exec",
+ "tjq_parser",
  "topological-sort",
  "trace",
  "tracing",
