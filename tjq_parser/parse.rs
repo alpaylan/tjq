@@ -3,13 +3,12 @@ use std::{collections::HashMap, vec};
 use tree_sitter::Node;
 
 use tjq_exec::{BinOp, Filter, UnOp};
-
 use crate::printer::print_ast;
 
 pub fn parse(code: &str) -> (HashMap<String, Filter>, Filter) {
     let mut parser = tree_sitter::Parser::new();
     parser
-        .set_language(&tree_sitter_jq::LANGUAGE.into())
+        .set_language(&tree_sitter_tjq::LANGUAGE.into())
         .expect("Error loading jq grammar");
     let tree = parser.parse(code, None).unwrap();
 
@@ -47,7 +46,7 @@ pub fn parse(code: &str) -> (HashMap<String, Filter>, Filter) {
 pub fn parse_defs(code: &str) -> HashMap<String, Filter> {
     let mut parser = tree_sitter::Parser::new();
     parser
-        .set_language(&tree_sitter_jq::LANGUAGE.into())
+        .set_language(&tree_sitter_tjq::LANGUAGE.into())
         .expect("Error loading jq grammar");
     let tree = parser.parse(code, None).unwrap();
 
