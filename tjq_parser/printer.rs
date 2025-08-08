@@ -4,10 +4,16 @@ pub fn print_ast(node: Node, source: &str, indent: usize) {
     let indent_str = "  ".repeat(indent);
     let node_text = &source[node.byte_range()];
 
+    let kind = if node.kind() == "identifier" {
+        let text = &source[node.range().start_byte..node.range().end_byte];
+        if text.is_empty() { "hole" } else { node.kind() }
+    } else {
+        node.kind()
+    };
     println!(
         "{}{}[{}..{}]: {:?}",
         indent_str,
-        node.kind(),
+        kind,
         node.start_byte(),
         node.end_byte(),
         node_text

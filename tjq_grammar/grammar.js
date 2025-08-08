@@ -180,7 +180,6 @@ module.exports = grammar({
       $.subscript_expression,
       $.array,
       $.object,
-      $.hole
     ),
 
     function_expression: $ => prec.right(-2, seq(
@@ -189,7 +188,8 @@ module.exports = grammar({
     )),
 
     pipeline: $ => prec.right('pipeline', seq(
-      $.expression,
+      
+      optional($.expression),
       '|',
       $.expression,
     )),
@@ -230,11 +230,13 @@ module.exports = grammar({
 
     reduce_expression: $ => seq(
       'reduce',
-      $.binding_expression,
+      optional($.binding_expression),
+      
       '(',
-      field('initializer', $.expression), ';',
-      field('update', $.expression),
+      field('initializer', optional($.expression)), ';',
+      field('update', optional($.expression)),
       ')'
+      ,
     ),
     
     foreach_expression: $ => seq(
@@ -260,24 +262,24 @@ module.exports = grammar({
 
     if_expression: $ => seq(
       'if',
-      field('condition', $.expression),
-      'then',
-      field('body', $.expression),
+      field('condition', choice($.expression, $.hole)),
+      choice('then', $.hole),  // 'then' or hole if missing
+      field('body', choice($.expression, $.hole)),
       repeat($.elif_expression),
       optional($.else_expression),
-      'end'
+      choice('end', $.hole)    // 'end' or hole if missing
     ),
     
     elif_expression: $ => seq(
       'elif',
-      field('condition', $.expression),
+      optional(field('condition', $.expression)),
       'then',
-      field('body', $.expression),
+      optional(field('body', $.expression)),
     ),
 
     else_expression: $ => seq(
       'else',
-      $.expression,
+      optional($.expression),
     ),
     
     unary_expression: $ => prec.left('unary', seq(
@@ -484,7 +486,9 @@ module.exports = grammar({
       )
     )),
 
-    hole: $ => '??',
+     hole: $ => '??',
+    // hole: $ => ''
+    // hole: $ => token(prec(10, /(?=)/)),
 
   }
 });

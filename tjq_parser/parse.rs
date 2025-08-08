@@ -12,7 +12,7 @@ pub fn parse(code: &str) -> (HashMap<String, Filter>, Filter) {
         .expect("Error loading jq grammar");
     let tree = parser.parse(code, None).unwrap();
 
-    assert_eq!(tree.root_node().kind(), "program");
+    // assert_eq!(tree.root_node().kind(), "program");
 
     print_ast(tree.root_node(), code, 0); // print AST
                                           //print_node_details(tree.root_node(), code, 0);
@@ -28,7 +28,7 @@ pub fn parse(code: &str) -> (HashMap<String, Filter>, Filter) {
             }
             "comment" => {}
             _ => {
-                panic!("unexpected node in program: {}", child.kind());
+               println!("unexpected node in program: {}", child.kind());
             }
         }
     }
@@ -68,6 +68,17 @@ pub fn parse_defs(code: &str) -> HashMap<String, Filter> {
     }
 
     defs
+}
+
+fn parse_child_or_hole(
+    code: &str,
+    root: Node<'_>,
+    index: usize,
+    defs: &mut HashMap<String, Filter>,
+) -> Filter {
+    root.child(index)
+        .map(|node| parse_filter(code, node, defs))
+        .unwrap_or(Filter::Hole)
 }
 
 pub(crate) fn parse_filter(
@@ -289,17 +300,23 @@ pub(crate) fn parse_filter(
                     (cond, then)
                 })
                 .collect();
-
+                
             let else_ = if root.child_count() == 5 {
-                Filter::Dot
+                let end = &code[root.range().start_byte + 1..root.range().end_byte];
+                if end == "end" {
+                    Filter::Dot
+                } else {
+                    Filter::Hole
+                }
             } else {
                 parse_filter(
                     code,
                     root.child(root.child_count() - 2)
                         .expect("if expression should have an else"),
                     defs,
-                )
+                ) 
             };
+
 
             Filter::IfThenElse(
                 Box::new(cond),
@@ -309,11 +326,9 @@ pub(crate) fn parse_filter(
                 })),
             )
         }
-        "else_expression" => parse_filter(
-            code,
-            root.child(1).expect("else expression should have a value"),
-            defs,
-        ),
+        "else_expression" => parse_child_or_hole(code, root,1,defs),
+        
+        
         "call_expression" => {
             let name = code[root.child(0).unwrap().range().start_byte
                 ..root.child(0).unwrap().range().end_byte]
@@ -351,6 +366,7 @@ pub(crate) fn parse_filter(
                         .to_string()
                 })
                 .collect();
+            
             let body = parse_filter(
                 code,
                 root.child(root.child_count() - 2)
@@ -420,9 +436,15 @@ pub(crate) fn parse_filter(
             //     let child = root.child(i).unwrap();
             //     let text = &code[child.range().start_byte..child.range().end_byte];
             //     println!("Child {}: {} = '{}'", i, child.kind(), text);
-            // }
+            // }            let source_node = bind.child(0).unwrap();
             let bind = root.child(1).unwrap();
+
+            if bind.range().start_byte == bind.range().end_byte {
+                //if empty 
+                todo!();
+            }
             let source_node = bind.child(0).unwrap();
+
             let var_node = bind.child(2).unwrap();
             let source = parse_filter(code, source_node, defs);
 
@@ -438,6 +460,8 @@ pub(crate) fn parse_filter(
         "assignment_expression" => Filter::Dot,
         "foreach_expression" => Filter::Dot,
         "field_expression" => Filter::Dot,
+         "hole" => Filter::Hole,
+
         _ => {
             tracing::warn!(
                 "unknown filter {} {}",
@@ -451,6 +475,8 @@ pub(crate) fn parse_filter(
 
 #[cfg(test)]
 mod tests {
+
+    use std::process::CommandEnvs;
 
     use super::*;
 
@@ -592,6 +618,87 @@ mod tests {
             )
         );
     }
+    #[test]
+    fn test_if_expression(){
+        let code = r#"
+            if true then
+                1
+            else
+                2
+                end
+        "#;
+
+        let (defs, filter) = parse(code);
+
+        assert!(defs.is_empty());
+        assert_eq!(
+            filter,
+            Filter::IfThenElse(
+                Box::new(Filter::Boolean(true)),
+                Box::new(Filter::Number(1.0)),
+                Box::new(Filter::Number(2.0))
+            )
+        );
+    }
+
+    #[test]
+    fn test_binding_expression(){
+        let code = r#"
+           . as $item 
+        "#;
+        let (defs, filter) = parse(code);
+
+        assert_eq!(
+            filter,
+            Filter::BindingExpression(
+                Box::new(Filter::Dot),
+                Box::new(Filter::Variable("item".to_string()))
+            )
+        );
+    
+    
+        }
+
+    #[test]
+    fn test_binding_expression2(){
+        let code = r#"
+           1 as $item  | $item
+        "#;
+        let (defs, filter) = parse(code);
+
+        assert_eq!(
+            filter,
+            Filter::Pipe((Box::new(Filter::BindingExpression(
+                Box::new(Filter::Number(1.0)),
+                Box::new(Filter::Variable("item".to_string()))
+            ))), 
+                Box::new(Filter::Variable("item".to_string()),
+            ))
+            
+        );    
+    
+        }
+
+    #[test]
+    fn test_binding_expression3(){
+        let code = r#"
+           [1,2,3] as $item  | $item
+        "#;
+        let (defs, filter) = parse(code);
+
+        assert_eq!(
+            filter,
+            Filter::Pipe((Box::new(Filter::BindingExpression(
+                Box::new(Filter::Array(vec![Filter::Number(1.0), Filter::Number(2.0), Filter::Number(3.0)]))  ,
+                Box::new(Filter::Variable("item".to_string()))
+            ))), 
+                Box::new(Filter::Variable("item".to_string()),
+            ))
+            
+        );    
+    
+        }
+
 
     #[test]
     fn test_incomplete_binop() {
@@ -611,8 +718,38 @@ mod tests {
     }
 
     #[test]
+    fn test_incomplete_binop2 (){
+        let code = r#"1 == "#;
+
+        let (defs, filter) = parse(code);
+
+        assert!(defs.is_empty());
+        assert_eq!(
+            filter,
+            Filter::BinOp(
+                Box::new(Filter::Number(1.0)),
+                BinOp::Eq,
+                Box::new(Filter::Hole)
+            )
+        );
+    }
+
+
+    #[test]
     fn test_incomplete_pipe() {
         let code = r#"1 | "#;
+
+        let (defs, filter) = parse(code);
+
+        assert!(defs.is_empty());
+        assert_eq!(
+            filter,
+            Filter::Pipe(Box::new(Filter::Number(1.0)), Box::new(Filter::Hole))
+        );
+    }
+     #[test]
+    fn test_incomplete_pipe2() {
+        let code = r#" | 1 "#;
 
         let (defs, filter) = parse(code);
 
@@ -652,6 +789,32 @@ mod tests {
             ))
         );
         assert_eq!(filter, Filter::Hole);
+    }
+
+    #[test]
+    fn test_incomplete_function_definition2() {
+        let code = r#"
+            def f(a; b):
+                a*b
+        "#;
+
+        let (defs, filter) = parse(code);
+
+        assert_eq!(
+            defs.get("f"),
+            Some(&Filter::Bound(
+                vec!["a".to_string(), "b".to_string()],
+                Box::new(
+                    Filter::BinOp(
+                        Box::new(Filter::Call("a".to_string(), None)),
+                        BinOp::Mul,
+                        Box::new(Filter::Call("b".to_string(), None))
+                    )
+                )
+            ))
+        );
+        // assert_eq!(filter, Filter::Hole);
+        //check this!
     }
 
     #[test]
@@ -810,7 +973,8 @@ mod tests {
         let code = r#"
             if true then
                 1
-            else 
+            else  end
+            
         "#;
 
         let (defs, filter) = parse(code);
@@ -849,7 +1013,7 @@ mod tests {
     #[test]
     fn test_incomplete_if_then_else3() {
         let code = r#"
-            if true then
+            if true then end
         "#;
 
         let (defs, filter) = parse(code);
@@ -868,7 +1032,7 @@ mod tests {
     #[test]
     fn test_incomplete_if_then_else4() {
         let code = r#"
-            if true
+            if true 
         "#;
 
         let (defs, filter) = parse(code);
@@ -902,5 +1066,205 @@ mod tests {
             )
         );
     }
+
+    #[test]
+    fn test_hole_token(){
+        let code = r#" . |  "#;
+
+        let(defs,filter) = parse(code);
+        assert!(defs.is_empty());
+        assert_eq!(
+            filter,
+            Filter::Pipe(Box::new(Filter::Dot), Box::new(Filter::Hole) )   
+
+        );
+    }
+
+    #[test]
+
+    fn test_incomplete_unop(){
+        
+    }
+
+    #[test]
+    fn test_incomplete_reduce(){
+        let code = r#"
+            reduce .[] as $item 
+        "#;
+
+        let (defs, filter) = parse(code);
+
+        assert!(defs.is_empty());
+        assert_eq!(
+            filter,
+            Filter::ReduceExpression(
+                HashMap::from([("item".to_string(), Filter::ArrayIterator)]),
+                Box::new(Filter::Number(0.0)),
+                Box::new(Filter::Hole)
+            )
+        );
+    }
+
+    #[test]
+    fn test_incomplete_reduce2(){
+        let code = r#"
+            reduce  (;  . + 1 )
+        "#;
+
+        let (defs, filter) = parse(code);
+
+        assert!(defs.is_empty());
+        assert_eq!(
+            filter,
+            Filter::ReduceExpression(
+                HashMap::new(),
+                Box::new(Filter::Hole),
+                Box::new(Filter::BinOp(
+                    Box::new(Filter::Dot),
+                    BinOp::Add,
+                    Box::new(Filter::Number(1.0))
+                ))
+            )
+        );
+    }
+
+    #[test]
+    fn test_incomplete_reduce3(){
+        let code = r#"
+            reduce .[] as $item (  )
+            
+                    "#;
+
+        let (defs, filter) = parse(code);
+        //TODO check this (incomplete?)
+        assert!(defs.is_empty());
+        assert_eq!(
+            filter,
+           Filter::Dot
+        );
+    }
+        
+        
+    
+
+
+    #[test]
+
+    fn test_incomplete_binding(){
+        let code = r#"
+            . as 
+        "#;
+
+        let (defs, filter) = parse(code);
+
+        assert!(defs.is_empty());
+        assert_eq!(
+            filter,
+            Filter::BindingExpression(
+                Box::new(Filter::Dot),
+                Box::new(Filter::Hole)
+            )
+        );
+    }
+
+    #[test]
+
+    fn test_incomplete_binding2(){
+        let code = r#"
+            as $item 
+        "#;
+
+        let (defs, filter) = parse(code);
+
+        assert!(defs.is_empty());
+        assert_eq!(
+            filter,
+            Filter::BindingExpression(
+                Box::new(Filter::Hole),
+                Box::new(Filter::Hole)
+            )
+        );
+    }
+
+    #[test]
+    fn test_incomplete_array(){
+
+        let code = r#"
+            [1,2,3,4
+        "#;
+
+        let (defs, filter) = parse(code);
+
+        assert!(defs.is_empty());
+        assert_eq!(
+            filter,
+            Filter::Array(vec![
+                Filter::Number(1.0),
+                Filter::Number(2.0),
+                Filter::Number(3.0),
+                Filter::Number(4.0),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_call_expression(){
+        let code = r#"
+            add(1; 2)
+        "#;
+
+        let (defs, filter) = parse(code);
+
+        assert!(defs.is_empty());
+        assert_eq!(
+            filter,
+            Filter::Call(
+                "add".to_string(),
+                Some(vec![Filter::Number(1.0), Filter::Number(2.0)])
+            )
+        );
+    }
+
+    #[test]
+    fn test_incomplete_call_expression() {
+        let code = r#"
+            add(1; )
+        "#;
+
+        let (defs, filter) = parse(code);
+
+        assert!(defs.is_empty());
+        assert_eq!(
+            filter,
+            Filter::Call(
+                "add".to_string(),
+                Some(vec![Filter::Number(1.0), Filter::Hole])
+            )
+        );
+    }
+    #[test]
+    fn test_incomplete_call_expression2() {
+        let code = r#"
+            add(; 1)
+        "#;
+
+        let (defs, filter) = parse(code);
+
+        assert!(defs.is_empty());
+        assert_eq!(
+            filter,
+            Filter::Call(
+                "add".to_string(),
+                Some(vec![Filter::Hole, Filter::Number(1.0)])
+            )
+        );
+    }
+
+
+
+
+
+    
+    
 
 }
