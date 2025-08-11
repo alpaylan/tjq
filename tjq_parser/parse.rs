@@ -203,8 +203,11 @@ pub(crate) fn parse_filter(
             Filter::String(s)
         }
         "pipeline" => {
-            let lhs = parse_filter(code, root.child(0).expect("pipe should have a lhs"), defs);
-            let rhs = parse_filter(code, root.child(2).expect("pipe should have a rhs"), defs);
+            // let lhs = parse_filter(code, root.child(0).expect("pipe should have a lhs"), defs);
+            let lhs = parse_child_or_hole(code, root, 0, defs);
+            // let rhs = parse_filter(code, root.child(2).expect("pipe should have a rhs"), defs);
+            let rhs = parse_child_or_hole(code, root, 2, defs);
+            
             Filter::Pipe(Box::new(lhs), Box::new(rhs))
         }
         "binary_expression" => {
@@ -461,6 +464,7 @@ pub(crate) fn parse_filter(
         "foreach_expression" => Filter::Dot,
         "field_expression" => Filter::Dot,
          "hole" => Filter::Hole,
+        "slice_expression" => todo!(),
 
         _ => {
             tracing::warn!(
@@ -756,7 +760,7 @@ mod tests {
         assert!(defs.is_empty());
         assert_eq!(
             filter,
-            Filter::Pipe(Box::new(Filter::Number(1.0)), Box::new(Filter::Hole))
+            Filter::Pipe(Box::new(Filter::Hole), Box::new(Filter::Number(1.0)))
         );
     }
 
@@ -1260,7 +1264,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_subscript_expression(){
 
+        let code = r#"
+           . | .[2]
+        "#;
+
+        let (defs, filter) = parse(code);
+        assert!(defs.is_empty());
+        assert_eq!(
+            filter,
+            Filter::Pipe(
+                Box::new(Filter::Dot),
+                Box::new(Filter::ArrayIndex(2))
+            )
+        );
+    }
+    // #[test]
+    // fn test_array_slice() {
+    //     let code = r#"
+    //         .[1:3]
+    //     "#;
+
+    //     let (defs, filter) = parse(code);
+    //     assert!(defs.is_empty());
+    //     assert_eq!(
+    //         filter,
+    //         Filter::SliceExpression(1, 3)
+    //     );
+    // }
+    
 
 
 

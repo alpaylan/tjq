@@ -79,16 +79,16 @@ def range(from; to): range(from; to; 1);
 def range(to): range(0; to);
 def repeat(f): def rec: f, rec; rec;
 def recurse(f): def rec: ., (f | rec); rec;
-# todo(function_expression): def recurse: recurse(.[]?);
-# def recurse(f; cond): recurse(f | select(cond));
-# def while(cond; update): def rec: if cond then ., (update | rec) else empty end; rec;
+def recurse: recurse(.[]?);
+def recurse(f; cond): recurse(f | select(cond));
+def while(cond; update): def rec: if cond then ., (update | rec) else empty end; rec;
 # def until(cond; update): def rec: if cond then . else update | rec end; rec;
 
 # Iterators
 def map(f): [.[] | f];
 # todo(assignment_expression): def map_values(f): .[] |= f;
-# todo(reduce_expression, variable): def add(f): reduce f as $x (null; . + $x);
-# todo(reduce_expression, variable): def add: add(.[]);
+def add(f): reduce f as $x (null; . + $x);
+def add: add(.[]);
 # todo(assignment_expression): def join(x): .[:-1][] += x | add;
 # todo(reduce_expression, variable): def min_by(f): reduce min_by_or_empty(f) as $x (null; $x);
 # todo(reduce_expression, variable): def max_by(f): reduce max_by_or_empty(f) as $x (null; $x);

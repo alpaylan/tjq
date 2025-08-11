@@ -1091,7 +1091,29 @@ impl Shape {
                 // todo: understand this better
                 Shape::build_shape(filter, shapes, ctx, filters)
             }
-            Filter::FunctionExpression(_, expr) => todo!(),
+            Filter::FunctionExpression(_, expr) =>  {
+                let shapes = Shape::build_shape(expr, shapes, ctx, filters);
+                shapes.into_iter()
+                    .map(|s| match s {
+                        Shape::Blob => {
+                            let new_type_var = ctx.fresh();
+                            ctx.shapes.insert(new_type_var, Shape::TVar(new_type_var));
+                            Shape::TVar(new_type_var)
+                        }
+                        Shape::TVar(t) => {
+                            let current_shape = ctx.shapes.get(&t).unwrap().clone();
+                            let current_shape = Shape::merge_shapes(
+                                current_shape,
+                                Shape::Blob,
+                                ctx,
+                            );
+                            ctx.shapes.insert(t, current_shape);
+                            Shape::TVar(t)
+                        }
+                        _ => s,
+                    })
+                    .collect()
+            }
             Filter::BindingExpression(_, _) => todo!(),
             Filter::Variable(_) => todo!(),
             Filter::ReduceExpression(_, _, _) => todo!(),

@@ -34,6 +34,7 @@ pub enum Filter {
     BindingExpression(Box<Filter>, Box<Filter>),              //
     Variable(String),                                         // $var
     ReduceExpression(HashMap<String, Filter>, Box<Filter>, Box<Filter>),
+    // SliceExpression(i32,i32),                                        // [<n1> : <n2>]
     Hole, // Placeholder for a missing value in the AST
 }
 
@@ -137,6 +138,7 @@ impl Display for Filter {
                 write!(f, "{}", expr)
             }
             Filter::Hole => write!(f, "(_)"),
+            // Filter::SliceExpression(i32:, )
         }
     }
 }
@@ -629,7 +631,16 @@ impl Filter {
                 Box::new(filter1.substitute(var, arg)),
                 Box::new(filter2.substitute(var, arg)),
             ),
-            Filter::Bound(items, filter) => todo!(),
+            Filter::Bound(items, filter) => {
+                if items.contains(&var.to_string()) {
+                    self.clone()
+                } else {
+                    Filter::Bound(
+                        items.clone(),
+                        Box::new(filter.substitute(var, arg)),
+                    )
+                }
+            },
             Filter::BindingExpression(_, _) => todo!(),
             Filter::Variable(_) => todo!(),
             Filter::ReduceExpression(_, _, _) => todo!(),
@@ -739,12 +750,24 @@ mod tests {
                 )),
             )),
         );
+        let while_ = Filter::Bound(
+            vec!["f".into()],
+            Box::new(Filter::IfThenElse(
+                Box::new(Filter::Call("f".to_string(), None)),
+                Box::new(Filter::Pipe(
+                    Box::new(Filter::ArrayIterator),
+                    Box::new(Filter::Call("f".to_string(), None)),
+                )),
+                Box::new(Filter::Empty),
+            )),
+        );
 
         let mut filters = HashMap::new();
         filters.insert("map".to_string(), map);
         filters.insert("abs".to_string(), abs);
         filters.insert("isboolean".to_string(), isboolean);
         filters.insert("type".to_string(), type_);
+        filters.insert("while".to_string(), while_);
 
         filters
     }
