@@ -1294,7 +1294,209 @@ mod tests {
     //         Filter::SliceExpression(1, 3)
     //     );
     // }
-    
+   #[test]
+    fn test_incomplete_unary_expression() {
+        let code = r#"-"#;
+
+        let (defs, filter) = parse(code);
+
+        assert!(defs.is_empty());
+        assert_eq!(
+            filter,
+            Filter::UnOp(UnOp::Neg, Box::new(Filter::Hole))
+        );
+    }
+
+    #[test]
+    fn test_incomplete_object() {
+        let code = r#"{"name": "john", "age":"#;
+
+        let (defs, filter) = parse(code);
+
+        assert!(defs.is_empty());
+        assert_eq!(
+            filter,
+            Filter::Object(vec![
+                (Filter::String("name".to_string()), Filter::String("john".to_string())),
+                (Filter::String("age".to_string()), Filter::Hole)
+            ])
+        );
+    }
+
+    #[test]
+    fn test_incomplete_object_key() {
+        let code = r#"{: "value"}"#;
+
+        let (defs, filter) = parse(code);
+
+        assert!(defs.is_empty());
+        assert_eq!(
+            filter,
+            Filter::Object(vec![
+                (Filter::Hole, Filter::String("value".to_string()))
+            ])
+        );
+    }
+
+    #[test]
+    fn test_incomplete_parenthesized() {
+        let code = r#"("#;
+
+        let (defs, filter) = parse(code);
+
+        assert!(defs.is_empty());
+        assert_eq!(filter, Filter::Hole);
+    }
+
+    #[test]
+    fn test_incomplete_parenthesized_with_content() {
+        let code = r#"(1 + "#;
+
+        let (defs, filter) = parse(code);
+
+        assert!(defs.is_empty());
+        assert_eq!(
+            filter,
+            Filter::BinOp(
+                Box::new(Filter::Number(1.0)),
+                BinOp::Add,
+                Box::new(Filter::Hole)
+            )
+        );
+    }
+      #[test]
+    fn test_incomplete_subscript() {
+        let code = r#".[1"#;
+
+        let (defs, filter) = parse(code);
+        //TODO : determine the output 
+        assert!(defs.is_empty());
+        // This should handle incomplete array access
+        assert_eq!(filter, Filter::ArrayIndex(1));
+    }
+
+    // #[test]
+    // fn test_incomplete_try_catch() {
+    //     let code = r#"try"#;
+
+    //     let (defs, filter) = parse(code);
+
+    //     assert!(defs.is_empty());
+    //     // This should parse as a try expression with missing body
+    //     assert_eq!(
+    //         filter,
+    //         Filter::TryExpression(Box::new(Filter::Hole), None)
+    //     );
+    // }
+
+    // #[test]
+    // fn test_incomplete_try2() {
+    //     let code = r#"try .foo catch"#;
+
+    //     let (defs, filter) = parse(code);
+
+    //     assert!(defs.is_empty());
+    //     assert_eq!(
+    //         filter,
+    //         Filter::TryExpression(
+    //             Box::new(Filter::ObjIndex("foo".to_string())),
+    //             Some(Box::new(Filter::Hole))
+    //         )
+    //     );
+    // }
+
+    #[test]
+    fn test_multiple_incomplete_pipes() {
+        let code = r#". | | ."#;
+
+        let (defs, filter) = parse(code);
+
+        assert!(defs.is_empty());
+        assert_eq!(
+            filter,
+            Filter::Pipe(
+                Box::new(Filter::Dot),
+                Box::new(Filter::Pipe(
+                    Box::new(Filter::Hole),
+                    Box::new(Filter::Dot)
+                ))
+            )
+        );
+    }
+
+    #[test]
+    fn test_incomplete_sequence() {
+        let code = r#"1, 2,"#;
+
+        let (defs, filter) = parse(code);
+        //TODO : check 
+        assert!(defs.is_empty());
+        assert_eq!(
+            filter,
+
+            Filter::Comma(
+                Box::new(Filter::Comma(Box::new(Filter::Number(1.0)), Box::new(Filter::Number(2.0)))),
+                Box::new(Filter::Hole)
+            )
+        );
+    }
+
+    #[test]
+    fn test_incomplete_nested_arrays() {
+        let code = r#"[[1, 2], [3,"#;
+
+        let (defs, filter) = parse(code);
+
+        assert!(defs.is_empty());
+        assert_eq!(
+            filter,
+            Filter::Array(vec![
+                Filter::Array(vec![Filter::Number(1.0), Filter::Number(2.0)]),
+                Filter::Array(vec![Filter::Number(3.0), Filter::Hole])
+            ])
+        );
+    }
+
+      #[test]
+    fn test_incomplete_variable_reference() {
+        let code = r#"$"#;
+
+        let (defs, filter) = parse(code);
+
+        assert!(defs.is_empty());
+        assert_eq!(filter, Filter::Variable("".to_string()));
+    }
+
+    // #[test]
+    // fn test_incomplete_assignment() {
+    //     let code = r#".foo ="#;
+
+    //     let (defs, filter) = parse(code);
+
+    //     assert!(defs.is_empty());
+    //     assert_eq!(
+    //         filter,
+    //         Filter::AssignmentExpression(
+    //             Box::new(Filter::ObjIndex("foo".to_string())),
+    //             "=".to_string(),
+    //             Box::new(Filter::Hole)
+    //         )
+    //     );
+    // }
+
+    #[test]
+    fn test_incomplete_optional_operator() {
+        let code = r#".foo?"#;
+
+        let (defs, filter) = parse(code);
+        // TODO check !
+        assert!(defs.is_empty());
+        assert_eq!(
+            filter,
+            Filter::ObjIndex("foo".to_string()),
+        );
+    }
+
 
 
 
