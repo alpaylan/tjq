@@ -1,0 +1,947 @@
+use std::{collections::HashMap, vec};
+
+use anyhow::Context;
+use tree_sitter::Node;
+
+use crate::{BinOp, Filter, UnOp};
+
+pub fn parse(code: &str) -> (HashMap<String, Filter>, Filter) {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_jq::LANGUAGE.into())
+        .expect("Error loading jq grammar");
+    let tree = parser.parse(code, None).unwrap();
+
+    assert_eq!(tree.root_node().kind(), "program");
+
+    let mut defs = HashMap::new();
+
+    for i in 0..tree.root_node().child_count() - 1 {
+        let child = tree.root_node().child(i).unwrap();
+        match child.kind() {
+            "function_definition" => {
+                let f = parse_filter(code, child, &mut defs)
+                    .or_else(|e| {
+                        eprintln!(
+                            "Failed to parse function definition at {}:{} due to {}",
+                            child.start_position().row + 1,
+                            child.start_position().column + 1,
+                            e
+                        );
+                        Err(e)
+                    })
+                    .unwrap();
+                tracing::trace!("Parsed function definition: {}", f);
+            }
+            "comment" => {}
+            _ => {
+                panic!("unexpected node in program: {}", child.kind());
+            }
+        }
+    }
+    let f = parse_filter(
+        code,
+        tree.root_node()
+            .child(tree.root_node().child_count() - 1)
+            .expect("root should have at one children"),
+        &mut defs,
+    );
+
+    if let Err(e) = f {
+        panic!("Failed to parse filter: {}", e);
+    }
+    let f = f.unwrap();
+    tracing::debug!("Parsed filter: {}", f);
+
+    (defs, f)
+}
+
+pub fn parse_defs(code: &str) -> HashMap<String, Filter> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_jq::LANGUAGE.into())
+        .expect("Error loading jq grammar");
+    let tree = parser.parse(code, None).unwrap();
+
+    assert_eq!(tree.root_node().kind(), "program");
+
+    let mut defs = HashMap::new();
+
+    for i in 0..tree.root_node().child_count() {
+        let child = tree.root_node().child(i).unwrap();
+        match child.kind() {
+            "function_definition" => {
+                let _ = parse_filter(code, child, &mut defs);
+            }
+            "comment" => {}
+            _ => {
+                panic!("unexpected node in program: {}", child.kind());
+            }
+        }
+    }
+
+    defs
+}
+
+pub(crate) fn parse_filter(
+    code: &str,
+    root: Node<'_>,
+    defs: &mut HashMap<String, Filter>,
+) -> anyhow::Result<Filter> {
+    tracing::trace!(
+        "{}: {}",
+        root.kind(),
+        &code[root.range().start_byte..root.range().end_byte]
+    );
+
+    match root.kind() {
+        "dot" => Ok(Filter::Dot),
+        "sequence_expression" => {
+            let lhs = parse_filter(
+                code,
+                root.child(0).expect("sequence should have a lhs"),
+                defs,
+            )?;
+            let rhs = parse_filter(
+                code,
+                root.child(2).expect("sequence should have a rhs"),
+                defs,
+            )?;
+            Ok(Filter::Comma(Box::new(lhs), Box::new(rhs)))
+        }
+        "subscript_expression" => {
+            let lhs = parse_filter(
+                code,
+                root.child(0).expect("subscript should have a lhs"),
+                defs,
+            )?;
+
+            let rhs = if root.child_count() == 3 {
+                Filter::ArrayIterator
+            } else {
+                // todo: Implement expressions in the index position
+                // Filter::ArrayIndex(parse_filter(
+                //     code,
+                //     root.child(2).expect("subscript should have a rhs"),
+                //     defs,
+                // ))
+                let rhs = root.child(2).unwrap();
+                let rhs = code[rhs.range().start_byte..rhs.range().end_byte].parse::<isize>().unwrap_or_else(|_| panic!("array index should be a valid integer(expressions in the index are not yet supported), encountered '{}'", &code[rhs.range().start_byte..rhs.range().end_byte]));
+                Filter::ArrayIndex(rhs)
+            };
+
+            match lhs {
+                Filter::Dot => Ok(rhs),
+                _ => Ok(Filter::Pipe(Box::new(lhs), Box::new(rhs))),
+            }
+        }
+        "field" => {
+            // get the second child and make it an ObjectIndex
+            let identifier = parse_filter(
+                code,
+                root.child(1)
+                    .expect("field access should have the second child as its field"),
+                defs,
+            )?;
+            Ok(Filter::ObjIndex(identifier.to_string()))
+        }
+        "field_id" => Ok(Filter::String(
+            code[root.range().start_byte..root.range().end_byte].to_string(),
+        )),
+        "identifier" => match &code[root.range().start_byte..root.range().end_byte] {
+            "true" => Ok(Filter::Boolean(true)),
+            "false" => Ok(Filter::Boolean(false)),
+            "null" => Ok(Filter::Null),
+            "empty" => Ok(Filter::Empty),
+            "error" => Ok(Filter::Error),
+            "" => Ok(Filter::Hole),
+            s => Ok(Filter::Call(s.to_string(), None)),
+        },
+        "variable" => {
+            let name = &code[root.range().start_byte + 1..root.range().end_byte];
+            Ok(Filter::Variable(name.to_string()))
+        }
+        "array" => {
+            if root.child_count() == 2 {
+                return Ok(Filter::Array(vec![]));
+            }
+
+            let children = (1..root.child_count())
+                .step_by(2)
+                .map(|i| {
+                    parse_filter(
+                        code,
+                        root.child(i).expect("array should have a value"),
+                        defs,
+                    )
+                })
+                .collect::<Vec<anyhow::Result<Filter>>>();
+
+            if children.iter().any(|c| c.is_err()) {
+                return Err(anyhow::anyhow!("Error parsing array elements"));
+            }
+            Ok(Filter::Array(
+                children.into_iter().filter_map(|c| c.ok()).collect(),
+            ))
+        }
+        "object" => {
+            let mut pairs: Vec<(Filter, Filter)> = vec![];
+            for i in (1..root.child_count() - 1).step_by(2) {
+                let pair = root.child(i).unwrap();
+                let key = parse_filter(
+                    code,
+                    pair.child(0).context("pairs should have a key")?,
+                    defs,
+                )?;
+                let value = parse_filter(
+                    code,
+                    pair.child(2).context("pairs should have a value")?,
+                    defs,
+                )?;
+                pairs.push((key, value));
+            }
+
+            Ok(Filter::Object(pairs))
+        }
+        "number" => {
+            let num = code[root.range().start_byte..root.range().end_byte]
+                .parse::<f64>()
+                .context("number should be a valid float")?;
+            Ok(Filter::Number(num))
+        }
+        "string" => {
+            let s = code[root.range().start_byte + 1..root.range().end_byte - 1].to_string();
+            Ok(Filter::String(s))
+        }
+        "pipeline" => {
+            let lhs = parse_filter(code, root.child(0).context("pipe should have a lhs")?, defs)?;
+            let rhs = parse_filter(code, root.child(2).context("pipe should have a rhs")?, defs)?;
+            Ok(Filter::Pipe(Box::new(lhs), Box::new(rhs)))
+        }
+        "binary_expression" => {
+            let lhs = parse_filter(
+                code,
+                root.child(0)
+                    .context("binary expression should have a lhs")?,
+                defs,
+            )?;
+            let rhs = parse_filter(
+                code,
+                root.child(2)
+                    .context("binary expression should have a rhs")?,
+                defs,
+            )?;
+            let op = match &code
+                [root.child(1).unwrap().range().start_byte..root.child(1).unwrap().range().end_byte]
+            {
+                "+" => BinOp::Add,
+                "-" => BinOp::Sub,
+                "*" => BinOp::Mul,
+                "/" => BinOp::Div,
+                "%" => BinOp::Mod,
+                ">" => BinOp::Gt,
+                "<" => BinOp::Lt,
+                ">=" => BinOp::Ge,
+                "<=" => BinOp::Le,
+                "==" => BinOp::Eq,
+                "!=" => BinOp::Ne,
+                "and" => BinOp::And,
+                "or" => BinOp::Or,
+                _ => anyhow::bail!(
+                    "unknown binary operator: {}",
+                    &code[root.child(1).unwrap().range().start_byte
+                        ..root.child(1).unwrap().range().end_byte]
+                ),
+            };
+            Ok(Filter::BinOp(Box::new(lhs), op, Box::new(rhs)))
+        }
+        "unary_expression" => {
+            let rhs = parse_filter(
+                code,
+                root.child(1)
+                    .context("unary expression should have a rhs")?,
+                defs,
+            )?;
+            let op = match &code
+                [root.child(0).unwrap().range().start_byte..root.child(0).unwrap().range().end_byte]
+            {
+                "-" => UnOp::Neg,
+                _ => panic!("unknown unary operator"),
+            };
+            Ok(Filter::UnOp(op, Box::new(rhs)))
+        }
+        "true" => Ok(Filter::Boolean(true)),
+        "false" => Ok(Filter::Boolean(false)),
+        "null" => Ok(Filter::Null),
+        "parenthesized_expression" => parse_filter(
+            code,
+            root.child(1)
+                .context("paranthesized expression should have a value")?,
+            defs,
+        ),
+        // "paranthesized_expression" => {
+        //     let mut inner_defs = defs.clone();
+
+        //     parse_filter(code,
+        //          root.child(1)
+        //                 .expect("paranthesized expression should have a value"),
+        //          &mut inner_defs,
+
+        // )
+        // }
+        "if_expression" => {
+            let cond = parse_filter(
+                code,
+                root.child(1)
+                    .context("if expression should have a condition")?,
+                defs,
+            )?;
+            let then = parse_filter(
+                code,
+                root.child(3).context("if expression should have a then")?,
+                defs,
+            )?;
+            let elifs: Vec<(Filter, Filter)> = (4..root.child_count() - 2)
+                .map(|i| {
+                    let elif = root.child(i).context("if expression should have an elif")?;
+                    let cond = parse_filter(
+                        code,
+                        elif.child(1)
+                            .context("elif expression should have a condition")?,
+                        defs,
+                    )?;
+                    let then = parse_filter(
+                        code,
+                        elif.child(3)
+                            .context("elif expression should have a then")?,
+                        defs,
+                    )?;
+                    Ok((cond, then))
+                })
+                .collect::<Result<Vec<(Filter, Filter)>, anyhow::Error>>()?;
+
+            let else_ = if root.child_count() == 5 {
+                Filter::Dot
+            } else {
+                parse_filter(
+                    code,
+                    root.child(root.child_count() - 2)
+                        .context("if expression should have an else")?,
+                    defs,
+                )?
+            };
+
+            Ok(Filter::IfThenElse(
+                Box::new(cond),
+                Box::new(then),
+                Box::new(elifs.into_iter().rev().fold(else_, |acc, (cond, then)| {
+                    Filter::IfThenElse(Box::new(cond), Box::new(then), Box::new(acc))
+                })),
+            ))
+        }
+        "else_expression" => parse_filter(
+            code,
+            root.child(1).expect("else expression should have a value"),
+            defs,
+        ),
+        "call_expression" => {
+            let name = code[root.child(0).unwrap().range().start_byte
+                ..root.child(0).unwrap().range().end_byte]
+                .to_string();
+            let args = root.child(1);
+            if let Some(args) = args {
+                let args: Vec<Filter> = (1..args.child_count())
+                    .step_by(2)
+                    .map(|i| {
+                        parse_filter(
+                            code,
+                            args.child(i)
+                                .context("call expression should have arguments")?,
+                            defs,
+                        )
+                    })
+                    .collect::<Result<Vec<Filter>, _>>()?;
+                Ok(Filter::Call(name, Some(args)))
+            } else {
+                Ok(Filter::Call(name, None))
+            }
+        }
+        "function_definition" => {
+            let name = code[root.child(1).unwrap().range().start_byte
+                ..root.child(1).unwrap().range().end_byte]
+                .to_string();
+            let args = root
+                .child(2)
+                .expect("function definition should have arguments");
+            let args: Vec<String> = (1..args.child_count())
+                .step_by(2)
+                .map(|i| {
+                    code[args.child(i).unwrap().range().start_byte
+                        ..args.child(i).unwrap().range().end_byte]
+                        .to_string()
+                })
+                .collect();
+            let body = parse_filter(
+                code,
+                root.child(root.child_count() - 2)
+                    .context("function definition should have a body")?,
+                defs,
+            )?;
+            tracing::trace!(
+                "Parsed function definition: {}({}) -> {}",
+                name,
+                args.join(", "),
+                body
+            );
+            defs.insert(name.clone(), Filter::Bound(args, Box::new(body)));
+            Ok(Filter::Dot)
+        }
+
+        "function_expression" => {
+            let mut final_expr = Filter::Dot;
+            let mut inner_defs = HashMap::new();
+
+            for i in 0..root.child_count() {
+                let child = root.child(i).unwrap();
+
+                match child.kind() {
+                    "function_definition" => {
+                        let _ = parse_filter(code, child, &mut inner_defs)?;
+                    }
+                    _ => {
+                        final_expr = parse_filter(code, child, &mut inner_defs)?;
+                    }
+                }
+            }
+
+            let result = Filter::FunctionExpression(inner_defs, Box::new(final_expr));
+            tracing::trace!("Parsed function expression:\n{}", result);
+            Ok(result)
+        }
+        "binding_expression" => {
+            // println!("Child count: {}", root.child_count());
+            // for i in 0..root.child_count() {
+            //     let child = root.child(i).unwrap();
+            //     let text = &code[child.range().start_byte..child.range().end_byte];
+            //     println!("Child {}: {} = '{}'", i, child.kind(), text);
+            // }
+
+            let lhs = parse_filter(code, root.child(0).unwrap(), defs)?;
+            let pat = parse_filter(code, root.child(2).unwrap(), defs)?;
+            Ok(Filter::BindingExpression(Box::new(lhs), Box::new(pat)))
+        }
+        "optional_expression" => {
+            let field = root
+                .child(0)
+                .expect("optional expression should have the first child as its field");
+
+            let identifier = parse_filter(
+                code,
+                field
+                    .child(1)
+                    .expect("field access should have the second child as its field"),
+                defs,
+            )?;
+            Ok(Filter::ObjIndex(identifier.to_string()))
+        }
+        "reduce_expression" => {
+            // println!("Child count: {}", root.child_count());
+            // for i in 0..root.child_count() {
+            //     let child = root.child(i).unwrap();
+            //     let text = &code[child.range().start_byte..child.range().end_byte];
+            //     println!("Child {}: {} = '{}'", i, child.kind(), text);
+            // }
+            let bind = root.child(1).unwrap();
+            let source_node = bind.child(0).unwrap();
+            let var_node = bind.child(2).unwrap();
+            let source = parse_filter(code, source_node, defs)?;
+
+            let var_name = &code[var_node.range().start_byte + 1..var_node.range().end_byte];
+            let mut var_def = HashMap::new();
+            var_def.insert(var_name.to_string(), source.clone());
+
+            let init = parse_filter(code, root.child(3).unwrap(), defs)?;
+            let update = parse_filter(code, root.child(5).unwrap(), defs)?;
+
+            Ok(Filter::ReduceExpression(
+                var_def,
+                Box::new(init),
+                Box::new(update),
+            ))
+        }
+        "assignment_expression" => anyhow::bail!(
+            "assignment expressions are not supported, found: {}",
+            &code[root.range().start_byte..root.range().end_byte]
+        ),
+        "foreach_expression" => anyhow::bail!(
+            "foreach expressions are not supported, found: {}",
+            &code[root.range().start_byte..root.range().end_byte]
+        ),
+        "field_expression" => anyhow::bail!(
+            "field expressions are not supported, found: {}",
+            &code[root.range().start_byte..root.range().end_byte]
+        ),
+        _ => {
+            anyhow::bail!(
+                "unknown filter {} {}",
+                root.kind(),
+                code[root.range().start_byte..root.range().end_byte].to_string()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+
+    #[test]
+    fn test_parse() {
+        let code = r#"
+            def add(a; b): a + b;
+            add(1; 2)
+        "#;
+
+        let (defs, filter) = parse(code);
+
+        assert_eq!(
+            defs.get("add").unwrap().clone(),
+            Filter::Bound(
+                vec!["a".to_string(), "b".to_string()],
+                Box::new(Filter::BinOp(
+                    Box::new(Filter::Call("a".to_string(), None)),
+                    BinOp::Add,
+                    Box::new(Filter::Call("b".to_string(), None))
+                ))
+            )
+        );
+
+        assert_eq!(
+            filter,
+            Filter::Call(
+                "add".to_string(),
+                Some(vec![Filter::Number(1.0), Filter::Number(2.0)])
+            )
+        );
+    }
+
+    #[test]
+    fn test_parse_filter() {
+        let code = r#"
+            1 + 2
+        "#;
+
+        let (defs, filter) = parse(code);
+
+        assert_eq!(defs, HashMap::new());
+
+        assert_eq!(
+            filter,
+            Filter::BinOp(
+                Box::new(Filter::Number(1.0)),
+                BinOp::Add,
+                Box::new(Filter::Number(2.0))
+            )
+        );
+    }
+
+    #[test]
+    fn test_parse_function_definition() {
+        let code = r#"
+            (def f:  .[] ;  .) | f
+        "#;
+        let (defs, filter) = parse(code);
+        assert!(defs.is_empty());
+        assert_eq!(
+            filter,
+            Filter::Pipe(
+                Box::new(Filter::FunctionExpression(
+                    HashMap::from([(
+                        "f".to_string(),
+                        Filter::Bound(vec![], Box::new(Filter::ArrayIterator))
+                    )]),
+                    Box::new(Filter::Dot)
+                )),
+                Box::new(Filter::Call("f".to_string(), None))
+            )
+        );
+    }
+
+    #[test]
+    fn test_parse_variable() {
+        let code = r#"
+            def main:
+                def add(a; b): a + b;
+                def sub(a; b): a - b;
+                def mul(a; b): a * b;
+                add(1; 2);
+            sub(3; 1)
+        "#;
+        let (defs, filter) = parse(code);
+        assert_eq!(
+            defs.get("main").unwrap().clone(),
+            Filter::Bound(
+                vec![],
+                Box::new(Filter::FunctionExpression(
+                    HashMap::from([
+                        (
+                            "add".to_string(),
+                            Filter::Bound(
+                                vec!["a".to_string(), "b".to_string()],
+                                Box::new(Filter::BinOp(
+                                    Box::new(Filter::Call("a".to_string(), None)),
+                                    BinOp::Add,
+                                    Box::new(Filter::Call("b".to_string(), None))
+                                ))
+                            )
+                        ),
+                        (
+                            "sub".to_string(),
+                            Filter::Bound(
+                                vec!["a".to_string(), "b".to_string()],
+                                Box::new(Filter::BinOp(
+                                    Box::new(Filter::Call("a".to_string(), None)),
+                                    BinOp::Sub,
+                                    Box::new(Filter::Call("b".to_string(), None))
+                                ))
+                            )
+                        ),
+                        (
+                            "mul".to_string(),
+                            Filter::Bound(
+                                vec!["a".to_string(), "b".to_string()],
+                                Box::new(Filter::BinOp(
+                                    Box::new(Filter::Call("a".to_string(), None)),
+                                    BinOp::Mul,
+                                    Box::new(Filter::Call("b".to_string(), None))
+                                ))
+                            )
+                        ),
+                    ]),
+                    Box::new(Filter::Call(
+                        "add".to_string(),
+                        Some(vec![Filter::Number(1.0), Filter::Number(2.0)])
+                    ))
+                ))
+            )
+        );
+        assert_eq!(
+            filter,
+            Filter::Call(
+                "sub".to_string(),
+                Some(vec![Filter::Number(3.0), Filter::Number(1.0)])
+            )
+        );
+    }
+
+    #[test]
+    fn test_incomplete_binop() {
+        let code = r#"1 + "#;
+
+        let (defs, filter) = parse(code);
+
+        assert!(defs.is_empty());
+        assert_eq!(
+            filter,
+            Filter::BinOp(
+                Box::new(Filter::Number(1.0)),
+                BinOp::Add,
+                Box::new(Filter::Hole)
+            )
+        );
+    }
+
+    #[test]
+    fn test_incomplete_pipe() {
+        let code = r#"1 | "#;
+
+        let (defs, filter) = parse(code);
+
+        assert!(defs.is_empty());
+        assert_eq!(
+            filter,
+            Filter::Pipe(Box::new(Filter::Number(1.0)), Box::new(Filter::Hole))
+        );
+    }
+
+    #[test]
+    fn test_incomplete_comma() {
+        let code = r#"1, "#;
+
+        let (defs, filter) = parse(code);
+
+        assert!(defs.is_empty());
+        assert_eq!(
+            filter,
+            Filter::Comma(Box::new(Filter::Number(1.0)), Box::new(Filter::Hole))
+        );
+    }
+
+    #[test]
+    fn test_incomplete_function_definition() {
+        let code = r#"
+            def f(a; b):
+        "#;
+
+        let (defs, filter) = parse(code);
+
+        assert_eq!(
+            defs.get("f"),
+            Some(&Filter::Bound(
+                vec!["a".to_string(), "b".to_string()],
+                Box::new(Filter::Hole)
+            ))
+        );
+        assert_eq!(filter, Filter::Hole);
+    }
+
+    #[test]
+    fn test_incomplete_function_expression() {
+        let code = r#"
+            (def f(a; b): a + b; )
+        "#;
+
+        let (defs, filter) = parse(code);
+
+        assert!(defs.is_empty());
+        assert_eq!(
+            filter,
+            Filter::FunctionExpression(
+                HashMap::from([(
+                    "f".to_string(),
+                    Filter::Bound(
+                        vec!["a".to_string(), "b".to_string()],
+                        Box::new(Filter::BinOp(
+                            Box::new(Filter::Call("a".to_string(), None)),
+                            BinOp::Add,
+                            Box::new(Filter::Call("b".to_string(), None))
+                        ))
+                    )
+                )]),
+                Box::new(Filter::Hole)
+            )
+        );
+    }
+
+    #[test]
+    fn test_incomplete_nested_function_expression() {
+        let code = r#"
+            (def f(a; b): 
+                def g(c; d):
+            )
+
+        "#;
+
+        let (defs, filter) = parse(code);
+
+        assert!(defs.is_empty());
+        assert_eq!(
+            filter,
+            Filter::FunctionExpression(
+                HashMap::from([(
+                    "f".to_string(),
+                    Filter::Bound(
+                        vec!["a".to_string(), "b".to_string()],
+                        Box::new(Filter::FunctionExpression(
+                            HashMap::from([(
+                                "g".to_string(),
+                                Filter::Bound(
+                                    vec!["c".to_string(), "d".to_string()],
+                                    Box::new(Filter::Hole)
+                                )
+                            )]),
+                            Box::new(Filter::Hole)
+                        ))
+                    )
+                )]),
+                Box::new(Filter::Hole)
+            )
+        );
+    }
+
+    #[test]
+    fn test_incomplete_nested_function_expression2() {
+        let code = r#"
+            (def f(a; b): 
+                def g(c; d):
+                    c + d;
+            )
+
+        "#;
+
+        let (defs, filter) = parse(code);
+
+        assert!(defs.is_empty());
+        assert_eq!(
+            filter,
+            Filter::FunctionExpression(
+                HashMap::from([(
+                    "f".to_string(),
+                    Filter::Bound(
+                        vec!["a".to_string(), "b".to_string()],
+                        Box::new(Filter::FunctionExpression(
+                            HashMap::from([(
+                                "g".to_string(),
+                                Filter::Bound(
+                                    vec!["c".to_string(), "d".to_string()],
+                                    Box::new(Filter::BinOp(
+                                        Box::new(Filter::Call("c".to_string(), None)),
+                                        BinOp::Add,
+                                        Box::new(Filter::Call("d".to_string(), None))
+                                    ))
+                                )
+                            )]),
+                            Box::new(Filter::Hole)
+                        ))
+                    )
+                )]),
+                Box::new(Filter::Hole)
+            )
+        );
+    }
+
+    #[test]
+    fn test_incomplete_nested_function_expression3() {
+        let code = r#"
+            (def f(a; b): 
+                def g(c; d):
+                    c + d;
+                e + f;
+            )
+
+        "#;
+
+        let (defs, filter) = parse(code);
+
+        assert!(defs.is_empty());
+        assert_eq!(
+            filter,
+            Filter::FunctionExpression(
+                HashMap::from([(
+                    "f".to_string(),
+                    Filter::Bound(
+                        vec!["a".to_string(), "b".to_string()],
+                        Box::new(Filter::FunctionExpression(
+                            HashMap::from([(
+                                "g".to_string(),
+                                Filter::Bound(
+                                    vec!["c".to_string(), "d".to_string()],
+                                    Box::new(Filter::BinOp(
+                                        Box::new(Filter::Call("c".to_string(), None)),
+                                        BinOp::Add,
+                                        Box::new(Filter::Call("d".to_string(), None))
+                                    ))
+                                )
+                            )]),
+                            Box::new(Filter::BinOp(
+                                Box::new(Filter::Call("e".to_string(), None)),
+                                BinOp::Add,
+                                Box::new(Filter::Call("f".to_string(), None))
+                            ))
+                        ))
+                    )
+                )]),
+                Box::new(Filter::Hole)
+            )
+        );
+    }
+
+    #[test]
+    fn test_incomplete_if_then_else() {
+        let code = r#"
+            if true then
+                1
+            else 
+        "#;
+
+        let (defs, filter) = parse(code);
+
+        assert!(defs.is_empty());
+        assert_eq!(
+            filter,
+            Filter::IfThenElse(
+                Box::new(Filter::Boolean(true)),
+                Box::new(Filter::Number(1.0)),
+                Box::new(Filter::Hole)
+            )
+        );
+    }
+
+    #[test]
+    fn test_incomplete_if_then_else2() {
+        let code = r#"
+            if true then
+                1
+        "#;
+
+        let (defs, filter) = parse(code);
+
+        assert!(defs.is_empty());
+        assert_eq!(
+            filter,
+            Filter::IfThenElse(
+                Box::new(Filter::Boolean(true)),
+                Box::new(Filter::Number(1.0)),
+                Box::new(Filter::Hole)
+            )
+        );
+    }
+
+    #[test]
+    fn test_incomplete_if_then_else3() {
+        let code = r#"
+            if true then
+        "#;
+
+        let (defs, filter) = parse(code);
+
+        assert!(defs.is_empty());
+        assert_eq!(
+            filter,
+            Filter::IfThenElse(
+                Box::new(Filter::Boolean(true)),
+                Box::new(Filter::Hole),
+                Box::new(Filter::Hole)
+            )
+        );
+    }
+
+    #[test]
+    fn test_incomplete_if_then_else4() {
+        let code = r#"
+            if true
+        "#;
+
+        let (defs, filter) = parse(code);
+
+        assert!(defs.is_empty());
+        assert_eq!(
+            filter,
+            Filter::IfThenElse(
+                Box::new(Filter::Boolean(true)),
+                Box::new(Filter::Hole),
+                Box::new(Filter::Hole)
+            )
+        );
+    }
+
+    #[test]
+    fn test_incomplete_if_then_else5() {
+        let code = r#"
+            if
+        "#;
+
+        let (defs, filter) = parse(code);
+
+        assert!(defs.is_empty());
+        assert_eq!(
+            filter,
+            Filter::IfThenElse(
+                Box::new(Filter::Hole),
+                Box::new(Filter::Hole),
+                Box::new(Filter::Hole)
+            )
+        );
+    }
+}

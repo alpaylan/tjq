@@ -410,533 +410,551 @@ pub fn compute_shape(
 ) -> Constraints {
     match f {
         Filter::Dot => {
-                        vec![Constraint::Rel {
-                            t1: Shape::TVar(input_type),
-                            rel: Relation::Equality(Equality::Equal),
-                            t2: Shape::TVar(output_type),
-                        }]
-            }
+            vec![Constraint::Rel {
+                t1: Shape::TVar(input_type),
+                rel: Relation::Equality(Equality::Equal),
+                t2: Shape::TVar(output_type),
+            }]
+        }
         Filter::Pipe(f1, f2) => {
-                let mid_type = ctx.fresh();
-                let mut cs = vec![];
+            let mid_type = ctx.fresh();
+            let mut cs = vec![];
 
-                cs.extend(compute_shape(f1, ctx, input_type, mid_type, filters));
-                cs.extend(compute_shape(f2, ctx, mid_type, output_type, filters));
+            cs.extend(compute_shape(f1, ctx, input_type, mid_type, filters));
+            cs.extend(compute_shape(f2, ctx, mid_type, output_type, filters));
 
-                cs
-            }
+            cs
+        }
         Filter::Comma(f1, f2) => {
-                let left_output_type = ctx.fresh();
-                let right_output_type = ctx.fresh();
+            let left_output_type = ctx.fresh();
+            let right_output_type = ctx.fresh();
 
-                let mut cs = vec![];
-                cs.extend(compute_shape(
-                    f1,
-                    ctx,
-                    input_type,
-                    left_output_type,
-                    filters,
-                ));
-                cs.extend(compute_shape(
-                    f2,
-                    ctx,
-                    input_type,
-                    right_output_type,
-                    filters,
-                ));
+            let mut cs = vec![];
+            cs.extend(compute_shape(
+                f1,
+                ctx,
+                input_type,
+                left_output_type,
+                filters,
+            ));
+            cs.extend(compute_shape(
+                f2,
+                ctx,
+                input_type,
+                right_output_type,
+                filters,
+            ));
 
-                // output_type = left_output_type, right_output_type
-                // cs.push(Constraint::Comparison {
-                //     t1: Shape::Stream(vec![
-                //         Shape::TVar(left_output_type),
-                //         Shape::TVar(right_output_type),
-                //     ]),
-                //     rel: Relation::Equality(Equality::Equal),
-                //     t2: Shape::TVar(output_type),
-                // });
+            // output_type = left_output_type, right_output_type
+            // cs.push(Constraint::Comparison {
+            //     t1: Shape::Stream(vec![
+            //         Shape::TVar(left_output_type),
+            //         Shape::TVar(right_output_type),
+            //     ]),
+            //     rel: Relation::Equality(Equality::Equal),
+            //     t2: Shape::TVar(output_type),
+            // });
 
-                cs
-            }
+            cs
+        }
         Filter::ObjIndex(s) => {
-                // input_type <: { s: output_type }
+            // input_type <: { s: output_type }
+            vec![Constraint::Rel {
+                t1: Shape::TVar(input_type),
+                rel: Relation::Subtyping(Subtyping::Subtype),
+                t2: Shape::Object(vec![(s.clone(), Shape::TVar(output_type))]),
+            }]
+        }
+        Filter::ArrayIndex(n) => {
+            // input_type <: [output_type]
+            if *n >= 0 {
                 vec![Constraint::Rel {
                     t1: Shape::TVar(input_type),
                     rel: Relation::Subtyping(Subtyping::Subtype),
-                    t2: Shape::Object(vec![(s.clone(), Shape::TVar(output_type))]),
+                    t2: Shape::Tuple(
+                        [
+                            vec![Shape::Blob; *n as usize],
+                            vec![Shape::TVar(output_type)],
+                        ]
+                        .concat(),
+                    ),
                 }]
-            }
-        Filter::ArrayIndex(n) => {
-                // input_type <: [output_type]
-                if *n >= 0 {
-                    vec![Constraint::Rel {
-                        t1: Shape::TVar(input_type),
-                        rel: Relation::Subtyping(Subtyping::Subtype),
-                        t2: Shape::Tuple(
-                            [
-                                vec![Shape::Blob; *n as usize],
-                                vec![Shape::TVar(output_type)],
-                            ]
-                            .concat(),
-                        ),
-                    }]
-                } else {
-                    vec![
-                        Constraint::Rel {
-                            t1: Shape::TVar(input_type),
-                            rel: Relation::Subtyping(Subtyping::Subtype),
-                            t2: Shape::Array(Box::new(Shape::Blob), Some(*n)),
-                        },
-                        Constraint::Rel {
-                            t1: Shape::TVar(output_type),
-                            rel: Relation::Equality(Equality::Equal),
-                            t2: Shape::Null,
-                        },
-                    ]
-                }
-            }
-        Filter::ArrayIterator => {
-                // todo: figure out object iteration
-                // output_type <: [input_type]
-
-                // this is the type of a single element of the output stream
-                let single_output_type = ctx.fresh();
-
+            } else {
                 vec![
-                    // input must have been an array of the single_output_type
-                    // [single_output_type] = input_type
                     Constraint::Rel {
                         t1: Shape::TVar(input_type),
                         rel: Relation::Subtyping(Subtyping::Subtype),
-                        t2: Shape::Array(Box::new(Shape::TVar(single_output_type)), None),
+                        t2: Shape::Array(Box::new(Shape::Blob), Some(*n)),
                     },
-                    // output must be a stream of the single_output_type
-                    // output_type = S<single_output_type>
-                    // Constraint::Subtyping {
-                    //     t1: Shape::TVar(single_output_type),
-                    //     rel: Subtyping::Subtype,
-                    //     t2: Shape::Stream(vec![Shape::TVar(single_output_type)]),
-                    // },
+                    Constraint::Rel {
+                        t1: Shape::TVar(output_type),
+                        rel: Relation::Equality(Equality::Equal),
+                        t2: Shape::Null,
+                    },
                 ]
             }
+        }
+        Filter::ArrayIterator => {
+            // todo: figure out object iteration
+            // output_type <: [input_type]
+
+            // this is the type of a single element of the output stream
+            let single_output_type = ctx.fresh();
+
+            vec![
+                // input must have been an array of the single_output_type
+                // [single_output_type] = input_type
+                Constraint::Rel {
+                    t1: Shape::TVar(input_type),
+                    rel: Relation::Subtyping(Subtyping::Subtype),
+                    t2: Shape::Array(Box::new(Shape::TVar(single_output_type)), None),
+                },
+                // output must be a stream of the single_output_type
+                // output_type = S<single_output_type>
+                // Constraint::Subtyping {
+                //     t1: Shape::TVar(single_output_type),
+                //     rel: Subtyping::Subtype,
+                //     t2: Shape::Stream(vec![Shape::TVar(single_output_type)]),
+                // },
+            ]
+        }
         Filter::Null => {
-                // output_type = null
-                vec![Constraint::Rel {
-                    t1: Shape::TVar(output_type),
-                    rel: Relation::Equality(Equality::Equal),
-                    t2: Shape::Null,
-                }]
-            }
+            // output_type = null
+            vec![Constraint::Rel {
+                t1: Shape::TVar(output_type),
+                rel: Relation::Equality(Equality::Equal),
+                t2: Shape::Null,
+            }]
+        }
         Filter::Boolean(b) => {
-                // output_type = bool
-                vec![Constraint::Rel {
-                    t1: Shape::TVar(output_type),
-                    rel: Relation::Equality(Equality::Equal),
-                    t2: Shape::Bool(Some(*b)),
-                }]
-            }
+            // output_type = bool
+            vec![Constraint::Rel {
+                t1: Shape::TVar(output_type),
+                rel: Relation::Equality(Equality::Equal),
+                t2: Shape::Bool(Some(*b)),
+            }]
+        }
         Filter::Number(n) => {
-                // output_type = number
-                vec![Constraint::Rel {
-                    t1: Shape::TVar(output_type),
-                    rel: Relation::Equality(Equality::Equal),
-                    t2: Shape::Number(Some(*n)),
-                }]
-            }
+            // output_type = number
+            vec![Constraint::Rel {
+                t1: Shape::TVar(output_type),
+                rel: Relation::Equality(Equality::Equal),
+                t2: Shape::Number(Some(*n)),
+            }]
+        }
         Filter::String(s) => {
-                // output_type = string
-                vec![Constraint::Rel {
-                    t1: Shape::TVar(output_type),
-                    rel: Relation::Equality(Equality::Equal),
-                    t2: Shape::String(Some(s.clone())),
-                }]
-            }
+            // output_type = string
+            vec![Constraint::Rel {
+                t1: Shape::TVar(output_type),
+                rel: Relation::Equality(Equality::Equal),
+                t2: Shape::String(Some(s.clone())),
+            }]
+        }
         Filter::Array(array_filters) => {
-                let (mut cs, output_types) = array_filters
-                    .iter()
-                    .map(|f| {
-                        let output_type = ctx.fresh();
-                        (
-                            compute_shape(f, ctx, input_type, output_type, filters),
-                            Shape::TVar(output_type),
-                        )
-                    })
-                    .fold((vec![], vec![]), |(mut cs, mut output_types), (c, t)| {
-                        cs.extend(c);
-                        output_types.push(t);
-                        (cs, output_types)
-                    });
-
-                cs.push(Constraint::Rel {
-                    t1: Shape::TVar(output_type),
-                    rel: Relation::Equality(Equality::Equal),
-                    t2: Shape::Tuple(output_types),
+            let (mut cs, output_types) = array_filters
+                .iter()
+                .map(|f| {
+                    let output_type = ctx.fresh();
+                    (
+                        compute_shape(f, ctx, input_type, output_type, filters),
+                        Shape::TVar(output_type),
+                    )
+                })
+                .fold((vec![], vec![]), |(mut cs, mut output_types), (c, t)| {
+                    cs.extend(c);
+                    output_types.push(t);
+                    (cs, output_types)
                 });
 
-                cs
-            }
+            cs.push(Constraint::Rel {
+                t1: Shape::TVar(output_type),
+                rel: Relation::Equality(Equality::Equal),
+                t2: Shape::Tuple(output_types),
+            });
+
+            cs
+        }
         Filter::Object(items) => {
-                let (mut cs, output_types) = items
-                    .iter()
-                    .map(|(k, f)| {
-                        let output_type = ctx.fresh();
-                        let cs = compute_shape(f, ctx, input_type, output_type, filters);
-                        if let Filter::String(s) = k {
-                            (cs, (s.clone(), Shape::TVar(output_type)))
-                        } else {
-                            panic!("Unsupported object key type, expected string, found {k:?}")
-                        }
-                    })
-                    .fold((vec![], vec![]), |(mut cs, mut output_types), (c, t)| {
-                        cs.extend(c);
-                        output_types.push(t);
-                        (cs, output_types)
-                    });
-
-                cs.push(Constraint::Rel {
-                    t1: Shape::Object(output_types),
-                    rel: Relation::Equality(Equality::Equal),
-                    t2: Shape::TVar(output_type),
+            let (mut cs, output_types) = items
+                .iter()
+                .map(|(k, f)| {
+                    let output_type = ctx.fresh();
+                    let cs = compute_shape(f, ctx, input_type, output_type, filters);
+                    if let Filter::String(s) = k {
+                        (cs, (s.clone(), Shape::TVar(output_type)))
+                    } else {
+                        panic!("Unsupported object key type, expected string, found {k:?}")
+                    }
+                })
+                .fold((vec![], vec![]), |(mut cs, mut output_types), (c, t)| {
+                    cs.extend(c);
+                    output_types.push(t);
+                    (cs, output_types)
                 });
 
-                cs
-            }
+            cs.push(Constraint::Rel {
+                t1: Shape::Object(output_types),
+                rel: Relation::Equality(Equality::Equal),
+                t2: Shape::TVar(output_type),
+            });
+
+            cs
+        }
         Filter::UnOp(un_op, filter) => {
-                // let output_type = ctx.fresh();
-                let mut cs = compute_shape(filter, ctx, input_type, output_type, filters);
-                match un_op {
-                    UnOp::Neg => {
-                        // input type must be a number
-                        cs.push(Constraint::Rel {
-                            t1: Shape::TVar(input_type),
-                            rel: Relation::Equality(Equality::Equal),
-                            t2: Shape::Number(None),
-                        });
-                        // output_type must be a number
-                        cs.push(Constraint::Rel {
-                            t1: Shape::TVar(output_type),
-                            rel: Relation::Equality(Equality::Equal),
-                            t2: Shape::Number(None),
-                        });
-                    }
+            // let output_type = ctx.fresh();
+            let mut cs = compute_shape(filter, ctx, input_type, output_type, filters);
+            match un_op {
+                UnOp::Neg => {
+                    // input type must be a number
+                    cs.push(Constraint::Rel {
+                        t1: Shape::TVar(input_type),
+                        rel: Relation::Equality(Equality::Equal),
+                        t2: Shape::Number(None),
+                    });
+                    // output_type must be a number
+                    cs.push(Constraint::Rel {
+                        t1: Shape::TVar(output_type),
+                        rel: Relation::Equality(Equality::Equal),
+                        t2: Shape::Number(None),
+                    });
                 }
-                cs
             }
+            cs
+        }
         Filter::BinOp(filter, bin_op, filter1) => {
-                let left_type = ctx.fresh();
-                let right_type = ctx.fresh();
+            let left_type = ctx.fresh();
+            let right_type = ctx.fresh();
 
-                let mut cs = vec![];
-                cs.extend(compute_shape(filter, ctx, input_type, left_type, filters));
-                cs.extend(compute_shape(filter1, ctx, input_type, right_type, filters));
+            let mut cs = vec![];
+            cs.extend(compute_shape(filter, ctx, input_type, left_type, filters));
+            cs.extend(compute_shape(filter1, ctx, input_type, right_type, filters));
 
-                match bin_op {
-                    BinOp::Add => {
-                        // If both left and right are known to be concrete values of a type, we can do type level computation
+            match bin_op {
+                BinOp::Add => {
+                    // If both left and right are known to be concrete values of a type, we can do type level computation
+                    // let sum_num_num = Constraint::Computation {
+                    //     values: vec![
+                    //         |s| {
+                    //             if let Shape::Number(n) = s {
+                    //                 Some(n)
+                    //             } else {
+                    //                 None
+                    //             }
+                    //         },
+                    //         |s| if let Shape::Number(n) = s { n } else { None },
+                    //     ],
+                    //     output: |values: Vec<fn(Shape) -> T>| {
+                    //         if values.iter().all(|v| v.is_some()) {
+                    //             Shape::Number(Some(values.iter().map(|v| v.unwrap()).sum()))
+                    //         } else {
+                    //             Shape::Number(None)
+                    //         }
+                    //     },
+                    // };
 
-
-                        // the types cannot be subtypes of bool
-                        cs.push(
-                            Constraint::Rel {
-                                t1: Shape::TVar(left_type),
-                                rel: Relation::Subtyping(Subtyping::Subtype),
-                                t2: Shape::Bool(None),
-                            }
-                            .not(),
-                        );
-                        cs.push(
-                            Constraint::Rel {
-                                t1: Shape::TVar(right_type),
-                                rel: Relation::Subtyping(Subtyping::Subtype),
-                                t2: Shape::Bool(None),
-                            }
-                            .not(),
-                        );
-                        // the types must be equal, or null
-                        cs.push(Constraint::Or(vec![
-                            Constraint::Rel {
-                                t1: Shape::TVar(left_type),
-                                rel: Relation::Equality(Equality::Equal),
-                                t2: Shape::TVar(right_type),
-                            },
-                            Constraint::Rel {
-                                t1: Shape::TVar(left_type),
-                                rel: Relation::Equality(Equality::Equal),
-                                t2: Shape::Null,
-                            },
-                            Constraint::Rel {
-                                t1: Shape::TVar(right_type),
-                                rel: Relation::Equality(Equality::Equal),
-                                t2: Shape::Null,
-                            },
-                        ]));
-                        // if one of the types is not null, then that will be the output type
-                        // note: below we encode the reverse of this logic
-                        cs.push(Constraint::Conditional {
-                            c1: Box::new(Constraint::Rel {
-                                t1: Shape::TVar(left_type),
-                                rel: Relation::Equality(Equality::Equal),
-                                t2: Shape::Null,
-                            }),
-                            c2: Box::new(Constraint::Rel {
-                                t1: Shape::TVar(output_type),
-                                rel: Relation::Subtyping(Subtyping::Subtype),
-                                t2: Shape::TVar(right_type),
-                            }),
-                        });
-                        cs.push(Constraint::Conditional {
-                            c1: Box::new(Constraint::Rel {
-                                t1: Shape::TVar(right_type),
-                                rel: Relation::Equality(Equality::Equal),
-                                t2: Shape::Null,
-                            }),
-                            c2: Box::new(Constraint::Rel {
-                                t1: Shape::TVar(output_type),
-                                rel: Relation::Subtyping(Subtyping::Subtype),
-                                t2: Shape::TVar(left_type),
-                            }),
-                        });
-
-                        cs
-                    }
-                    BinOp::Sub => todo!(),
-                    BinOp::Mul => todo!(),
-                    BinOp::Div => todo!(),
-                    BinOp::Mod => todo!(),
-                    BinOp::Eq => {
-                        tracing::debug!("{output_type} == true ==> {left_type} == {right_type}");
-                        cs.push(Constraint::Conditional {
-                            c1: Box::new(Constraint::Rel {
-                                t1: Shape::TVar(output_type),
-                                rel: Relation::Equality(Equality::Equal),
-                                t2: Shape::Bool(Some(true)),
-                            }),
-                            c2: Box::new(Constraint::Rel {
-                                t1: Shape::TVar(left_type),
-                                rel: Relation::Equality(Equality::Equal),
-                                t2: Shape::TVar(right_type),
-                            }),
-                        });
-
-                        cs.push(Constraint::Conditional {
-                            c1: Box::new(Constraint::Rel {
-                                t1: Shape::TVar(output_type),
-                                rel: Relation::Equality(Equality::Equal),
-                                t2: Shape::Bool(Some(false)),
-                            }),
-                            c2: Box::new(Constraint::Rel {
-                                t1: Shape::TVar(left_type),
-                                rel: Relation::Equality(Equality::NotEqual),
-                                t2: Shape::TVar(right_type),
-                            }),
-                        });
-
-                        cs.push(Constraint::Rel {
-                            t1: Shape::TVar(output_type),
-                            rel: Relation::Subtyping(Subtyping::Subtype),
-                            t2: Shape::Bool(None),
-                        });
-
-                        cs
-                    }
-                    BinOp::Ne => todo!(),
-                    BinOp::Gt => todo!(),
-                    BinOp::Ge => todo!(),
-                    BinOp::Lt => todo!(),
-                    BinOp::Le => todo!(),
-                    BinOp::And => todo!(),
-                    BinOp::Or => {
-                        // if the output is true, then either left or right must be true
-                        cs.push(Constraint::Conditional {
-                            c1: Box::new(Constraint::Rel {
-                                t1: Shape::TVar(output_type),
-                                rel: Relation::Equality(Equality::Equal),
-                                t2: Shape::Bool(Some(true)),
-                            }),
-                            c2: Box::new(Constraint::Or(vec![
-                                Constraint::Rel {
-                                    t1: Shape::TVar(left_type),
-                                    rel: Relation::Equality(Equality::Equal),
-                                    t2: Shape::Bool(Some(true)),
-                                },
-                                Constraint::Rel {
-                                    t1: Shape::TVar(right_type),
-                                    rel: Relation::Equality(Equality::Equal),
-                                    t2: Shape::Bool(Some(true)),
-                                },
-                            ])),
-                        });
-
-                        // if the output is false, then both left and right must be false
-                        cs.push(Constraint::Conditional {
-                            c1: Box::new(Constraint::Rel {
-                                t1: Shape::TVar(output_type),
-                                rel: Relation::Equality(Equality::Equal),
-                                t2: Shape::Bool(Some(false)),
-                            }),
-                            c2: Box::new(Constraint::And(vec![
-                                Constraint::Rel {
-                                    t1: Shape::TVar(left_type),
-                                    rel: Relation::Equality(Equality::Equal),
-                                    t2: Shape::Bool(Some(false)),
-                                },
-                                Constraint::Rel {
-                                    t1: Shape::TVar(right_type),
-                                    rel: Relation::Equality(Equality::Equal),
-                                    t2: Shape::Bool(Some(false)),
-                                },
-                            ])),
-                        });
-
-                        // left and right and output must be of type bool
-                        cs.push(Constraint::Rel {
-                            t1: Shape::TVar(output_type),
-                            rel: Relation::Subtyping(Subtyping::Subtype),
-                            t2: Shape::Bool(None),
-                        });
-
-                        cs.push(Constraint::Rel {
+                    // the types cannot be subtypes of bool
+                    cs.push(
+                        Constraint::Rel {
                             t1: Shape::TVar(left_type),
                             rel: Relation::Subtyping(Subtyping::Subtype),
                             t2: Shape::Bool(None),
-                        });
-
-                        cs.push(Constraint::Rel {
+                        }
+                        .not(),
+                    );
+                    cs.push(
+                        Constraint::Rel {
                             t1: Shape::TVar(right_type),
                             rel: Relation::Subtyping(Subtyping::Subtype),
                             t2: Shape::Bool(None),
-                        });
+                        }
+                        .not(),
+                    );
+                    // the types must be equal, or null
+                    cs.push(Constraint::Or(vec![
+                        Constraint::Rel {
+                            t1: Shape::TVar(left_type),
+                            rel: Relation::Equality(Equality::Equal),
+                            t2: Shape::TVar(right_type),
+                        },
+                        Constraint::Rel {
+                            t1: Shape::TVar(left_type),
+                            rel: Relation::Equality(Equality::Equal),
+                            t2: Shape::Null,
+                        },
+                        Constraint::Rel {
+                            t1: Shape::TVar(right_type),
+                            rel: Relation::Equality(Equality::Equal),
+                            t2: Shape::Null,
+                        },
+                    ]));
+                    // if one of the types is not null, then that will be the output type
+                    // note: below we encode the reverse of this logic
+                    cs.push(Constraint::Conditional {
+                        c1: Box::new(Constraint::Rel {
+                            t1: Shape::TVar(left_type),
+                            rel: Relation::Equality(Equality::Equal),
+                            t2: Shape::Null,
+                        }),
+                        c2: Box::new(Constraint::Rel {
+                            t1: Shape::TVar(output_type),
+                            rel: Relation::Subtyping(Subtyping::Subtype),
+                            t2: Shape::TVar(right_type),
+                        }),
+                    });
+                    cs.push(Constraint::Conditional {
+                        c1: Box::new(Constraint::Rel {
+                            t1: Shape::TVar(right_type),
+                            rel: Relation::Equality(Equality::Equal),
+                            t2: Shape::Null,
+                        }),
+                        c2: Box::new(Constraint::Rel {
+                            t1: Shape::TVar(output_type),
+                            rel: Relation::Subtyping(Subtyping::Subtype),
+                            t2: Shape::TVar(left_type),
+                        }),
+                    });
 
-                        cs
-                    }
+                    cs
+                }
+                BinOp::Sub => todo!(),
+                BinOp::Mul => todo!(),
+                BinOp::Div => todo!(),
+                BinOp::Mod => todo!(),
+                BinOp::Eq => {
+                    tracing::debug!("{output_type} == true ==> {left_type} == {right_type}");
+                    cs.push(Constraint::Conditional {
+                        c1: Box::new(Constraint::Rel {
+                            t1: Shape::TVar(output_type),
+                            rel: Relation::Equality(Equality::Equal),
+                            t2: Shape::Bool(Some(true)),
+                        }),
+                        c2: Box::new(Constraint::Rel {
+                            t1: Shape::TVar(left_type),
+                            rel: Relation::Equality(Equality::Equal),
+                            t2: Shape::TVar(right_type),
+                        }),
+                    });
+
+                    cs.push(Constraint::Conditional {
+                        c1: Box::new(Constraint::Rel {
+                            t1: Shape::TVar(output_type),
+                            rel: Relation::Equality(Equality::Equal),
+                            t2: Shape::Bool(Some(false)),
+                        }),
+                        c2: Box::new(Constraint::Rel {
+                            t1: Shape::TVar(left_type),
+                            rel: Relation::Equality(Equality::NotEqual),
+                            t2: Shape::TVar(right_type),
+                        }),
+                    });
+
+                    cs.push(Constraint::Rel {
+                        t1: Shape::TVar(output_type),
+                        rel: Relation::Subtyping(Subtyping::Subtype),
+                        t2: Shape::Bool(None),
+                    });
+
+                    cs
+                }
+                BinOp::Ne => todo!(),
+                BinOp::Gt => todo!(),
+                BinOp::Ge => todo!(),
+                BinOp::Lt => todo!(),
+                BinOp::Le => todo!(),
+                BinOp::And => todo!(),
+                BinOp::Or => {
+                    // if the output is true, then either left or right must be true
+                    cs.push(Constraint::Conditional {
+                        c1: Box::new(Constraint::Rel {
+                            t1: Shape::TVar(output_type),
+                            rel: Relation::Equality(Equality::Equal),
+                            t2: Shape::Bool(Some(true)),
+                        }),
+                        c2: Box::new(Constraint::Or(vec![
+                            Constraint::Rel {
+                                t1: Shape::TVar(left_type),
+                                rel: Relation::Equality(Equality::Equal),
+                                t2: Shape::Bool(Some(true)),
+                            },
+                            Constraint::Rel {
+                                t1: Shape::TVar(right_type),
+                                rel: Relation::Equality(Equality::Equal),
+                                t2: Shape::Bool(Some(true)),
+                            },
+                        ])),
+                    });
+
+                    // if the output is false, then both left and right must be false
+                    cs.push(Constraint::Conditional {
+                        c1: Box::new(Constraint::Rel {
+                            t1: Shape::TVar(output_type),
+                            rel: Relation::Equality(Equality::Equal),
+                            t2: Shape::Bool(Some(false)),
+                        }),
+                        c2: Box::new(Constraint::And(vec![
+                            Constraint::Rel {
+                                t1: Shape::TVar(left_type),
+                                rel: Relation::Equality(Equality::Equal),
+                                t2: Shape::Bool(Some(false)),
+                            },
+                            Constraint::Rel {
+                                t1: Shape::TVar(right_type),
+                                rel: Relation::Equality(Equality::Equal),
+                                t2: Shape::Bool(Some(false)),
+                            },
+                        ])),
+                    });
+
+                    // left and right and output must be of type bool
+                    cs.push(Constraint::Rel {
+                        t1: Shape::TVar(output_type),
+                        rel: Relation::Subtyping(Subtyping::Subtype),
+                        t2: Shape::Bool(None),
+                    });
+
+                    cs.push(Constraint::Rel {
+                        t1: Shape::TVar(left_type),
+                        rel: Relation::Subtyping(Subtyping::Subtype),
+                        t2: Shape::Bool(None),
+                    });
+
+                    cs.push(Constraint::Rel {
+                        t1: Shape::TVar(right_type),
+                        rel: Relation::Subtyping(Subtyping::Subtype),
+                        t2: Shape::Bool(None),
+                    });
+
+                    cs
                 }
             }
+        }
         Filter::Empty => todo!(),
         Filter::Error => {
-                // output_type = error
-                vec![Constraint::False]
-            }
+            // output_type = error
+            vec![Constraint::False]
+        }
         Filter::Call(f, args) => {
-                if let Some(filter) = filters.get(f) {
-                    if let Filter::Bound(params, body) = filter {
-                        // if params is empty, then we can compute the shape of the body directly
-                        if params.is_empty() {
-                            return compute_shape(body, ctx, input_type, output_type, filters);
-                        }
-                        // if params is not empty, then args should match the params
-                        let args = args.clone().expect("Expected args for bound filter");
-                        if args.len() != params.len() {
-                            panic!("Expected {} args, found {}", params.len(), args.len());
-                        }
-                        todo!()
-                    } else {
-                        panic!("Expected a bound filter, found: {:?}", filter);
+            if let Some(filter) = filters.get(f) {
+                if let Filter::Bound(params, body) = filter {
+                    // if params is empty, then we can compute the shape of the body directly
+                    if params.is_empty() {
+                        return compute_shape(body, ctx, input_type, output_type, filters);
                     }
-                } else {
+                    // if params is not empty, then args should match the params
+                    let args = args.clone().expect("Expected args for bound filter");
+                    if args.len() != params.len() {
+                        panic!("Expected {} args, found {}", params.len(), args.len());
+                    }
                     todo!()
+                } else {
+                    panic!("Expected a bound filter, found: {:?}", filter);
                 }
+            } else {
+                todo!()
             }
+        }
         Filter::IfThenElse(if_, then, else_) => {
-                let mut cs = vec![];
+            let mut cs = vec![];
 
-                let if_type = ctx.fresh();
+            let if_type = ctx.fresh();
 
-                cs.extend(compute_shape(if_, ctx, input_type, if_type, filters));
+            cs.extend(compute_shape(if_, ctx, input_type, if_type, filters));
 
-                // if expression must evaluate to a boolean
-                cs.push(Constraint::Rel {
+            // if expression must evaluate to a boolean
+            cs.push(Constraint::Rel {
+                t1: Shape::TVar(if_type),
+                rel: Relation::Subtyping(Subtyping::Subtype),
+                t2: Shape::Bool(None),
+            });
+
+            let then_type = ctx.fresh();
+            let then_cs = compute_shape(then, ctx, input_type, then_type, filters);
+            // if the if expression is true, then the then expression must be of type then_type
+            cs.push(Constraint::Conditional {
+                c1: Box::new(Constraint::Rel {
                     t1: Shape::TVar(if_type),
+                    rel: Relation::Equality(Equality::Equal),
+                    t2: Shape::Bool(Some(true)),
+                }),
+                c2: Box::new(Constraint::Rel {
+                    t1: Shape::TVar(then_type),
                     rel: Relation::Subtyping(Subtyping::Subtype),
+                    t2: Shape::TVar(output_type),
+                }),
+            });
+            // if the if expression is true, then the then expression should constrain the types.
+            cs.push(Constraint::Conditional {
+                c1: Box::new(Constraint::Rel {
+                    t1: Shape::TVar(if_type),
+                    rel: Relation::Equality(Equality::Equal),
+                    t2: Shape::Bool(Some(true)),
+                }),
+                c2: Box::new(Constraint::And(then_cs.clone())),
+            });
+
+            // if the if expression is false, then the else expression must be of type else_type
+            let else_type = ctx.fresh();
+            cs.push(Constraint::Conditional {
+                c1: Box::new(Constraint::Rel {
+                    t1: Shape::TVar(if_type),
+                    rel: Relation::Equality(Equality::Equal),
+                    t2: Shape::Bool(Some(false)),
+                }),
+                c2: Box::new(Constraint::Rel {
+                    t1: Shape::TVar(else_type),
+                    rel: Relation::Subtyping(Subtyping::Subtype),
+                    t2: Shape::TVar(output_type),
+                }),
+            });
+            // if the if expression is false, then the else expression should constrain the types.
+            let else_cs = compute_shape(else_, ctx, input_type, else_type, filters);
+            cs.push(Constraint::Conditional {
+                c1: Box::new(Constraint::Rel {
+                    t1: Shape::TVar(if_type),
+                    rel: Relation::Equality(Equality::Equal),
+                    t2: Shape::Bool(Some(false)),
+                }),
+                c2: Box::new(Constraint::And(else_cs.clone())),
+            });
+
+            // if the if expression is unknown, then the then and else expressions will be unioned
+            cs.push(Constraint::Conditional {
+                c1: Box::new(Constraint::Rel {
+                    t1: Shape::TVar(if_type),
+                    rel: Relation::Equality(Equality::Equal),
                     t2: Shape::Bool(None),
-                });
+                }),
+                c2: Box::new(Constraint::Rel {
+                    t1: Shape::Union(
+                        Box::new(Shape::TVar(then_type)),
+                        Box::new(Shape::TVar(else_type)),
+                    ),
+                    rel: Relation::Subtyping(Subtyping::Subtype),
+                    t2: Shape::TVar(output_type),
+                }),
+            });
 
-                let then_type = ctx.fresh();
-                let then_cs = compute_shape(then, ctx, input_type, then_type, filters);
-                // if the if expression is true, then the then expression must be of type then_type
-                cs.push(Constraint::Conditional {
-                    c1: Box::new(Constraint::Rel {
-                        t1: Shape::TVar(if_type),
-                        rel: Relation::Equality(Equality::Equal),
-                        t2: Shape::Bool(Some(true)),
-                    }),
-                    c2: Box::new(Constraint::Rel {
-                        t1: Shape::TVar(then_type),
-                        rel: Relation::Subtyping(Subtyping::Subtype),
-                        t2: Shape::TVar(output_type),
-                    }),
-                });
-                // if the if expression is true, then the then expression should constrain the types.
-                cs.push(Constraint::Conditional {
-                    c1: Box::new(Constraint::Rel {
-                        t1: Shape::TVar(if_type),
-                        rel: Relation::Equality(Equality::Equal),
-                        t2: Shape::Bool(Some(true)),
-                    }),
-                    c2: Box::new(Constraint::And(then_cs.clone())),
-                });
+            // if the if expression is unknown, then the then and else expressions should constrain the types.
+            cs.push(Constraint::Conditional {
+                c1: Box::new(Constraint::Rel {
+                    t1: Shape::TVar(if_type),
+                    rel: Relation::Equality(Equality::Equal),
+                    t2: Shape::Bool(None),
+                }),
+                c2: Box::new(Constraint::Or(vec![
+                    Constraint::And(then_cs),
+                    Constraint::And(else_cs),
+                ])),
+            });
 
-                // if the if expression is false, then the else expression must be of type else_type
-                let else_type = ctx.fresh();
-                cs.push(Constraint::Conditional {
-                    c1: Box::new(Constraint::Rel {
-                        t1: Shape::TVar(if_type),
-                        rel: Relation::Equality(Equality::Equal),
-                        t2: Shape::Bool(Some(false)),
-                    }),
-                    c2: Box::new(Constraint::Rel {
-                        t1: Shape::TVar(else_type),
-                        rel: Relation::Subtyping(Subtyping::Subtype),
-                        t2: Shape::TVar(output_type),
-                    }),
-                });
-                // if the if expression is false, then the else expression should constrain the types.
-                let else_cs = compute_shape(else_, ctx, input_type, else_type, filters);
-                cs.push(Constraint::Conditional {
-                    c1: Box::new(Constraint::Rel {
-                        t1: Shape::TVar(if_type),
-                        rel: Relation::Equality(Equality::Equal),
-                        t2: Shape::Bool(Some(false)),
-                    }),
-                    c2: Box::new(Constraint::And(else_cs.clone())),
-                });
-
-                // if the if expression is unknown, then the then and else expressions will be unioned
-                cs.push(Constraint::Conditional {
-                    c1: Box::new(Constraint::Rel {
-                        t1: Shape::TVar(if_type),
-                        rel: Relation::Equality(Equality::Equal),
-                        t2: Shape::Bool(None),
-                    }),
-                    c2: Box::new(Constraint::Rel {
-                        t1: Shape::Union(
-                            Box::new(Shape::TVar(then_type)),
-                            Box::new(Shape::TVar(else_type)),
-                        ),
-                        rel: Relation::Subtyping(Subtyping::Subtype),
-                        t2: Shape::TVar(output_type),
-                    }),
-                });
-
-                // if the if expression is unknown, then the then and else expressions should constrain the types.
-                cs.push(Constraint::Conditional {
-                    c1: Box::new(Constraint::Rel {
-                        t1: Shape::TVar(if_type),
-                        rel: Relation::Equality(Equality::Equal),
-                        t2: Shape::Bool(None),
-                    }),
-                    c2: Box::new(Constraint::Or(vec![
-                        Constraint::And(then_cs),
-                        Constraint::And(else_cs),
-                    ])),
-                });
-
-                cs
-            }
+            cs
+        }
         Filter::Bound(items, filter) => todo!(),
         Filter::FunctionExpression(_, _) => todo!(),
         Filter::BindingExpression(filter, filter1) => todo!(),
         Filter::Variable(_) => todo!(),
         Filter::ReduceExpression(hash_map, filter, filter1) => todo!(),
-Filter::Hole => todo!(),
+        Filter::Hole => todo!(),
     }
 }
 
@@ -1045,7 +1063,7 @@ mod solver_tests {
         experimental_type_inference::{
             compute_shape, Equality, Relation, Shape, TypeEnv, TypeError,
         },
-        Subtyping, Type,
+        Subtyping,
     };
 
     fn builtin_filters() -> HashMap<String, Filter> {
@@ -1272,10 +1290,7 @@ mod solver_tests {
     fn test_solver_add_definite() {
         let (tin, tout) = solve_constraints(r#"1 + 1"#);
         // t: T -> T
-        assert_eq!(
-            tin,
-            Shape::TVar(1)
-        );
+        assert_eq!(tin, Shape::TVar(1));
         assert_eq!(tout, Shape::Number(Some(2.0)));
     }
 

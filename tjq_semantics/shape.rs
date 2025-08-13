@@ -2,6 +2,7 @@ use std::{
     cmp::Ordering,
     collections::HashMap,
     fmt::{self, Display, Formatter},
+    ops::{Deref, DerefMut},
 };
 
 use tjq_exec::{BinOp, Filter, Json, UnOp};
@@ -20,10 +21,71 @@ pub enum Shape {
     Object(Vec<(String, Shape)>),
     Mismatch(Box<Shape>, Box<Shape>),
     Union(Box<Shape>, Box<Shape>),
+    Cond(Box<Shape>, Box<Shape>),
+    Neg(Box<Shape>),
 }
 
-pub enum Type {
-    Arrow(Box<Shape>, Box<Shape>), // A -> B
+impl Shape {
+    pub(crate) fn null() -> Self {
+        Shape::Null
+    }
+    pub(crate) fn tvar(t: usize) -> Self {
+        Shape::TVar(t)
+    }
+    pub(crate) fn bool(b: bool) -> Self {
+        Shape::Bool(Some(b))
+    }
+    pub(crate) fn bool_() -> Self {
+        Shape::Bool(None)
+    }
+
+    pub(crate) fn number(n: impl Into<f64>) -> Self {
+        Shape::Number(Some(n.into()))
+    }
+    pub(crate) fn number_() -> Self {
+        Shape::Number(None)
+    }
+
+    pub(crate) fn string(s: impl Into<String>) -> Self {
+        Shape::String(Some(s.into()))
+    }
+    pub(crate) fn string_() -> Self {
+        Shape::String(None)
+    }
+
+    pub(crate) fn blob() -> Self {
+        Shape::Blob
+    }
+    pub(crate) fn array(shape: Shape, u: Option<isize>) -> Self {
+        Shape::Array(Box::new(shape), u)
+    }
+    pub(crate) fn tuple(shapes: Vec<Shape>) -> Self {
+        Shape::Tuple(shapes)
+    }
+    pub(crate) fn object(items: Vec<(String, Shape)>) -> Self {
+        Shape::Object(items)
+    }
+    pub(crate) fn mismatch(s1: Shape, s2: Shape) -> Self {
+        Shape::Mismatch(Box::new(s1), Box::new(s2))
+    }
+    pub(crate) fn union(s1: Shape, s2: Shape) -> Self {
+        Shape::Union(Box::new(s1), Box::new(s2))
+    }
+    pub(crate) fn union_(shapes: Vec<Shape>) -> Self {
+        if shapes.is_empty() {
+            panic!("Cannot create union of empty shapes");
+        }
+        let mut iter = shapes.into_iter().rev();
+        let mut result = iter.next().unwrap();
+        for shape in iter {
+            result = Shape::union(result, shape);
+        }
+        result
+    }
+
+    pub(crate) fn neg(self) -> Self {
+        Shape::Neg(Box::new(self))
+    }
 }
 
 // . : |- A -> A
@@ -85,7 +147,7 @@ impl ShapeMismatch {
 impl Display for Shape {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            Shape::TVar(t) => write!(f, "<T_{t}>"),
+            Shape::TVar(t) => write!(f, "<T{t}>",),
             Shape::Blob => write!(f, "<>"),
             Shape::Null => write!(f, "<null>"),
             Shape::Bool(None) => write!(f, "<bool>"),
@@ -118,24 +180,40 @@ impl Display for Shape {
             }
             Shape::Mismatch(s1, s2) => write!(f, "({s1} >< {s2})"),
             Shape::Union(s1, s2) => write!(f, "({s1} | {s2})"),
+            Shape::Neg(shape) => {
+                write!(f, "(!{shape})")
+            }
+            Shape::Cond(shape, shape1) => todo!(),
         }
     }
 }
 
-#[derive(Debug)]
-pub struct ShapeContext {
-    pub shapes: HashMap<usize, Shape>,
-}
+#[derive(Debug, Clone)]
+pub struct ShapeContext(HashMap<usize, Shape>);
 
 impl ShapeContext {
     fn new() -> Self {
-        ShapeContext {
-            shapes: HashMap::new(),
-        }
+        ShapeContext(HashMap::new())
     }
 
     fn fresh(&self) -> usize {
-        self.shapes.len()
+        self.0.len()
+    }
+
+    fn get(&self, t: &usize) -> Option<&Shape> {
+        self.0.get(t)
+    }
+
+    fn get_mut(&mut self, t: &usize) -> Option<&mut Shape> {
+        self.0.get_mut(t)
+    }
+
+    fn insert(&mut self, t: usize, shape: Shape) {
+        self.0.insert(t, shape);
+    }
+
+    fn remove(&mut self, t: &usize) -> Option<Shape> {
+        self.0.remove(t)
     }
 
     fn normalize(&mut self) {
@@ -152,7 +230,7 @@ impl ShapeContext {
         //     }
         // });
 
-        let shapes = self.shapes.clone();
+        let shapes = self.0.clone();
 
         let dependencies = shapes
             .iter()
@@ -162,18 +240,18 @@ impl ShapeContext {
         let mut sorted = toposort(dependencies);
 
         while let Some(t) = sorted.pop() {
-            let shape = self.shapes.get(&t).unwrap().clone();
+            let shape = self.get(&t).unwrap().clone();
             if let Shape::TVar(t_) = shape {
                 tracing::debug!("Normalizing {t} -> {t_}");
                 if t == t_ {
-                    self.shapes.insert(t, Shape::Blob);
+                    self.insert(t, Shape::Blob);
                 } else {
-                    let shape = self.shapes.get(&t_).unwrap().clone();
-                    self.shapes.insert(t, shape);
+                    let shape = self.get(&t_).unwrap().clone();
+                    self.insert(t, shape);
                 }
             } else {
-                let shape = shape.normalize(&self.shapes);
-                self.shapes.insert(t, shape);
+                let shape = shape.normalize(self);
+                self.insert(t, shape);
             }
         }
     }
@@ -209,19 +287,19 @@ impl Display for Subtyping {
 impl Shape {
     pub fn new(f: &Filter, filters: &HashMap<String, Filter>) -> (Shape, Vec<Shape>) {
         let mut ctx = ShapeContext::new();
-        ctx.shapes.insert(0, Shape::TVar(0));
+        ctx.insert(0, Shape::tvar(0));
 
-        let mut results = Shape::build_shape(f, vec![Shape::TVar(0)], &mut ctx, filters);
-        tracing::debug!("type context: {:?}", ctx.shapes);
+        let mut results = Shape::build_shape(f, vec![Shape::tvar(0)], &mut ctx, filters);
+        tracing::debug!("type context: {:?}", ctx);
         tracing::debug!("result types: {:?}", results);
         ctx.normalize();
 
         for result in results.iter_mut() {
             tracing::debug!("Normalizing {result}");
-            *result = result.normalize(&ctx.shapes).canonicalize();
+            // *result = result.normalize(&mut ctx).canonicalize();
         }
 
-        (ctx.shapes.remove(&0).unwrap(), results)
+        (ctx.remove(&0).unwrap(), results)
     }
 
     pub fn dependencies(&self) -> Vec<usize> {
@@ -240,23 +318,24 @@ impl Shape {
                 .into_iter()
                 .chain(s2.dependencies())
                 .collect(),
+            Shape::Neg(shape) => shape.dependencies(),
+            Shape::Cond(shape, shape1) => todo!(),
         }
     }
 
-    pub fn normalize(&self, shapes: &HashMap<usize, Shape>) -> Shape {
+    pub fn normalize(&self, ctx: &mut ShapeContext) -> Shape {
         tracing::debug!("normalizing {self}");
         match self {
             Shape::TVar(t) => {
-                let shape = shapes.get(t).unwrap().clone();
+                let shape = ctx.get(t).unwrap().clone();
                 if let Shape::TVar(t_) = &shape {
                     if t == t_ {
-                        // Shape::Blob
-                        Shape::TVar(*t_)
+                        Shape::Blob
                     } else {
-                        shape.normalize(shapes)
+                        shape.normalize(ctx)
                     }
                 } else {
-                    shape.normalize(shapes)
+                    shape.normalize(ctx)
                 }
             }
             Shape::Blob => Shape::Blob,
@@ -264,29 +343,27 @@ impl Shape {
             Shape::Bool(b) => Shape::Bool(*b),
             Shape::Number(n) => Shape::Number(*n),
             Shape::String(s) => Shape::String(s.clone()),
-            Shape::Array(shape, u) => Shape::Array(Box::new(shape.normalize(shapes)), *u),
-            Shape::Tuple(tuple) => {
-                Shape::Tuple(tuple.iter().map(|s| s.normalize(shapes)).collect())
-            }
+            Shape::Array(shape, u) => Shape::Array(Box::new(shape.normalize(ctx)), *u),
+            Shape::Tuple(tuple) => Shape::Tuple(tuple.iter().map(|s| s.normalize(ctx)).collect()),
             Shape::Object(obj) => Shape::Object(
                 obj.iter()
-                    .map(|(k, s)| (k.clone(), s.normalize(shapes)))
+                    .map(|(k, s)| (k.clone(), s.normalize(ctx)))
                     .collect(),
             ),
-            Shape::Mismatch(s1, s2) => Shape::Mismatch(
-                Box::new(s1.normalize(shapes)),
-                Box::new(s2.normalize(shapes)),
-            ),
-            Shape::Union(s1, s2) => Shape::Union(
-                Box::new(s1.normalize(shapes)),
-                Box::new(s2.normalize(shapes)),
-            ),
+            Shape::Mismatch(s1, s2) => {
+                Shape::Mismatch(Box::new(s1.normalize(ctx)), Box::new(s2.normalize(ctx)))
+            }
+            Shape::Union(s1, s2) => {
+                Shape::Union(Box::new(s1.normalize(ctx)), Box::new(s2.normalize(ctx)))
+            }
+            Shape::Neg(shape) => Shape::Neg(Box::new(shape.normalize(ctx))),
+            Shape::Cond(shape, shape1) => todo!(),
         }
     }
 
     pub fn subtype(&self, other: &Self) -> Subtyping {
         match (self, other) {
-            (Shape::TVar(t), _) | (_, Shape::TVar(t)) => {
+            (Shape::TVar(_), _) | (_, Shape::TVar(_)) => {
                 // TVar can be any type, so it should not be a subtype of any other type
                 Subtyping::Incompatible
             }
@@ -436,12 +513,10 @@ impl Shape {
 
     pub fn canonicalize(&self) -> Shape {
         match self {
-            Shape::TVar(_)
-            | Shape::Blob
-            | Shape::Null
-            | Shape::Bool(_)
-            | Shape::Number(_)
-            | Shape::String(_) => self.clone(),
+            Shape::TVar(t) => Shape::TVar(*t),
+            Shape::Blob | Shape::Null | Shape::Bool(_) | Shape::Number(_) | Shape::String(_) => {
+                self.clone()
+            }
             Shape::Array(shape, u) => Shape::Array(Box::new(shape.canonicalize()), *u),
             Shape::Tuple(shapes) => {
                 Shape::Tuple(shapes.iter().map(|s| s.canonicalize()).collect::<Vec<_>>())
@@ -486,6 +561,28 @@ impl Shape {
                     }
                 }
             },
+            Shape::Neg(shape) => match *shape.clone() {
+                s @ Shape::TVar(_)
+                | s @ Shape::Blob
+                | s @ Shape::Null
+                | s @ Shape::Bool(_)
+                | s @ Shape::Number(_)
+                | s @ Shape::String(_)
+                | s @ Shape::Array(_, _)
+                | s @ Shape::Tuple(_)
+                | s @ Shape::Object(_) => s,
+                Shape::Neg(shape) => shape.canonicalize(),
+                Shape::Union(shape, shape1) => Shape::Union(
+                    Box::new(Shape::neg(*shape.clone()).canonicalize()),
+                    Box::new(Shape::neg(*shape1.clone()).canonicalize()),
+                ),
+                Shape::Mismatch(shape, shape1) => Shape::Mismatch(
+                    Box::new(Shape::neg(*shape.clone()).canonicalize()),
+                    Box::new(Shape::neg(*shape1.clone()).canonicalize()),
+                ),
+                Shape::Cond(shape, shape1) => todo!(),
+            },
+            Shape::Cond(shape, shape1) => todo!(),
         }
     }
 
@@ -526,22 +623,22 @@ impl Shape {
                 .map(|shape| match shape {
                     Shape::Blob => {
                         let new_type_var = ctx.fresh();
-                        ctx.shapes.insert(new_type_var, Shape::TVar(new_type_var));
+                        ctx.insert(new_type_var, Shape::tvar(new_type_var));
                         // todo: check this
-                        Shape::TVar(new_type_var)
+                        Shape::tvar(new_type_var)
                     }
                     Shape::TVar(t) => {
                         let new_type_var = ctx.fresh();
-                        let current_shape = ctx.shapes.get(&t).unwrap().clone();
+                        let current_shape = ctx.get(&t).unwrap().clone();
                         // <'I> + {s: <'T>}
                         let current_shape = Shape::merge_shapes(
                             current_shape,
-                            Shape::Object(vec![(s.clone(), Shape::TVar(new_type_var))]),
+                            Shape::Object(vec![(s.clone(), Shape::tvar(new_type_var))]),
                             ctx,
                         );
-                        ctx.shapes.insert(t, current_shape);
-                        ctx.shapes.insert(new_type_var, Shape::TVar(new_type_var));
-                        Shape::TVar(new_type_var)
+                        ctx.insert(t, current_shape);
+                        ctx.insert(new_type_var, Shape::tvar(new_type_var));
+                        Shape::tvar(new_type_var)
                     }
                     Shape::Null => Shape::Null,
                     Shape::Bool(b) => Shape::Mismatch(
@@ -570,13 +667,15 @@ impl Shape {
                         let new_type_var = ctx.fresh();
 
                         if !has_key {
-                            obj.push((s.clone(), Shape::TVar(new_type_var)));
+                            obj.push((s.clone(), Shape::tvar(new_type_var)));
                         }
 
                         Shape::Object(obj)
                     }
-                    Shape::Mismatch(s1, s2) => todo!(),
-                    Shape::Union(s1, s2) => todo!(),
+                    Shape::Mismatch(_, _) => todo!(),
+                    Shape::Union(_, _) => todo!(),
+                    Shape::Neg(shape) => todo!(),
+                    Shape::Cond(shape, shape1) => todo!(),
                 })
                 .collect(),
             Filter::ArrayIndex(u) => shapes
@@ -584,23 +683,23 @@ impl Shape {
                 .map(|shape| match shape {
                     Shape::Blob => {
                         let new_type_var = ctx.fresh();
-                        ctx.shapes.insert(new_type_var, Shape::TVar(new_type_var));
-                        Shape::TVar(new_type_var)
+                        ctx.insert(new_type_var, Shape::tvar(new_type_var));
+                        Shape::tvar(new_type_var)
                     }
                     Shape::TVar(t) => {
                         let new_type_var = ctx.fresh();
-                        let current_shape = ctx.shapes.get(&t).unwrap().clone();
+                        let current_shape = ctx.get(&t).unwrap().clone();
                         // <'I> + {s: <'T>}
                         let current_shape = Shape::merge_shapes(
                             current_shape,
-                            Shape::Array(Box::new(Shape::TVar(new_type_var)), Some(*u)),
+                            Shape::Array(Box::new(Shape::tvar(new_type_var)), Some(*u)),
                             ctx,
                         );
 
-                        ctx.shapes.insert(t, current_shape);
-                        ctx.shapes.insert(new_type_var, Shape::TVar(new_type_var));
+                        ctx.insert(t, current_shape);
+                        ctx.insert(new_type_var, Shape::tvar(new_type_var));
 
-                        Shape::TVar(new_type_var)
+                        Shape::tvar(new_type_var)
                     }
                     Shape::Null => Shape::Null,
                     Shape::Bool(b) => Shape::Mismatch(
@@ -620,7 +719,7 @@ impl Shape {
                     Shape::Tuple(mut tuple) => {
                         while (*u).max(0) as usize >= tuple.len() {
                             let new_type_var = ctx.fresh();
-                            tuple.push(Shape::TVar(new_type_var));
+                            tuple.push(Shape::tvar(new_type_var));
                         }
 
                         Shape::Tuple(tuple)
@@ -629,8 +728,10 @@ impl Shape {
                         Box::new(Shape::Object(obj)),
                         Box::new(Shape::Array(Box::new(Shape::Blob), Some(*u))),
                     ),
-                    Shape::Mismatch(s1, s2) => todo!(),
-                    Shape::Union(s1, s2) => todo!(),
+                    Shape::Mismatch(_, _) => todo!(),
+                    Shape::Union(_, _) => todo!(),
+                    Shape::Neg(shape) => todo!(),
+                    Shape::Cond(shape, shape1) => todo!(),
                 })
                 .collect(),
             Filter::ArrayIterator => shapes
@@ -638,21 +739,21 @@ impl Shape {
                 .flat_map(|shape| match shape {
                     Shape::Blob => {
                         let new_type_var = ctx.fresh();
-                        ctx.shapes.insert(new_type_var, Shape::TVar(new_type_var));
-                        vec![Shape::TVar(new_type_var)]
+                        ctx.insert(new_type_var, Shape::tvar(new_type_var));
+                        vec![Shape::tvar(new_type_var)]
                     }
                     Shape::TVar(t) => {
                         let new_type_var = ctx.fresh();
-                        let current_shape = ctx.shapes.get(&t).unwrap().clone();
+                        let current_shape = ctx.get(&t).unwrap().clone();
                         let current_shape = Shape::merge_shapes(
                             current_shape,
-                            Shape::Array(Box::new(Shape::TVar(new_type_var)), None),
+                            Shape::Array(Box::new(Shape::tvar(new_type_var)), None),
                             ctx,
                         );
-                        ctx.shapes.insert(t, current_shape);
-                        ctx.shapes.insert(new_type_var, Shape::TVar(new_type_var));
+                        ctx.insert(t, current_shape);
+                        ctx.insert(new_type_var, Shape::tvar(new_type_var));
 
-                        vec![Shape::TVar(new_type_var)]
+                        vec![Shape::tvar(new_type_var)]
                     }
                     Shape::Null => vec![Shape::Mismatch(
                         Box::new(Shape::Null),
@@ -670,11 +771,13 @@ impl Shape {
                         Box::new(Shape::String(s)),
                         Box::new(Shape::Array(Box::new(Shape::Blob), None)),
                     )],
-                    Shape::Array(shape, u) => vec![*shape.clone()],
+                    Shape::Array(shape, _) => vec![*shape.clone()],
                     Shape::Tuple(vec) => vec,
                     Shape::Object(vec) => vec.into_iter().map(|(_, shape)| shape).collect(),
-                    Shape::Mismatch(s1, s2) => todo!(),
-                    Shape::Union(s1, s2) => todo!(),
+                    Shape::Mismatch(_, _) => todo!(),
+                    Shape::Union(_, _) => todo!(),
+                    Shape::Neg(shape) => todo!(),
+                    Shape::Cond(shape, shape1) => todo!(),
                 })
                 .collect(),
             Filter::Null => vec![Shape::Null],
@@ -728,10 +831,10 @@ impl Shape {
                         .map(|s| match s {
                             Shape::Number(n) => Shape::Number(n.map(|n| -n)),
                             Shape::TVar(t) => {
-                                let current_shape = ctx.shapes.get(&t).unwrap().clone();
+                                let current_shape = ctx.get(&t).unwrap().clone();
                                 let current_shape =
                                     Shape::merge_shapes(current_shape, Shape::Number(None), ctx);
-                                ctx.shapes.insert(t, current_shape);
+                                ctx.insert(t, current_shape);
 
                                 Shape::Number(None)
                             }
@@ -753,6 +856,20 @@ impl Shape {
                         .zip(s2)
                         .map(|(l, r)| {
                             match (l, r) {
+                                (Shape::TVar(t0), Shape::TVar(t1)) => {
+                                    if t0 == t1 {
+                                        Shape::tvar(t0)
+                                    } else {
+                                        let current_shape = ctx.get(&t0).unwrap().clone();
+                                        let current_shape = Shape::merge_shapes(
+                                            current_shape,
+                                            Shape::tvar(t1),
+                                            ctx,
+                                        );
+                                        ctx.insert(t0, current_shape);
+                                        Shape::tvar(t0)
+                                    }
+                                }
                                 // null + X
                                 // X + null
                                 (Shape::Null, s) | (s, Shape::Null) => s,
@@ -767,7 +884,7 @@ impl Shape {
                                 },
                                 (Shape::String(_), Shape::TVar(t))
                                 | (Shape::TVar(t), Shape::String(_)) => {
-                                    let current_shape = ctx.shapes.get(&t).unwrap().clone();
+                                    let current_shape = ctx.get(&t).unwrap().clone();
                                     let current_shape = Shape::merge_shapes(
                                         current_shape,
                                         Shape::Union(
@@ -776,7 +893,7 @@ impl Shape {
                                         ),
                                         ctx,
                                     );
-                                    ctx.shapes.insert(t, current_shape);
+                                    ctx.insert(t, current_shape);
 
                                     Shape::String(None)
                                 }
@@ -789,7 +906,7 @@ impl Shape {
                                 }
                                 (Shape::Array(shape, u), Shape::TVar(t))
                                 | (Shape::TVar(t), Shape::Array(shape, u)) => {
-                                    let current_shape = ctx.shapes.get(&t).unwrap().clone();
+                                    let current_shape = ctx.get(&t).unwrap().clone();
                                     let current_shape = Shape::merge_shapes(
                                         current_shape,
                                         Shape::Union(
@@ -798,7 +915,7 @@ impl Shape {
                                         ),
                                         ctx,
                                     );
-                                    ctx.shapes.insert(t, current_shape);
+                                    ctx.insert(t, current_shape);
 
                                     Shape::Array(shape, u)
                                 }
@@ -833,7 +950,7 @@ impl Shape {
                                 }
                                 (Shape::Object(obj), Shape::TVar(t))
                                 | (Shape::TVar(t), Shape::Object(obj)) => {
-                                    let current_shape = ctx.shapes.get(&t).unwrap().clone();
+                                    let current_shape = ctx.get(&t).unwrap().clone();
                                     let current_shape = Shape::merge_shapes(
                                         current_shape.clone(),
                                         Shape::Union(
@@ -842,7 +959,7 @@ impl Shape {
                                         ),
                                         ctx,
                                     );
-                                    ctx.shapes.insert(t, current_shape);
+                                    ctx.insert(t, current_shape);
 
                                     Shape::Object(obj)
                                 }
@@ -855,7 +972,7 @@ impl Shape {
                                 },
                                 (Shape::Number(_), Shape::TVar(t))
                                 | (Shape::TVar(t), Shape::Number(_)) => {
-                                    let current_shape = ctx.shapes.get(&t).unwrap().clone();
+                                    let current_shape = ctx.get(&t).unwrap().clone();
                                     let current_shape = Shape::merge_shapes(
                                         current_shape.clone(),
                                         Shape::Union(
@@ -864,7 +981,7 @@ impl Shape {
                                         ),
                                         ctx,
                                     );
-                                    ctx.shapes.insert(t, current_shape);
+                                    ctx.insert(t, current_shape);
 
                                     Shape::Number(None)
                                 }
@@ -892,13 +1009,13 @@ impl Shape {
                                 }
                                 (Shape::Array(shape, u), Shape::TVar(t))
                                 | (Shape::TVar(t), Shape::Array(shape, u)) => {
-                                    let current_shape = ctx.shapes.get(&t).unwrap().clone();
+                                    let current_shape = ctx.get(&t).unwrap().clone();
                                     let current_shape = Shape::merge_shapes(
                                         current_shape,
                                         Shape::Array(shape.clone(), u),
                                         ctx,
                                     );
-                                    ctx.shapes.insert(t, current_shape);
+                                    ctx.insert(t, current_shape);
 
                                     Shape::Array(shape, u)
                                 }
@@ -910,13 +1027,13 @@ impl Shape {
                                 },
                                 (Shape::Number(_), Shape::TVar(t))
                                 | (Shape::TVar(t), Shape::Number(_)) => {
-                                    let current_shape = ctx.shapes.get(&t).unwrap().clone();
+                                    let current_shape = ctx.get(&t).unwrap().clone();
                                     let current_shape = Shape::merge_shapes(
                                         current_shape.clone(),
                                         Shape::Number(None),
                                         ctx,
                                     );
-                                    ctx.shapes.insert(t, current_shape);
+                                    ctx.insert(t, current_shape);
 
                                     Shape::Number(None)
                                 }
@@ -953,7 +1070,7 @@ impl Shape {
                                 },
                                 (Shape::Number(n), Shape::TVar(t))
                                 | (Shape::TVar(t), Shape::Number(n)) => {
-                                    let current_shape = ctx.shapes.get(&t).unwrap().clone();
+                                    let current_shape = ctx.get(&t).unwrap().clone();
                                     let current_shape = Shape::merge_shapes(
                                         current_shape.clone(),
                                         Shape::Union(
@@ -962,7 +1079,7 @@ impl Shape {
                                         ),
                                         ctx,
                                     );
-                                    ctx.shapes.insert(t, current_shape);
+                                    ctx.insert(t, current_shape);
 
                                     if let Some(n) = n {
                                         if n >= 0.0 {
@@ -1011,13 +1128,13 @@ impl Shape {
                                 },
                                 (Shape::Number(_), Shape::TVar(t))
                                 | (Shape::TVar(t), Shape::Number(_)) => {
-                                    let current_shape = ctx.shapes.get(&t).unwrap().clone();
+                                    let current_shape = ctx.get(&t).unwrap().clone();
                                     let current_shape = Shape::merge_shapes(
                                         current_shape.clone(),
                                         Shape::Number(None),
                                         ctx,
                                     );
-                                    ctx.shapes.insert(t, current_shape);
+                                    ctx.insert(t, current_shape);
 
                                     Shape::Number(None)
                                 }
@@ -1032,7 +1149,6 @@ impl Shape {
                 | BinOp::Le
                 | BinOp::And
                 | BinOp::Or
-                | BinOp::Eq
                 | BinOp::Ne => {
                     let s1 = Shape::build_shape(l, shapes.clone(), ctx, filters);
                     let s2 = Shape::build_shape(r, shapes, ctx, filters);
@@ -1047,9 +1163,66 @@ impl Shape {
                         })
                         .collect()
                 }
+                BinOp::Eq => {
+                    let s1 = Shape::build_shape(l, shapes.clone(), ctx, filters);
+                    let s2 = Shape::build_shape(r, shapes, ctx, filters);
+
+                    s1.into_iter()
+                        .zip(s2)
+                        .map(|(l, r)| {
+                            match (l, r) {
+                                (Shape::Mismatch(l, r), _) | (_, Shape::Mismatch(l, r)) => {
+                                    Shape::Mismatch(l, r)
+                                }
+                                // Const computations
+                                (Shape::Number(Some(n1)), Shape::Number(Some(n2))) if n1 == n2 => {
+                                    Shape::Bool(Some(true))
+                                }
+                                (Shape::Bool(Some(b1)), Shape::Bool(Some(b2))) if b1 == b2 => {
+                                    Shape::Bool(Some(true))
+                                }
+                                (Shape::String(Some(s1)), Shape::String(Some(s2))) if s1 == s2 => {
+                                    Shape::Bool(Some(true))
+                                }
+                                (Shape::Null, Shape::Null) => Shape::Bool(Some(true)),
+                                // Imprecise computations
+                                (Shape::Number(Some(_)), Shape::Number(None))
+                                | (Shape::Number(None), Shape::Number(Some(_)))
+                                | (Shape::Number(None), Shape::Number(None))
+                                | (Shape::Bool(Some(_)), Shape::Bool(None))
+                                | (Shape::Bool(None), Shape::Bool(Some(_)))
+                                | (Shape::String(Some(_)), Shape::String(None))
+                                | (Shape::String(None), Shape::String(Some(_))) => {
+                                    Shape::Bool(None)
+                                }
+                                // Refine TVar's to respect the equality check
+                                (Shape::TVar(t), s) | (s, Shape::TVar(t)) => {
+                                    // return a condition
+                                    Shape::union(
+                                        Shape::cond()
+                                        , s2)
+                                }
+                                _ => todo!(),
+                            }
+                        })
+                        .collect()
+                }
             },
             Filter::Empty => vec![],
-            Filter::Error => todo!(),
+            Filter::Error => {
+                // if the input shape is a type variable, invert it; if it is a concrete type, return a mismatch
+                shapes
+                    .into_iter()
+                    .map(|shape| match shape {
+                        Shape::TVar(t) => {
+                            let current_shape = ctx.get(&t).unwrap().clone();
+                            ctx.insert(t, Shape::Neg(Box::new(current_shape)));
+                            Shape::Neg(Box::new(Shape::tvar(t)))
+                        }
+                        _ => Shape::Mismatch(Box::new(shape.clone()), Box::new(Shape::neg(shape))),
+                    })
+                    .collect()
+            }
             Filter::Call(name, filters_) => match filters_ {
                 Some(args) => {
                     let filter = filters
@@ -1075,7 +1248,7 @@ impl Shape {
                 let s = Shape::build_shape(filter, shapes.clone(), ctx, filters);
                 let s1 = Shape::build_shape(filter1, shapes.clone(), ctx, filters);
                 let s2 = Shape::build_shape(filter2, shapes, ctx, filters);
-
+                tracing::debug!("computing if_then_else {s:?} {s1:?} {s2:?}");
                 s.into_iter()
                     .zip(s1)
                     .zip(s2)
@@ -1087,11 +1260,11 @@ impl Shape {
                     })
                     .collect()
             }
-            Filter::Bound(items, filter) => {
+            Filter::Bound(_, filter) => {
                 // todo: understand this better
                 Shape::build_shape(filter, shapes, ctx, filters)
             }
-            Filter::FunctionExpression(_, expr) => todo!(),
+            Filter::FunctionExpression(_, _) => todo!(),
             Filter::BindingExpression(_, _) => todo!(),
             Filter::Variable(_) => todo!(),
             Filter::ReduceExpression(_, _, _) => todo!(),
@@ -1102,22 +1275,30 @@ impl Shape {
     pub fn merge_shapes(s1: Shape, s2: Shape, ctx: &mut ShapeContext) -> Shape {
         match (s1, s2) {
             (Shape::Blob, s) | (s, Shape::Blob) => s,
+            (Shape::TVar(t0), Shape::TVar(t1)) => {
+                if t0 == t1 {
+                    Shape::tvar(t0)
+                } else {
+                    let current_shape = ctx.get(&t0).unwrap().clone();
+                    let current_shape = Shape::merge_shapes(current_shape, Shape::tvar(t1), ctx);
+                    ctx.insert(t0, current_shape);
+                    Shape::tvar(t0)
+                }
+            }
             (Shape::TVar(t), s) | (s, Shape::TVar(t)) => {
-                let current_shape = ctx.shapes.get(&t).unwrap().clone();
+                let current_shape = ctx.get(&t).unwrap().clone();
                 match current_shape {
                     Shape::Blob => {
-                        ctx.shapes.insert(t, s.clone());
+                        ctx.insert(t, s.clone());
                         s
                     }
                     Shape::TVar(t1) => {
-                        // t = t1
-                        // t1 = X
-                        ctx.shapes.insert(t1, s.clone());
+                        ctx.insert(t1, s.clone());
                         s
                     }
                     _ => {
                         let current_shape = Shape::merge_shapes(current_shape, s.clone(), ctx);
-                        ctx.shapes.insert(t, current_shape.clone());
+                        ctx.insert(t, current_shape.clone());
                         current_shape
                     }
                 }
@@ -1135,12 +1316,12 @@ impl Shape {
 
                 while tuple1.len() < len {
                     let new_type_var = ctx.fresh();
-                    tuple1.push(Shape::TVar(new_type_var));
+                    tuple1.push(Shape::tvar(new_type_var));
                 }
 
                 while tuple2.len() < len {
                     let new_type_var = ctx.fresh();
-                    tuple2.push(Shape::TVar(new_type_var));
+                    tuple2.push(Shape::tvar(new_type_var));
                 }
 
                 let tuple = tuple1
@@ -1363,18 +1544,24 @@ impl Shape {
                     Some(mismatch)
                 }
             }
+            Shape::Neg(shape) => {
+                let inner_result = shape.check(j.clone(), path.clone());
+                match inner_result {
+                    None => Some(ShapeMismatch::new(path, self.clone(), Shape::from_json(j))),
+                    Some(_) => None,
+                }
+            }
+            Shape::Cond(shape, shape1) => todo!(),
         }
     }
 
     pub fn check_self(&self, path: Vec<Access>) -> Option<ShapeMismatch> {
         println!("checking self: {self}");
         match self {
-            Shape::Blob
-            | Shape::TVar(_)
-            | Shape::Null
-            | Shape::Bool(..)
-            | Shape::Number(..)
-            | Shape::String(..) => None,
+            Shape::TVar(_) => None,
+            Shape::Blob | Shape::Null | Shape::Bool(..) | Shape::Number(..) | Shape::String(..) => {
+                None
+            }
             Shape::Array(shape, _) => shape.check_self([path.clone(), vec![Access::Iter]].concat()),
             Shape::Tuple(tuple) => {
                 let (_, mismatches): (Vec<_>, Vec<_>) = tuple
@@ -1406,130 +1593,71 @@ impl Shape {
 
                 mismatches.into_iter().next().flatten()
             }
+            Shape::Neg(shape) => {
+                let inner_result = shape.check_self(path.clone());
+                match inner_result {
+                    None => Some(ShapeMismatch::new(path, self.clone(), self.clone())),
+                    Some(_) => None,
+                }
+            }
+            Shape::Cond(shape, shape1) => todo!(),
         }
     }
 }
 
 #[cfg(test)]
-mod tests {
+mod shape_computation_tests {
     use crate::shape::{Access, Shape, ShapeMismatch};
     use std::collections::HashMap;
-    use tjq_exec::{BinOp, Filter, Json, UnOp};
-    use tjq_parser::parse;
+    use tjq_exec::{parse, parse_defs, Filter, Json};
 
     fn builtin_filters() -> HashMap<String, Filter> {
-        let map = Filter::Bound(
-            vec!["f".into()],
-            Box::new(Filter::Array(vec![Filter::Pipe(
-                Box::new(Filter::ArrayIterator),
-                Box::new(Filter::Call("f".to_string(), None)),
-            )])),
-        );
+        // read defs.jq
+        parse_defs(include_str!("../tjq/defs.jq"))
+    }
 
-        let abs = Filter::Bound(
-            vec![],
-            Box::new(Filter::IfThenElse(
-                Box::new(Filter::BinOp(
-                    Box::new(Filter::Dot),
-                    BinOp::Lt,
-                    Box::new(Filter::Number(0.0)),
-                )),
-                Box::new(Filter::UnOp(UnOp::Neg, Box::new(Filter::Dot))),
-                Box::new(Filter::Dot),
-            )),
-        );
+    fn json(s: &str) -> Json {
+        let sjson: serde_json::Value = serde_json::from_str(s).unwrap();
+        fn sjson_to_json(sjson: &serde_json::Value) -> Json {
+            match sjson {
+                serde_json::Value::Null => Json::Null,
+                serde_json::Value::Bool(b) => Json::Boolean(*b),
+                serde_json::Value::Number(n) => Json::Number(n.as_f64().unwrap()),
+                serde_json::Value::String(s) => Json::String(s.clone()),
+                serde_json::Value::Array(arr) => {
+                    Json::Array(arr.iter().map(sjson_to_json).collect())
+                }
+                serde_json::Value::Object(obj) => Json::Object(
+                    obj.iter()
+                        .map(|(k, v)| (k.clone(), sjson_to_json(v)))
+                        .collect(),
+                ),
+            }
+        }
+        sjson_to_json(&sjson)
+    }
 
-        let isboolean = Filter::Bound(
-            vec![],
-            Box::new(Filter::BinOp(
-                Box::new(Filter::BinOp(
-                    Box::new(Filter::Dot),
-                    BinOp::Eq,
-                    Box::new(Filter::Boolean(true)),
-                )),
-                BinOp::Or,
-                Box::new(Filter::BinOp(
-                    Box::new(Filter::Dot),
-                    BinOp::Eq,
-                    Box::new(Filter::Boolean(false)),
-                )),
-            )),
-        );
+    #[test]
+    fn test_add_dot_number() {
+        let (shape, result) = get_type("1 + .");
+        assert_eq!(shape, Shape::union(Shape::number_(), Shape::null()));
+        assert_eq!(result, Shape::number_());
+    }
 
-        // def type:
-        //     if . == null then "null"
-        //     elif isboolean then "boolean"
-        //     elif . < "" then "number"
-        //     elif . < [] then "string"
-        //     elif . < {} then "array"
-        //     else             "object" end;
-        let type_ = Filter::Bound(
-            vec![],
-            Box::new(Filter::IfThenElse(
-                Box::new(Filter::BinOp(
-                    Box::new(Filter::Dot),
-                    BinOp::Eq,
-                    Box::new(Filter::Null),
-                )),
-                Box::new(Filter::String("null".to_string())),
-                Box::new(Filter::IfThenElse(
-                    Box::new(Filter::Call("isboolean".to_string(), None)),
-                    Box::new(Filter::String("boolean".to_string())),
-                    Box::new(Filter::IfThenElse(
-                        Box::new(Filter::BinOp(
-                            Box::new(Filter::Dot),
-                            BinOp::Lt,
-                            Box::new(Filter::String("".to_string())),
-                        )),
-                        Box::new(Filter::String("number".to_string())),
-                        Box::new(Filter::IfThenElse(
-                            Box::new(Filter::BinOp(
-                                Box::new(Filter::Dot),
-                                BinOp::Lt,
-                                Box::new(Filter::Array(vec![])),
-                            )),
-                            Box::new(Filter::String("string".to_string())),
-                            Box::new(Filter::IfThenElse(
-                                Box::new(Filter::BinOp(
-                                    Box::new(Filter::Dot),
-                                    BinOp::Lt,
-                                    Box::new(Filter::Object(vec![])),
-                                )),
-                                Box::new(Filter::String("array".to_string())),
-                                Box::new(Filter::String("object".to_string())),
-                            )),
-                        )),
-                    )),
-                )),
-            )),
-        );
-
-        let mut filters = HashMap::new();
-        filters.insert("map".to_string(), map);
-        filters.insert("abs".to_string(), abs);
-        filters.insert("isboolean".to_string(), isboolean);
-        filters.insert("type".to_string(), type_);
-
-        filters
+    #[test]
+    fn test_add_dot_dot() {
+        let (shape, result) = get_type(". + .");
+        assert_eq!(shape, Shape::tvar(0));
+        assert_eq!(result, Shape::tvar(0));
     }
 
     #[test]
     fn test_plus1() {
-        let json = Json::Number(1.0);
-        let filter = Filter::BinOp(
-            Box::new(Filter::Number(1.0)),
-            BinOp::Add,
-            Box::new(Filter::Dot),
-        );
+        let json = json("1.0");
+        let (shape, result) = get_type("1 + .");
 
-        let (shape, results) = Shape::new(&filter, &HashMap::new());
-
-        assert_eq!(
-            shape,
-            Shape::Union(Box::new(Shape::Number(None)), Box::new(Shape::Null))
-        );
-        assert_eq!(results.len(), 1);
-        assert_eq!(results.first().unwrap(), &Shape::Number(None));
+        assert_eq!(shape, Shape::union(Shape::number_(), Shape::null()));
+        assert_eq!(result, Shape::number_());
 
         let results = shape.check(json, vec![]);
 
@@ -1538,56 +1666,30 @@ mod tests {
 
     #[test]
     fn test_plus2() {
-        let filter = Filter::Comma(
-            Box::new(Filter::BinOp(
-                Box::new(Filter::Dot),
-                BinOp::Add,
-                Box::new(Filter::Number(1.0)),
-            )),
-            Box::new(Filter::BinOp(
-                Box::new(Filter::Dot),
-                BinOp::Add,
-                Box::new(Filter::String("hello".to_string())),
-            )),
-        );
-
-        let (shape, results) = Shape::new(&filter, &HashMap::new());
+        let (shape, results) = get_type_with_results(". + 1, . + \"hello\"");
 
         assert_eq!(
             shape,
-            Shape::Mismatch(
-                Box::new(Shape::Union(
-                    Box::new(Shape::Number(None)),
-                    Box::new(Shape::Null)
-                )),
-                Box::new(Shape::Union(
-                    Box::new(Shape::String(None)),
-                    Box::new(Shape::Null)
-                )),
+            Shape::mismatch(
+                Shape::union(Shape::number_(), Shape::null()),
+                Shape::union(Shape::string_(), Shape::null())
             )
         );
 
         assert_eq!(results.len(), 2);
 
-        assert_eq!(results.first().unwrap(), &Shape::Number(None));
+        assert_eq!(results.first().unwrap(), &Shape::number_());
 
-        assert_eq!(results.last().unwrap(), &Shape::String(None));
+        assert_eq!(results.last().unwrap(), &Shape::string_());
     }
 
     #[test]
     fn test_minus1() {
-        let json = Json::Number(1.0);
-        let filter = Filter::BinOp(
-            Box::new(Filter::Number(1.0)),
-            BinOp::Sub,
-            Box::new(Filter::Number(2.0)),
-        );
+        let json = json("1.0");
+        let (shape, result) = get_type("1 - 2");
 
-        let (shape, results) = Shape::new(&filter, &HashMap::new());
-
-        assert_eq!(shape, Shape::Blob);
-        assert_eq!(results.len(), 1);
-        assert_eq!(results.first().unwrap(), &Shape::Number(Some(-1.0)));
+        assert_eq!(shape, Shape::tvar(0));
+        assert_eq!(result, Shape::number(-1.0));
 
         let results = shape.check(json, vec![]);
 
@@ -1596,23 +1698,16 @@ mod tests {
 
     #[test]
     fn test_minus2() {
-        let json1 = Json::Number(1.0);
-        let json2 = Json::Object(vec![("a".to_string(), Json::Number(2.0))]);
-
-        let filter = Filter::BinOp(
-            Box::new(Filter::Number(1.0)),
-            BinOp::Sub,
-            Box::new(Filter::ObjIndex("a".to_string())),
-        );
-
-        let (shape, results) = Shape::new(&filter, &HashMap::new());
+        let json1 = json("1.0");
+        let json2 = json(r#"{"a": 2.0}"#);
+        let (shape, result) = get_type("1 - .a");
 
         assert_eq!(
             shape,
-            Shape::Object(vec![("a".to_string(), Shape::Number(None))])
+            Shape::object(vec![("a".to_string(), Shape::number_())])
         );
 
-        assert_eq!(results, vec![Shape::Number(None)]);
+        assert_eq!(result, Shape::number_());
 
         let results = shape.check(json1, vec![]);
 
@@ -1620,8 +1715,8 @@ mod tests {
             results,
             Some(ShapeMismatch::new(
                 vec![],
-                Shape::Object(vec![("a".to_string(), Shape::Number(None))]),
-                Shape::Number(Some(1.0)),
+                Shape::object(vec![("a".to_string(), Shape::number_())]),
+                Shape::number(1.0),
             ))
         );
 
@@ -1632,46 +1727,27 @@ mod tests {
     #[test]
     fn test_minus3() {
         // "x" - .a
-        let filter = Filter::BinOp(
-            Box::new(Filter::String("x".to_string())),
-            BinOp::Sub,
-            Box::new(Filter::ObjIndex("a".to_string())),
-        );
+        let (shape, result) = get_type("\"x\" - .a");
 
-        let (shape, results) = Shape::new(&filter, &HashMap::new());
-
-        assert_eq!(shape, Shape::Object(vec![("a".to_string(), Shape::Blob)]));
-
-        assert_eq!(results.len(), 1);
-        assert_eq!(
-            results.first().unwrap(),
-            &Shape::Mismatch(
-                Box::new(Shape::String(Some("x".to_string()))),
-                Box::new(Shape::Blob)
-            )
-        );
+        assert_eq!(shape, Shape::object(vec![("a".to_string(), Shape::blob())]));
+        assert_eq!(result, Shape::mismatch(Shape::string("x"), Shape::blob()));
     }
 
     #[test]
     fn test_abs() {
-        let filter = Filter::Call("abs".to_string(), None);
-
-        let (shape, results) = Shape::new(&filter, &builtin_filters());
-        assert_eq!(shape, Shape::Number(None));
-
-        assert_eq!(results.len(), 1);
-        assert_eq!(results.first().unwrap().canonicalize(), Shape::Number(None));
+        let (shape, result) = get_type("abs");
+        assert_eq!(shape, Shape::number_());
+        assert_eq!(result.canonicalize(), Shape::number_());
     }
 
     #[test]
     fn test_isboolean() {
-        let json1 = Json::Boolean(true);
-        let json2 = Json::Number(1.0);
-        let filter = Filter::Call("isboolean".to_string(), None);
+        let json1 = json("true");
+        let json2 = json("1.0");
+        let (shape, result) = get_type("isboolean");
 
-        let (shape, results) = Shape::new(&filter, &builtin_filters());
-        assert_eq!(shape, Shape::Blob);
-        assert_eq!(results, vec![Shape::Bool(None)]);
+        assert_eq!(shape, Shape::tvar(0));
+        assert_eq!(result, Shape::bool_());
 
         let results = shape.check(json1, vec![]);
         assert_eq!(results, None);
@@ -1682,33 +1758,27 @@ mod tests {
 
     #[test]
     fn test_type() {
-        let json1 = Json::Boolean(true);
-        let json2 = Json::Number(1.0);
+        let json1 = json("true");
+        let json2 = json("1.0");
+        let (shape, result) = get_type("type");
 
-        let filter = Filter::Call("type".to_string(), None);
-
-        let (shape, results) = Shape::new(&filter, &builtin_filters());
-
-        assert_eq!(shape, Shape::Blob);
+        assert_eq!(shape, Shape::tvar(0));
 
         assert_eq!(
-            results,
-            vec![Shape::Union(
-                Box::new(Shape::String(Some("null".to_string()))),
-                Box::new(Shape::Union(
-                    Box::new(Shape::String(Some("boolean".to_string()))),
-                    Box::new(Shape::Union(
-                        Box::new(Shape::String(Some("number".to_string()))),
-                        Box::new(Shape::Union(
-                            Box::new(Shape::String(Some("string".to_string()))),
-                            Box::new(Shape::Union(
-                                Box::new(Shape::String(Some("array".to_string()))),
-                                Box::new(Shape::String(Some("object".to_string())))
-                            ))
-                        ))
-                    ))
-                ))
-            )]
+            result,
+            Shape::union(
+                Shape::string("null"),
+                Shape::union(
+                    Shape::string("boolean"),
+                    Shape::union(
+                        Shape::string("number"),
+                        Shape::union(
+                            Shape::string("string"),
+                            Shape::union(Shape::string("array"), Shape::string("object"))
+                        )
+                    )
+                )
+            )
         );
 
         let results = shape.check(json1, vec![]);
@@ -1720,46 +1790,21 @@ mod tests {
 
     #[test]
     fn test_map1() {
-        let json1 = Json::Array(vec![Json::Number(-1.0), Json::Number(2.0)]);
-        let json2 = Json::Array(vec![
-            Json::String("hello".to_string()),
-            Json::String("world".to_string()),
-        ]);
-        let json3 = Json::Array(vec![Json::Number(-1.0), Json::String("world".to_string())]);
-        let json4 = Json::Array(vec![Json::String("hello".to_string()), Json::Boolean(true)]);
+        let json1 = json("[-1.0, 2.0]");
+        let json2 = json(r#"["hello", "world"]"#);
+        let json3 = json(r#"[-1.0, "world"]"#);
+        let json4 = json(r#"["hello", true]"#);
 
         // map(. * 2)
-        let filter = Filter::Call(
-            "map".to_string(),
-            Some(vec![Filter::BinOp(
-                Box::new(Filter::Dot),
-                BinOp::Mul,
-                Box::new(Filter::Number(2.0)),
-            )]),
-        );
-
-        let (shape, results) = Shape::new(&filter, &builtin_filters());
+        let (shape, result) = get_type("map(. * 2)");
         assert_eq!(
             shape,
-            Shape::Array(
-                Box::new(Shape::Union(
-                    Box::new(Shape::Number(None)),
-                    Box::new(Shape::String(None))
-                )),
-                None
-            )
+            Shape::array(Shape::union(Shape::number_(), Shape::string_()), None)
         );
 
-        assert_eq!(results.len(), 1);
         assert_eq!(
-            results.first().unwrap(),
-            &Shape::Array(
-                Box::new(Shape::Union(
-                    Box::new(Shape::Number(None)),
-                    Box::new(Shape::String(None))
-                )),
-                None
-            )
+            result,
+            Shape::array(Shape::union(Shape::number_(), Shape::string_()), None)
         );
 
         let results = shape.check(json1, vec![]);
@@ -1777,37 +1822,21 @@ mod tests {
             results,
             Some(ShapeMismatch::new(
                 vec![Access::Array(1)],
-                Shape::Union(Box::new(Shape::Number(None)), Box::new(Shape::String(None))),
-                Shape::Bool(Some(true))
+                Shape::union(Shape::number_(), Shape::string_()),
+                Shape::bool(true)
             ))
         );
     }
 
     #[test]
     fn test_map2() {
-        let json1 = Json::Array(vec![Json::Number(-1.0), Json::Number(2.0)]);
-        let json2 = Json::Array(vec![
-            Json::String("hello".to_string()),
-            Json::String("world".to_string()),
-        ]);
-        let json3 = Json::Array(vec![Json::Number(-1.0), Json::String("world".to_string())]);
-        let json4 = Json::Array(vec![Json::Null, Json::Boolean(true)]);
+        let json1 = json("[-1.0, 2.0]");
+        let json2 = json(r#"["hello", "world"]"#);
+        let json3 = json(r#"[-1.0, "world"]"#);
+        let json4 = json("[null, true]");
 
-        let filter = Filter::Call(
-            "map".to_string(),
-            Some(vec![Filter::Bound(
-                vec![],
-                Box::new(Filter::BinOp(
-                    Box::new(Filter::Dot),
-                    BinOp::Add,
-                    Box::new(Filter::Number(2.0)),
-                )),
-            )]),
-        );
+        let (shape, result) = get_type("map(. + 2)");
 
-        println!("Filter: {filter}");
-        let (shape, results) = Shape::new(&filter, &builtin_filters());
-        println!("Shape: {shape}");
         assert_eq!(
             shape,
             Shape::Array(
@@ -1819,11 +1848,7 @@ mod tests {
             )
         );
 
-        assert_eq!(results.len(), 1);
-        assert_eq!(
-            results.first().unwrap(),
-            &Shape::Array(Box::new(Shape::Number(None)), None)
-        );
+        assert_eq!(result, Shape::Array(Box::new(Shape::Number(None)), None));
 
         let results = shape.check(json1, vec![]);
         assert_eq!(results, None);
@@ -1861,20 +1886,9 @@ mod tests {
 
     #[test]
     fn test_map3() {
-        let json = Json::Array(vec![
-            Json::Array(vec![Json::Number(-1.0), Json::Number(-2.0)]),
-            Json::Array(vec![Json::Number(3.0), Json::Number(4.0)]),
-        ]);
-        let filter = Filter::Call(
-            "map".to_string(),
-            Some(vec![Filter::Call(
-                "map".to_string(),
-                Some(vec![Filter::Call("abs".to_string(), None)]),
-            )]),
-        );
+        let json = json("[[-1.0, -2.0], [3.0, 4.0]]");
+        let (shape, result) = get_type("map(map(abs))");
 
-        let (shape, results) = Shape::new(&filter, &builtin_filters());
-        println!("Shape: {shape}");
         assert_eq!(
             shape,
             Shape::Array(
@@ -1883,10 +1897,8 @@ mod tests {
             )
         );
 
-        assert_eq!(results.len(), 1);
-
         assert_eq!(
-            results.first().unwrap().canonicalize(),
+            result.canonicalize(),
             Shape::Array(
                 Box::new(Shape::Array(Box::new(Shape::Number(None)), None)),
                 None
@@ -1898,8 +1910,9 @@ mod tests {
         assert_eq!(results, None);
     }
 
-    fn get_type(expression: &str) -> (Shape, Shape) {
-        tracing_subscriber::fmt()
+    fn get_type_with_results(expression: &str) -> (Shape, Vec<Shape>) {
+        // Initialize tracing subscriber if not already initialized
+        let _ = tracing_subscriber::fmt()
             .with_target(false)
             .with_thread_ids(false)
             .with_thread_names(false)
@@ -1908,10 +1921,32 @@ mod tests {
             .with_level(true)
             .without_time()
             .with_max_level(tracing::Level::DEBUG)
-            .init();
+            .try_init();
 
         let (_, filter) = parse(expression);
         let (i, o) = Shape::new(&filter, &builtin_filters());
+        (
+            i.canonicalize(),
+            o.into_iter().map(|s| s.canonicalize()).collect(),
+        )
+    }
+
+    fn get_type(expression: &str) -> (Shape, Shape) {
+        // Initialize tracing subscriber if not already initialized
+        let _ = tracing_subscriber::fmt()
+            .with_target(false)
+            .with_thread_ids(false)
+            .with_thread_names(false)
+            .with_file(true)
+            .with_line_number(true)
+            .with_level(true)
+            .without_time()
+            .with_max_level(tracing::Level::DEBUG)
+            .try_init();
+
+        let (_, filter) = parse(expression);
+        let (i, o) = Shape::new(&filter, &builtin_filters());
+        println!("{:?}", (i.clone(), o[0].clone()));
         (i.canonicalize(), o[0].canonicalize())
     }
 
@@ -1919,45 +1954,45 @@ mod tests {
     fn test_solver_dot() {
         let (tin, tout) = get_type(r#"."#);
         // t: T -> T
-        assert_eq!(tin, Shape::TVar(0));
-        assert_eq!(tout, Shape::TVar(0));
+        assert_eq!(tin, Shape::tvar(0));
+        assert_eq!(tout, Shape::tvar(0));
     }
 
     #[test]
     fn test_solver_number() {
         let (tin, tout) = get_type(r#"3"#);
         // t: T -> T
-        assert_eq!(tin, Shape::TVar(1));
-        assert_eq!(tout, Shape::Number(Some(3.0)));
+        assert_eq!(tin, Shape::tvar(1));
+        assert_eq!(tout, Shape::number(3.0));
     }
 
     #[test]
     fn test_solver_boolean() {
         let (tin, tout) = get_type(r#"true"#);
         // t: T -> T
-        assert_eq!(tin, Shape::TVar(1));
-        assert_eq!(tout, Shape::Bool(Some(true)));
+        assert_eq!(tin, Shape::tvar(1));
+        assert_eq!(tout, Shape::bool(true));
     }
 
     #[test]
     fn test_solver_string() {
         let (tin, tout) = get_type(r#""hello""#);
         // t: T -> T
-        assert_eq!(tin, Shape::TVar(1));
-        assert_eq!(tout, Shape::String(Some("hello".to_string())));
+        assert_eq!(tin, Shape::tvar(1));
+        assert_eq!(tout, Shape::string("hello"));
     }
 
     #[test]
     fn test_solver_array() {
         let (tin, tout) = get_type(r#"[1, 2, 3]"#);
         // t: T -> T
-        assert_eq!(tin, Shape::TVar(1));
+        assert_eq!(tin, Shape::tvar(1));
         assert_eq!(
             tout,
-            Shape::Tuple(vec![
-                Shape::Number(Some(1.0)),
-                Shape::Number(Some(2.0)),
-                Shape::Number(Some(3.0))
+            Shape::tuple(vec![
+                Shape::number(1.0),
+                Shape::number(2.0),
+                Shape::number(3.0)
             ])
         );
     }
@@ -1966,12 +2001,12 @@ mod tests {
     fn test_solver_object() {
         let (tin, tout) = get_type(r#"{ "a": 1, "b": 2 }"#);
         // t: T -> T
-        assert_eq!(tin, Shape::TVar(1));
+        assert_eq!(tin, Shape::tvar(1));
         assert_eq!(
             tout,
-            Shape::Object(vec![
-                ("a".to_string(), Shape::Number(Some(1.0))),
-                ("b".to_string(), Shape::Number(Some(2.0)))
+            Shape::object(vec![
+                ("a".to_string(), Shape::number(1.0)),
+                ("b".to_string(), Shape::number(2.0))
             ])
         );
     }
@@ -1981,22 +2016,16 @@ mod tests {
     fn test_solver_not() {
         let (tin, tout) = get_type(r#"not"#);
         // t: T -> T
-        assert_eq!(
-            tin,
-            Shape::Union(Box::new(Shape::Null), Box::new(Shape::Bool(None)))
-        );
-        assert_eq!(
-            tout,
-            Shape::Union(Box::new(Shape::Null), Box::new(Shape::Bool(None)))
-        );
+        assert_eq!(tin, Shape::union(Shape::null(), Shape::bool_()));
+        assert_eq!(tout, Shape::union(Shape::null(), Shape::bool_()));
     }
 
     #[test]
     fn test_solver_negation() {
         let (tin, tout) = get_type(r#"- ."#);
         // t: T -> T
-        assert_eq!(tin, Shape::Number(None));
-        assert_eq!(tout, Shape::Number(None));
+        assert_eq!(tin, Shape::number_());
+        assert_eq!(tout, Shape::number_());
     }
 
     #[test]
@@ -2004,8 +2033,8 @@ mod tests {
     fn test_solver_add_definite() {
         let (tin, tout) = get_type(r#"1 + 1"#);
         // t: T -> T
-        assert_eq!(tin, Shape::TVar(1));
-        assert_eq!(tout, Shape::Number(Some(2.0)));
+        assert_eq!(tin, Shape::tvar(1));
+        assert_eq!(tout, Shape::number(2.0));
     }
 
     #[test]
@@ -2013,11 +2042,8 @@ mod tests {
     fn test_solver_math() {
         let (tin, tout) = get_type(r#". + 1"#);
         // t: T -> T
-        assert_eq!(
-            tin,
-            Shape::Union(Box::new(Shape::Null), Box::new(Shape::Number(None)))
-        );
-        assert_eq!(tout, Shape::Number(None));
+        assert_eq!(tin, Shape::union(Shape::null(), Shape::number_()));
+        assert_eq!(tout, Shape::number_());
     }
 
     #[test]
@@ -2027,11 +2053,19 @@ mod tests {
         // t: { a: { b: T }} -> T
         assert_eq!(
             tin,
-            Shape::Object(vec![(
+            Shape::object(vec![(
                 "a".to_string(),
-                Shape::Object(vec![("b".to_string(), Shape::TVar(2))])
+                Shape::object(vec![("b".to_string(), Shape::tvar(2))])
             )])
         );
-        assert_eq!(tout, Shape::TVar(2));
+        assert_eq!(tout, Shape::tvar(2));
+    }
+
+    #[test]
+    fn test_error_neg() {
+        let (tin, tout) = get_type(r#"if . == true or . == false then 1 else error end"#);
+        tracing::debug!("tin: {tin}, tout: {tout}");
+        assert_eq!(tin, Shape::bool_());
+        assert_eq!(tout, Shape::number(1.0));
     }
 }
