@@ -458,6 +458,7 @@ pub(crate) fn parse_filter(
             //     let text = &code[child.range().start_byte..child.range().end_byte];
             //     println!("Child {}: {} = '{}'", i, child.kind(), text);
             // }            let source_node = bind.child(0).unwrap();
+            // todo@can: .[0] | reduce .[] as $item (0; if($item > 5 ) then . + 1 else . end)
             let bind = root.child(1).unwrap();
 
             if bind.range().start_byte == bind.range().end_byte {
