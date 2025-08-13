@@ -157,6 +157,7 @@ module.exports = grammar({
     ),
 
     expression: $ => choice(
+      $.hole, // todo@can
       $.sequence_expression,
       $._expression,
     ),

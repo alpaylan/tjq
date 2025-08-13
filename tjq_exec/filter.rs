@@ -34,7 +34,8 @@ pub enum Filter {
     BindingExpression(Box<Filter>, Box<Filter>),              //
     Variable(String),                                         // $var
     ReduceExpression(HashMap<String, Filter>, Box<Filter>, Box<Filter>),
-    // SliceExpression(i32,i32),                                        // [<n1> : <n2>]
+    // ReduceExpression(String, Box<Filter>, Box<Filter>, Box<Filter>), // reduce <f> as $<s> (<init>, <update>) // todo@can: change the type definition to this
+    // SliceExpression(i32,i32),                                        // .[<n1> : <n2>]
     Hole, // Placeholder for a missing value in the AST
 }
 
@@ -226,6 +227,8 @@ impl Filter {
         global_definitions: &HashMap<String, Filter>,
         variable_ctx: &mut HashMap<String, Filter>,
     ) -> Vec<Result<Json, JQError>> {
+        tracing::debug!("Filtering with: {}", filter);
+        tracing::trace!("JSON: {}", json);
         match filter {
             Filter::Dot => vec![Ok(json.clone())],
             Filter::Pipe(f1, f2) => Filter::filter(json, f1, global_definitions, variable_ctx)
@@ -428,6 +431,7 @@ impl Filter {
             Filter::Error => vec![Err(JQError::Unknown)],
             Filter::Call(name, filters_) => match filters_ {
                 Some(args) => {
+                    tracing::debug!("Calling filter: {name} with args: {:?}", args);
                     // Find the filter with the given name
                     let filter = global_definitions
                         .get(name)
@@ -437,12 +441,14 @@ impl Filter {
                         if params.len() != args.len() {
                             return vec![Err(JQError::FilterNotDefined(name.clone(), args.len()))];
                         }
-                        // Bind the arguments to the parameters
-                        let mut filters = global_definitions.clone();
+                        let mut filter = *filter.clone();
                         for (param, arg) in params.iter().zip(args.iter()) {
-                            filters.insert(param.clone(), arg.clone());
+                            tracing::trace!("Substituting {} with {}", param, arg);
+                            filter = filter.substitute(param, arg);
+                            tracing::trace!("Substituted filter: {}", filter);
                         }
-                        Filter::filter(json, filter, &filters, variable_ctx)
+
+                        Filter::filter(json, &filter, &global_definitions, variable_ctx)
                     } else {
                         vec![Err(JQError::FilterNotDefined(name.clone(), args.len()))]
                     }
@@ -667,6 +673,7 @@ mod tests {
 
     fn builtin_filters() -> HashMap<String, Filter> {
         // read defs.jq
+        tracing::debug!("Parsing built-in filters");
         parse_defs(include_str!("../tjq/defs.jq"))
     }
 
@@ -693,6 +700,7 @@ mod tests {
 
     fn filter(s: &str) -> Filter {
         let (_, filter) = parse(s);
+        tracing::debug!("Parsed filter: {}", filter);
         filter
     }
 
@@ -828,6 +836,16 @@ mod tests {
 
     #[test]
     fn test_map3() {
+        let _ = tracing_subscriber::fmt()
+            .with_target(false)
+            .with_thread_ids(false)
+            .with_thread_names(false)
+            .with_file(true)
+            .with_line_number(true)
+            .with_level(true)
+            .without_time()
+            .with_env_filter(EnvFilter::from_default_env())
+            .try_init();
         let input = json("[[-1.0, -2.0], [3.0, 4.0]]");
         let f = filter("map(map(abs))");
 
@@ -857,5 +875,20 @@ mod tests {
             "Expected 3.0, got: {:?}",
             results
         );
+    }
+
+    #[test]
+    fn test_fibonacci() {
+        let input = json("null");
+        let f = filter(
+            r#"
+        (def fib(n):
+            if n <= 1 then n else fib(n - 1) + fib(n - 2) end;
+        fib(5))
+        "#,
+        );
+
+        let results = run(&f, input);
+        assert_eq!(results, vec![json("5.0")]);
     }
 }

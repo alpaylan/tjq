@@ -60,7 +60,12 @@ pub fn parse_defs(code: &str) -> HashMap<String, Filter> {
             "function_definition" => {
                 let _ = parse_filter(code, child, &mut defs);
             }
-            "comment" => {}
+            "comment" => {
+                tracing::trace!(
+                    "Skipping comment: {}",
+                    &code[child.range().start_byte..child.range().end_byte]
+                );
+            }
             _ => {
                 panic!("unexpected node in program: {}", child.kind());
             }
@@ -304,8 +309,23 @@ pub(crate) fn parse_filter(
                 })
                 .collect();
 
+            tracing::trace!(
+                "Parsed if expression: cond: {}, then: {}, elifs: {:?}",
+                cond,
+                then,
+                elifs
+            );
+            tracing::trace!(
+                "root.child_count(): {}, root.range(): {:?}",
+                root.child_count(),
+                root.range()
+            );
+            // todo @can: make sure we can handle the case where there are elifs but no else
             let else_ = if root.child_count() == 5 {
-                let end = &code[root.range().start_byte + 1..root.range().end_byte];
+                tracing::trace!("if expression has no else, returning dot or hole");
+                let end = &code[root.child(4).unwrap().range().start_byte
+                    ..root.child(4).unwrap().range().end_byte];
+                tracing::trace!("end: {}", end);
                 if end == "end" {
                     Filter::Dot
                 } else {
@@ -463,14 +483,17 @@ pub(crate) fn parse_filter(
         "field_expression" => Filter::Dot,
         "hole" => Filter::Hole,
         "slice_expression" => todo!(),
-
         _ => {
             tracing::warn!(
                 "unknown filter {} {}",
                 root.kind(),
                 code[root.range().start_byte..root.range().end_byte].to_string()
             );
-            Filter::Dot
+            panic!(
+                "unknown filter {} {}",
+                root.kind(),
+                code[root.range().start_byte..root.range().end_byte].to_string()
+            );
         }
     }
 }
@@ -479,6 +502,8 @@ pub(crate) fn parse_filter(
 mod tests {
 
     use std::process::CommandEnvs;
+
+    use tracing_subscriber::EnvFilter;
 
     use super::*;
 
@@ -737,16 +762,24 @@ mod tests {
 
     #[test]
     fn test_incomplete_pipe() {
+        let _ = tracing_subscriber::fmt()
+            .with_target(false)
+            .with_thread_ids(false)
+            .with_thread_names(false)
+            .with_file(true)
+            .with_line_number(true)
+            .with_level(true)
+            .without_time()
+            .with_env_filter(EnvFilter::from_default_env())
+            .try_init();
         let code = r#"1 | "#;
+        let inferred = r#"1 | ??"#;
 
-        let (defs, filter) = parse(code);
-
-        assert!(defs.is_empty());
-        assert_eq!(
-            filter,
-            Filter::Pipe(Box::new(Filter::Number(1.0)), Box::new(Filter::Hole))
-        );
+        let (_, filter) = parse(code);
+        let (_, expected) = parse(inferred);
+        assert_eq!(filter, expected);
     }
+
     #[test]
     fn test_incomplete_pipe2() {
         let code = r#" | 1 "#;
@@ -770,6 +803,23 @@ mod tests {
         assert_eq!(
             filter,
             Filter::Comma(Box::new(Filter::Number(1.0)), Box::new(Filter::Hole))
+        );
+    }
+
+    #[test]
+    fn test_abs() {
+        let (_, filter) = parse("if . < 0 then - . end");
+        assert_eq!(
+            filter,
+            Filter::IfThenElse(
+                Box::new(Filter::BinOp(
+                    Box::new(Filter::Dot),
+                    BinOp::Lt,
+                    Box::new(Filter::Number(0.0))
+                )),
+                Box::new(Filter::UnOp(UnOp::Neg, Box::new(Filter::Dot))),
+                Box::new(Filter::Dot)
+            )
         );
     }
 
@@ -1125,15 +1175,13 @@ mod tests {
 
     #[test]
     fn test_incomplete_reduce3() {
-        let code = r#"
-            reduce .[] as $item (  )
-            
-                    "#;
+        let code = r#"reduce .[] as $item (  )"#;
+        let expected = r#"reduce .[] as $item (??; ??)"#;
 
-        let (defs, filter) = parse(code);
+        let (_, filter) = parse(code);
+        let (_, expected) = parse(expected);
         //TODO check this (incomplete?)
-        assert!(defs.is_empty());
-        assert_eq!(filter, Filter::Dot);
+        assert_eq!(filter, expected);
     }
 
     #[test]
