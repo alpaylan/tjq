@@ -34,6 +34,7 @@ pub enum Filter {
     BindingExpression(Box<Filter>, Box<Filter>),              //
     Variable(String),                                         // $var
     ReduceExpression(HashMap<String, Filter>, Box<Filter>, Box<Filter>),
+    // SliceExpression(i32,i32),                                        // [<n1> : <n2>]
     Hole, // Placeholder for a missing value in the AST
 }
 
@@ -137,6 +138,7 @@ impl Display for Filter {
                 write!(f, "{}", expr)
             }
             Filter::Hole => write!(f, "(_)"),
+            // Filter::SliceExpression(i32:, )
         }
     }
 }
@@ -484,7 +486,10 @@ impl Filter {
                 Filter::filter(json, filter, global_definitions, variable_ctx)
             }
             Filter::FunctionExpression(local_defs, expr) => {
-                tracing::debug!("Function expression with local definitions: {:?}", local_defs);
+                tracing::debug!(
+                    "Function expression with local definitions: {:?}",
+                    local_defs
+                );
                 let mut scoped_filters = global_definitions.clone();
                 for (name, local_filter) in local_defs {
                     scoped_filters.insert(name.clone(), local_filter.clone());
@@ -630,7 +635,13 @@ impl Filter {
                 Box::new(filter1.substitute(var, arg)),
                 Box::new(filter2.substitute(var, arg)),
             ),
-            Filter::Bound(items, filter) => todo!(),
+            Filter::Bound(items, filter) => {
+                if items.contains(&var.to_string()) {
+                    self.clone()
+                } else {
+                    Filter::Bound(items.clone(), Box::new(filter.substitute(var, arg)))
+                }
+            }
             Filter::BindingExpression(_, _) => todo!(),
             Filter::Variable(_) => todo!(),
             Filter::ReduceExpression(_, _, _) => todo!(),

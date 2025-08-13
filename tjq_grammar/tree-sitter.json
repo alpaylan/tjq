@@ -1,0 +1,39 @@
+{
+  "$schema": "https://tree-sitter.github.io/tree-sitter/assets/schemas/config.schema.json",
+  "grammars": [
+    {
+      "name": "tjq",
+      "camelcase": "Tjq",
+      "title": "Jq",
+      "scope": "source.jq",
+      "file-types": [
+        "tjq"
+      ],
+      "injection-regex": "^jq$",
+      "class-name": "TreeSitterJq"
+    }
+  ],
+  "metadata": {
+    "version": "1.0.2",
+    "license": "GPL-3.0-or-later",
+    "description": "Jq grammar for tree-sitter",
+    "authors": [
+      {
+        "name": "Noah Peart",
+        "email": "noah.v.peart@gmail.com"
+      }
+    ],
+    "links": {
+      "repository": "https://github.com/nverno/tree-sitter-jq"
+    }
+  },
+  "bindings": {
+    "c": true,
+    "go": false,
+    "node": false,
+    "python": false,
+    "rust": true,
+    "swift": false,
+    "zig": false
+  }
+}

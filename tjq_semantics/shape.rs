@@ -1198,9 +1198,8 @@ impl Shape {
                                 // Refine TVar's to respect the equality check
                                 (Shape::TVar(t), s) | (s, Shape::TVar(t)) => {
                                     // return a condition
-                                    Shape::union(
-                                        Shape::cond()
-                                        , s2)
+                                    // Shape::union(Shape::cond(), s2)
+                                    todo!()
                                 }
                                 _ => todo!(),
                             }
@@ -1264,7 +1263,27 @@ impl Shape {
                 // todo: understand this better
                 Shape::build_shape(filter, shapes, ctx, filters)
             }
-            Filter::FunctionExpression(_, _) => todo!(),
+            Filter::FunctionExpression(_, expr) => {
+                let shapes = Shape::build_shape(expr, shapes, ctx, filters);
+                shapes
+                    .into_iter()
+                    .map(|s| match s {
+                        Shape::Blob => {
+                            let new_type_var = ctx.fresh();
+                            ctx.insert(new_type_var, Shape::TVar(new_type_var));
+                            Shape::TVar(new_type_var)
+                        }
+                        Shape::TVar(t) => {
+                            let current_shape = ctx.get(&t).unwrap().clone();
+                            let current_shape =
+                                Shape::merge_shapes(current_shape, Shape::Blob, ctx);
+                            ctx.insert(t, current_shape);
+                            Shape::TVar(t)
+                        }
+                        _ => s,
+                    })
+                    .collect()
+            }
             Filter::BindingExpression(_, _) => todo!(),
             Filter::Variable(_) => todo!(),
             Filter::ReduceExpression(_, _, _) => todo!(),
