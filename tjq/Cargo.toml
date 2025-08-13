@@ -10,7 +10,6 @@ path = "main.rs"
 
 
 [dependencies]
-tjq_parser = { path = "../tjq_parser" }
 tjq_exec = { path = "../tjq_exec" }
 tjq_semantics = { path = "../tjq_semantics" }
 

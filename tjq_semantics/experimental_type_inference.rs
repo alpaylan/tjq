@@ -960,10 +960,11 @@ pub fn compute_shape(
 
 #[cfg(test)]
 mod constraint_tests {
+    use tjq_exec::parse;
+
     use super::Context;
     use crate::experimental_type_inference::{compute_shape, solve};
     use std::collections::HashMap;
-    use tjq_parser::parse;
 
     #[test]
     fn test_subtyping() {
@@ -1055,8 +1056,8 @@ mod constraint_tests {
 #[cfg(test)]
 mod solver_tests {
     use std::collections::HashMap;
+    use tjq_exec::parse;
     use tjq_exec::{BinOp, Filter, UnOp};
-    use tjq_parser::parse;
 
     use super::{solve, Constraint, Context};
     use crate::{

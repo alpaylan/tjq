@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use clap::Parser;
 use clap_derive::Parser;
 use serde_json::Value;
+use tjq_exec::{parse, parse_defs};
 use tjq_exec::{Filter, Json};
-use tjq_parser::{parse, parse_defs};
 use tjq_semantics::Shape;
 
 #[derive(Parser)]
@@ -23,7 +23,7 @@ struct CLI {
 
 pub fn builtin_filters() -> HashMap<String, Filter> {
     // read defs.jq
-    
+
     parse_defs(include_str!("defs.jq"))
 }
 

@@ -4,7 +4,6 @@ resolver = "3"
 members = [
     "tjq_semantics",
     "tjq_exec",
-    "tjq_parser",
     "tjq",
     "tjq_lsp",
     "tjq_grammar"
