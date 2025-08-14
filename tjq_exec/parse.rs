@@ -783,7 +783,7 @@ mod tests {
 
     #[test]
     fn test_incomplete_pipe2() {
-        let code = r#" | 1 "#;
+        let code = r#" ?? | 1 "#;
 
         let (defs, filter) = parse(code);
 
@@ -1022,7 +1022,7 @@ mod tests {
         let code = r#"
             if true then
                 1
-            else  end
+            else  ?? end
             
         "#;
 
@@ -1118,7 +1118,7 @@ mod tests {
 
     #[test]
     fn test_hole_token() {
-        let code = r#" . |  "#;
+        let code = r#" . | ?? "#;
 
         let (defs, filter) = parse(code);
         assert!(defs.is_empty());
@@ -1512,4 +1512,5 @@ mod tests {
         assert!(defs.is_empty());
         assert_eq!(filter, Filter::ObjIndex("foo".to_string()),);
     }
+
 }

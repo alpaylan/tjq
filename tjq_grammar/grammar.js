@@ -263,12 +263,12 @@ module.exports = grammar({
 
     if_expression: $ => seq(
       'if',
-      field('condition', choice($.expression, $.hole)),
-      choice('then', $.hole),  // 'then' or hole if missing
-      field('body', choice($.expression, $.hole)),
+      field('condition', choice($.expression)),
+      choice('then'), 
+      field('body', choice($.expression)),
       repeat($.elif_expression),
       optional($.else_expression),
-      choice('end', $.hole)    // 'end' or hole if missing
+      choice('end')   
     ),
     
     elif_expression: $ => seq(

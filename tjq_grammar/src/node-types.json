@@ -56,6 +56,10 @@
         "named": true
       },
       {
+        "type": "hole",
+        "named": true
+      },
+      {
         "type": "identifier",
         "named": true
       },
@@ -886,10 +890,6 @@
           {
             "type": "expression",
             "named": true
-          },
-          {
-            "type": "hole",
-            "named": true
           }
         ]
       },
@@ -899,10 +899,6 @@
         "types": [
           {
             "type": "expression",
-            "named": true
-          },
-          {
-            "type": "hole",
             "named": true
           }
         ]
@@ -918,10 +914,6 @@
         },
         {
           "type": "else_expression",
-          "named": true
-        },
-        {
-          "type": "hole",
           "named": true
         }
       ]

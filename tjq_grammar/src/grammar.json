@@ -379,6 +379,10 @@
       "members": [
         {
           "type": "SYMBOL",
+          "name": "hole"
+        },
+        {
+          "type": "SYMBOL",
           "name": "sequence_expression"
         },
         {
@@ -915,10 +919,6 @@
               {
                 "type": "SYMBOL",
                 "name": "expression"
-              },
-              {
-                "type": "SYMBOL",
-                "name": "hole"
               }
             ]
           }
@@ -929,10 +929,6 @@
             {
               "type": "STRING",
               "value": "then"
-            },
-            {
-              "type": "SYMBOL",
-              "name": "hole"
             }
           ]
         },
@@ -945,10 +941,6 @@
               {
                 "type": "SYMBOL",
                 "name": "expression"
-              },
-              {
-                "type": "SYMBOL",
-                "name": "hole"
               }
             ]
           }
@@ -978,10 +970,6 @@
             {
               "type": "STRING",
               "value": "end"
-            },
-            {
-              "type": "SYMBOL",
-              "name": "hole"
             }
           ]
         }
