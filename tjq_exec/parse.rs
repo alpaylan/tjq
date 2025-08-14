@@ -309,36 +309,21 @@ pub(crate) fn parse_filter(
                 })
                 .collect();
 
-            tracing::trace!(
-                "Parsed if expression: cond: {}, then: {}, elifs: {:?}",
-                cond,
-                then,
-                elifs
-            );
-            tracing::trace!(
-                "root.child_count(): {}, root.range(): {:?}",
-                root.child_count(),
-                root.range()
-            );
-            // todo @can: make sure we can handle the case where there are elifs but no else
-            let else_ = if root.child_count() == 5 {
-                tracing::trace!("if expression has no else, returning dot or hole");
-                let end = &code[root.child(4).unwrap().range().start_byte
-                    ..root.child(4).unwrap().range().end_byte];
-                tracing::trace!("end: {}", end);
-                if end == "end" {
+
+                let tail = root.child(root.child_count() - 2).expect("if expression should end with 'end' or 'else <expr> end'");
+                let tail_str =  &code[tail.range().start_byte..tail.range().end_byte];
+
+                let else_ = if tail_str == "end" {
                     Filter::Dot
-                } else {
+                } 
+                else if tail_str != "elseX" {
+
                     Filter::Hole
-                }
-            } else {
-                parse_filter(
-                    code,
-                    root.child(root.child_count() - 2)
-                        .expect("if expression should have an else"),
-                    defs,
-                )
-            };
+                }else {
+                    // if … then … else <expr> end
+                    println!("{}", tail_str);
+                    parse_filter(code, tail, defs)
+                };
 
             Filter::IfThenElse(
                 Box::new(cond),
@@ -490,11 +475,12 @@ pub(crate) fn parse_filter(
                 root.kind(),
                 code[root.range().start_byte..root.range().end_byte].to_string()
             );
-            panic!(
-                "unknown filter {} {}",
-                root.kind(),
-                code[root.range().start_byte..root.range().end_byte].to_string()
-            );
+            // panic!(
+            //     "unknown filter {} {}",
+            //     root.kind(),
+            //     code[root.range().start_byte..root.range().end_byte].to_string()
+            // );
+            todo!("handle erroneous parse tree!")
         }
     }
 }
@@ -1444,20 +1430,12 @@ mod tests {
     #[test]
     fn test_incomplete_sequence() {
         let code = r#"1, 2,"#;
-
-        let (defs, filter) = parse(code);
-        //TODO : check
-        assert!(defs.is_empty());
-        assert_eq!(
-            filter,
-            Filter::Comma(
-                Box::new(Filter::Comma(
-                    Box::new(Filter::Number(1.0)),
-                    Box::new(Filter::Number(2.0))
-                )),
-                Box::new(Filter::Hole)
-            )
-        );
+        let expected = r#"1, 2, ??"#;
+        let (_, filter) = parse(code);
+        let (_, expected) = parse(expected);
+        //TODO check this (incomplete?)
+        assert_eq!(filter, expected);
+    
     }
 
     #[test]
@@ -1512,5 +1490,48 @@ mod tests {
         assert!(defs.is_empty());
         assert_eq!(filter, Filter::ObjIndex("foo".to_string()),);
     }
+
+    #[test]
+    fn test_if_expression2(){
+        let code = r#"
+            if true then
+                1
+            elif 3>2 then
+                2
+            
+            end
+        "#;
+
+        let (defs, filter) = parse(code);
+
+        assert!(defs.is_empty());
+    }
+
+    #[test]
+    fn test_if_expression3(){
+        let code = r#"
+            if true then
+                1
+
+            end
+        "#;
+
+        let (defs, filter) = parse(code);
+
+        assert!(defs.is_empty());
+    }
+
+    #[test]
+    fn test_if_expression4(){
+        let code = r#"
+            if true then
+                1
+        "#;
+
+        let (defs, filter) = parse(code);
+
+        assert!(defs.is_empty());
+    }
+
 
 }

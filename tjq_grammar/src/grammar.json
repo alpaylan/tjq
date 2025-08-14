@@ -924,13 +924,8 @@
           }
         },
         {
-          "type": "CHOICE",
-          "members": [
-            {
-              "type": "STRING",
-              "value": "then"
-            }
-          ]
+          "type": "STRING",
+          "value": "then"
         },
         {
           "type": "FIELD",
@@ -965,13 +960,8 @@
           ]
         },
         {
-          "type": "CHOICE",
-          "members": [
-            {
-              "type": "STRING",
-              "value": "end"
-            }
-          ]
+          "type": "STRING",
+          "value": "end"
         }
       ]
     },

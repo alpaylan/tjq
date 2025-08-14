@@ -157,7 +157,7 @@ module.exports = grammar({
     ),
 
     expression: $ => choice(
-      $.hole, // todo@can
+      $.hole,
       $.sequence_expression,
       $._expression,
     ),
@@ -264,12 +264,13 @@ module.exports = grammar({
     if_expression: $ => seq(
       'if',
       field('condition', choice($.expression)),
-      choice('then'), 
+      'then', 
       field('body', choice($.expression)),
       repeat($.elif_expression),
       optional($.else_expression),
-      choice('end')   
+      'end' 
     ),
+    
     
     elif_expression: $ => seq(
       'elif',
