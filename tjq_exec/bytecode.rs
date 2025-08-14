@@ -297,7 +297,7 @@ impl Compiler {
             Filter::FunctionExpression(hash_map, filter) => todo!(),
             Filter::BindingExpression(filter, filter1) => todo!(),
             Filter::Variable(_) => todo!(),
-            Filter::ReduceExpression(hash_map, filter, filter1) => todo!(),
+            Filter::ReduceExpression(var, generator,init,update, ) => todo!(),
 Filter::Hole => todo!(),
         }
     }

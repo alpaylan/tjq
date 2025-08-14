@@ -1286,7 +1286,7 @@ impl Shape {
             }
             Filter::BindingExpression(_, _) => todo!(),
             Filter::Variable(_) => todo!(),
-            Filter::ReduceExpression(_, _, _) => todo!(),
+            Filter::ReduceExpression(_, _, _,_) => todo!(),
             Filter::Hole => todo!(),
         }
     }

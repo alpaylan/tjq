@@ -437,33 +437,34 @@ pub(crate) fn parse_filter(
             Filter::ObjIndex(identifier.to_string())
         }
         "reduce_expression" => {
-            // println!("Child count: {}", root.child_count());
-            // for i in 0..root.child_count() {
-            //     let child = root.child(i).unwrap();
-            //     let text = &code[child.range().start_byte..child.range().end_byte];
-            //     println!("Child {}: {} = '{}'", i, child.kind(), text);
-            // }            let source_node = bind.child(0).unwrap();
-            // todo@can: .[0] | reduce .[] as $item (0; if($item > 5 ) then . + 1 else . end)
-            let bind = root.child(1).unwrap();
+            
+            let bind = root.child(1)
+                .expect("reduce: expected binding_expression ");
 
-            if bind.range().start_byte == bind.range().end_byte {
-                //if empty
-                todo!();
+            if bind.is_missing() || bind.range().start_byte == bind.range().end_byte {
+                panic!("reduce: missing binding_expression ");
             }
-            let source_node = bind.child(0).unwrap();
 
-            let var_node = bind.child(2).unwrap();
-            let source = parse_filter(code, source_node, defs);
+            let source_node = bind.child(0)
+                .expect("reduce: binding_expression missing source expression");
+            let var_node = bind.child(2)
+                .expect("reduce: binding_expression missing $variable");
 
-            let var_name = &code[var_node.range().start_byte + 1..var_node.range().end_byte];
-            let mut var_def = HashMap::new();
-            var_def.insert(var_name.to_string(), source.clone());
+            let generator = parse_filter(code, source_node, defs);
 
-            let init = parse_filter(code, root.child(3).unwrap(), defs);
-            let update = parse_filter(code, root.child(5).unwrap(), defs);
+            let vtxt = &code[var_node.range().start_byte..var_node.range().end_byte];
+            let var_name = vtxt.strip_prefix('$')
+                .unwrap_or_else(|| panic!("reduce: expected variable"))
+                .to_string();
 
-            Filter::ReduceExpression(var_def, Box::new(init), Box::new(update))
-        }
+            let init_node = root.child(3).expect("reduce: missing initializer expression");
+            let upd_node  = root.child(5).expect("reduce: missing update expression");
+
+            let init   = parse_filter(code, init_node, defs);
+            let update = parse_filter(code, upd_node, defs);
+
+            Filter::ReduceExpression(var_name, Box::new(generator), Box::new(init), Box::new(update))
+        },
         "assignment_expression" => Filter::Dot,
         "foreach_expression" => Filter::Dot,
         "field_expression" => Filter::Dot,
@@ -1113,7 +1114,29 @@ mod tests {
             Filter::Pipe(Box::new(Filter::Dot), Box::new(Filter::Hole))
         );
     }
+    #[test]
+    fn test_reduce_expression() {
+        let code = r#"
+            reduce .[] as $item ( 0; . + 1 )
+        "#;
 
+        let (defs, filter) = parse(code);
+
+        assert!(defs.is_empty());
+        assert_eq!(
+            filter,
+            Filter::ReduceExpression(
+                "item".to_string(),
+                Box::new(Filter::ArrayIterator),
+                Box::new(Filter::Number(0.0)),
+                Box::new(Filter::BinOp(
+                    Box::new(Filter::Dot),
+                    BinOp::Add,
+                    Box::new(Filter::Number(1.0))
+                ))
+            )
+        );
+    }
     #[test]
 
     fn test_incomplete_unop() {}
@@ -1130,8 +1153,9 @@ mod tests {
         assert_eq!(
             filter,
             Filter::ReduceExpression(
-                HashMap::from([("item".to_string(), Filter::ArrayIterator)]),
+                "item".to_string(),
                 Box::new(Filter::Number(0.0)),
+                Box::new(Filter::Hole),
                 Box::new(Filter::Hole)
             )
         );
@@ -1149,13 +1173,15 @@ mod tests {
         assert_eq!(
             filter,
             Filter::ReduceExpression(
-                HashMap::new(),
+                "".to_string(),
                 Box::new(Filter::Hole),
+                Box::new(Filter::Hole),
+
                 Box::new(Filter::BinOp(
                     Box::new(Filter::Dot),
                     BinOp::Add,
                     Box::new(Filter::Number(1.0))
-                ))
+                )),
             )
         );
     }

@@ -4,7 +4,7 @@
 ./target/debug/tjq --expression="def double: . * 2; def triple: . * 3; double | triple" --input='5'
 ./target/debug/tjq --expression="[while(.<100; .*2)]" --input='1'
 ./target/debug/tjq --expression=".[2] --input='[1,2,3]'
-
+./target/debug/tjq --expression='reduce .[] as $item (0; . + $item)' --input='[1,2,3]'
 
 jq 'def asd:  .[] ;  . | asd ' <<< "[4]" 
 jq 'def asd:  .[] ;  . | asd) ' <<< "[4]"

@@ -953,7 +953,7 @@ pub fn compute_shape(
         Filter::FunctionExpression(_, _) => todo!(),
         Filter::BindingExpression(filter, filter1) => todo!(),
         Filter::Variable(_) => todo!(),
-        Filter::ReduceExpression(hash_map, filter, filter1) => todo!(),
+        Filter::ReduceExpression(var_name,init , generator, update) => todo!(),
         Filter::Hole => todo!(),
     }
 }

@@ -33,8 +33,7 @@ pub enum Filter {
     FunctionExpression(HashMap<String, Filter>, Box<Filter>), // local_defs, <f>
     BindingExpression(Box<Filter>, Box<Filter>),              //
     Variable(String),                                         // $var
-    ReduceExpression(HashMap<String, Filter>, Box<Filter>, Box<Filter>),
-    // ReduceExpression(String, Box<Filter>, Box<Filter>, Box<Filter>), // reduce <f> as $<s> (<init>, <update>) // todo@can: change the type definition to this
+    ReduceExpression(String, Box<Filter>, Box<Filter>, Box<Filter>), // reduce <f> as $<s> (<init>, <update>) 
     // SliceExpression(i32,i32),                                        // .[<n1> : <n2>]
     Hole, // Placeholder for a missing value in the AST
 }
@@ -132,11 +131,8 @@ impl Display for Filter {
                 write!(f, "{} as {}", filter, pattern)
             }
             Filter::Variable(s) => write!(f, "${s}"),
-            Filter::ReduceExpression(var_def, expr, num) => {
-                for (name, local_filter) in var_def {
-                    write!(f, "variable")?;
-                }
-                write!(f, "{}", expr)
+            Filter::ReduceExpression(var, gen, init, upd) => {
+                write!(f, "reduce {} as ${} ({}; {})", gen, var, init, upd)
             }
             Filter::Hole => write!(f, "(_)"),
             // Filter::SliceExpression(i32:, )
@@ -525,45 +521,61 @@ impl Filter {
                     vec![Err(JQError::FilterNotDefined(name.clone(), 0))]
                 }
             }
-            Filter::ReduceExpression(var_def, init, update) => {
-                let init_results = Filter::filter(json, init, global_definitions, variable_ctx);
-                let acc = match &init_results[0] {
-                    Ok(Json::Number(n)) => *n,
-                    _ => panic!(
-                        "reduce init must produce a number(other types are not implemented yet)"
-                    ),
-                };
-                let mut acc = acc;
-
-                for (var_name, src_filter) in var_def {
-                    let elems = Filter::filter(json, src_filter, global_definitions, variable_ctx);
-                    for e in elems {
-                        let elem_json = e.clone().unwrap();
-
-                        let lit = match elem_json {
-                            Json::Number(n) => Filter::Number(n),
-                            Json::Boolean(b) => Filter::Boolean(b),
-                            Json::String(s) => Filter::String(s),
-                            Json::Null => Filter::Null,
-                            _ => panic!("reduce only supports primitives for now"),
-                        };
-                        variable_ctx.insert(var_name.clone(), lit);
-
-                        let upd_results = Filter::filter(
-                            &Json::Number(acc),
-                            update,
-                            global_definitions,
-                            variable_ctx,
-                        );
-                        acc = match &upd_results[0] {
-                            Ok(Json::Number(n)) => *n,
-                            _ => panic!("reduce update must produce a number"),
-                        };
+            Filter::ReduceExpression(var, gen, init, update) => {
+                    let mut gen_items = Vec::new();
+                    for r in Filter::filter(json, gen, global_definitions, variable_ctx) {
+                        match r {
+                            Ok(j) => gen_items.push(j),
+                            Err(e) => return vec![Err(e)], 
+                        }
                     }
-                }
 
-                vec![Ok(Json::Number(acc))]
-            }
+                    let init_results = Filter::filter(json, init, global_definitions, variable_ctx);
+                    let acc0 = match init_results.into_iter().find(|r| r.is_ok()) {
+                        Some(Ok(v)) => v,
+                        Some(Err(e)) => return vec![Err(e)],
+                        None => return vec![Err(JQError::Unknown)], 
+                    };
+
+                    let old_binding = variable_ctx.get(var).cloned();
+
+                    let mut acc = acc0;
+                    for item in gen_items {
+                        // bind $var to the generated item
+                        variable_ctx.insert(var.clone(), Filter::from_json_const(&item));
+
+                        let upd_results = Filter::filter(&acc, update, global_definitions, variable_ctx);
+                        match upd_results.into_iter().find(|r| r.is_ok()) {
+                            Some(Ok(next)) => acc = next,
+                            Some(Err(e)) => {
+                                // restore binding
+                                if let Some(prev) = old_binding {
+                                    variable_ctx.insert(var.clone(), prev);
+                                } else {
+                                    variable_ctx.remove(var);
+                                }
+                                return vec![Err(e)];
+                            }
+                            None => {
+                                if let Some(prev) = old_binding {
+                                    variable_ctx.insert(var.clone(), prev);
+                                } else {
+                                    variable_ctx.remove(var);
+                                }
+                                return vec![Err(JQError::Unknown)];
+                            }
+                        }
+                    }
+
+                    if let Some(prev) = old_binding {
+                        variable_ctx.insert(var.clone(), prev);
+                    } else {
+                        variable_ctx.remove(var);
+                    }
+
+                    vec![Ok(acc)]
+                },
+
             Filter::Hole => vec![Err(JQError::IncompleteProgram)],
         }
     }
@@ -650,8 +662,28 @@ impl Filter {
             }
             Filter::BindingExpression(_, _) => todo!(),
             Filter::Variable(_) => todo!(),
-            Filter::ReduceExpression(_, _, _) => todo!(),
+            Filter::ReduceExpression(var, gen, init, upd) => Filter::ReduceExpression(
+                    var.clone(),
+                    Box::new(gen.substitute(var, arg)),
+                    Box::new(init.substitute(var, arg)),
+                    Box::new(upd.substitute(var, arg)),
+                ),
+            
             Filter::Hole => todo!(),
+        }
+    }
+    fn from_json_const(j: &Json) -> Filter {
+        match j {
+            Json::Null        => Filter::Null,
+            Json::Boolean(b)  => Filter::Boolean(*b),
+            Json::Number(n)   => Filter::Number(*n),
+            Json::String(s)   => Filter::String(s.clone()),
+            Json::Array(a)    => Filter::Array(a.iter().map(Self::from_json_const).collect()),
+            Json::Object(o)   => Filter::Object(
+                o.iter()
+                 .map(|(k,v)| (Filter::String(k.clone()), Self::from_json_const(v)))
+                 .collect()
+            ),
         }
     }
 }
