@@ -5,13 +5,14 @@ use crate::json::Json;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum JQError {
-    ObjIndexForNonObject(Json, Json),
-    ArrIndexForNonArray(Json, Json),
+    ObjIndexForNonObject(Json),
+    ArrIndexForNonArray(Json),
     ArrIteratorForNonIterable(Json),
     NonStringObjectKey(Json),
     BinOpTypeError(Json, BinOp, Json),
     UnOpTypeError(Json, UnOp),
     FilterNotDefined(String, usize),
+    InvalidArrayIndex(Json, Json),
     IncompleteProgram,
     Unknown,
 }
@@ -68,6 +69,9 @@ impl Display for JQError {
             }
             JQError::IncompleteProgram => {
                 write!(f, "Incomplete program")
+            }
+            JQError::InvalidArrayIndex(json, index) => {
+                write!(f, "Invalid array index {} for {}", index, json.debug())
             }
         }
     }

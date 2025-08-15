@@ -1,11 +1,212 @@
+use std::fmt::{Display, Formatter};
 use std::{collections::HashMap, vec};
 
-use tree_sitter::Node;
+use tree_sitter::{Node, Range};
 
 use crate::printer::print_ast;
 use crate::{BinOp, Filter, UnOp};
 
-pub fn parse(code: &str) -> (HashMap<String, Filter>, Filter) {
+pub(crate) struct Cst<'a> {
+    pub range: Range,
+    pub value: &'a str,
+    pub kind: FilterKind,
+    pub children: Vec<Cst<'a>>,
+}
+
+pub(crate) enum FilterKind {
+    Dot,
+    Pipe,
+    Comma,
+    ObjIndex,
+    ArrayIndex,
+    ArrayIterator,
+    Null,
+    Boolean,
+    Number,
+    String,
+    Array,
+    Object,
+    BinOp(BinOp),
+    UnOp(UnOp),
+    Variable,
+    FunctionExpression,
+    Call,
+    IfThenElse,
+    Bound,
+    ReduceExpression,
+    Hole,
+}
+
+impl From<&Cst<'_>> for Filter {
+    fn from(cst: &Cst<'_>) -> Filter {
+        match cst.kind {
+            FilterKind::Hole => {
+                assert!(cst.children.len() == 0);
+                Filter::Hole
+            }
+            FilterKind::Dot => {
+                assert!(cst.children.len() == 0);
+                Filter::Dot
+            }
+            FilterKind::Pipe => {
+                assert!(cst.children.len() == 2);
+                Filter::Pipe(
+                    Box::new((&cst.children[0]).into()),
+                    Box::new((&cst.children[1]).into()),
+                )
+            }
+            FilterKind::Comma => {
+                assert!(cst.children.len() == 2);
+                Filter::Comma(
+                    Box::new((&cst.children[0]).into()),
+                    Box::new((&cst.children[1]).into()),
+                )
+            }
+            FilterKind::ObjIndex => {
+                assert!(cst.children.len() == 1);
+                Filter::ObjIndex(Box::new((&cst.children[0]).into()))
+            }
+            FilterKind::ArrayIndex => {
+                assert!(cst.children.len() == 1);
+                Filter::ArrayIndex(Box::new((&cst.children[0]).into()))
+            }
+            FilterKind::ArrayIterator => {
+                assert!(cst.children.len() == 0);
+                Filter::ArrayIterator
+            }
+            FilterKind::Null => {
+                assert!(cst.children.len() == 0);
+                Filter::Null
+            }
+            FilterKind::Boolean => {
+                assert!(cst.children.len() == 1);
+                assert!(cst.children[0].value == "true" || cst.children[0].value == "false");
+                Filter::Boolean(cst.children[0].value == "true")
+            }
+            FilterKind::Number => {
+                assert!(cst.children.len() == 1);
+                Filter::Number(cst.children[0].value.parse().unwrap())
+            }
+            FilterKind::String => {
+                assert!(cst.children.len() == 1);
+                Filter::String(cst.children[0].value.to_string())
+            }
+            FilterKind::Array => Filter::Array(cst.children.iter().map(|c| c.into()).collect()),
+            FilterKind::Object => Filter::Object(
+                cst.children
+                    .iter()
+                    .map(|c| {
+                        assert!(c.children.len() == 2);
+                        ((&c.children[0]).into(), (&c.children[1]).into())
+                    })
+                    .collect(),
+            ),
+            FilterKind::BinOp(binop) => {
+                assert!(cst.children.len() == 3);
+                Filter::BinOp(
+                    Box::new((&cst.children[0]).into()),
+                    binop,
+                    Box::new((&cst.children[2]).into()),
+                )
+            }
+            FilterKind::UnOp(unop) => {
+                assert!(cst.children.len() == 2);
+                Filter::UnOp(unop, Box::new((&cst.children[1]).into()))
+            }
+            FilterKind::Variable => {
+                assert!(cst.children.len() == 1);
+                Filter::Variable(cst.children[0].value.to_string())
+            }
+            FilterKind::FunctionExpression => {
+                assert!(cst.children.len() >= 1);
+                todo!()
+            }
+            FilterKind::Call => todo!(),
+            FilterKind::IfThenElse => {
+                assert!(cst.children.len() == 3);
+                Filter::IfThenElse(
+                    Box::new((&cst.children[0]).into()),
+                    Box::new((&cst.children[1]).into()),
+                    Box::new((&cst.children[2]).into()),
+                )
+            }
+            FilterKind::Bound => todo!(),
+            FilterKind::ReduceExpression => todo!(),
+        }
+    }
+}
+
+impl Display for FilterKind {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        match self {
+            FilterKind::Dot => write!(f, "."),
+            FilterKind::Hole => write!(f, "??"),
+            FilterKind::ArrayIndex => write!(f, "[]"),
+            FilterKind::Object => write!(f, "{{}}"),
+            FilterKind::FunctionExpression => write!(f, "function"),
+            FilterKind::Call => write!(f, "call"),
+            FilterKind::IfThenElse => write!(f, "if"),
+            FilterKind::Bound => write!(f, "bound"),
+            FilterKind::ReduceExpression => write!(f, "reduce"),
+            FilterKind::Pipe => todo!(),
+            FilterKind::Comma => todo!(),
+            FilterKind::ObjIndex => todo!(),
+            FilterKind::ArrayIterator => todo!(),
+            FilterKind::Null => todo!(),
+            FilterKind::Boolean => todo!(),
+            FilterKind::Number => todo!(),
+            FilterKind::String => todo!(),
+            FilterKind::Array => todo!(),
+            FilterKind::BinOp(bin_op) => todo!(),
+            FilterKind::UnOp(un_op) => todo!(),
+            FilterKind::Variable => todo!(),
+        }
+    }
+}
+
+impl Display for Cst<'_> {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        write!(f, "Cst({})", self.value)?;
+        if !self.children.is_empty() {
+            write!(f, " -> [")?;
+            for child in &self.children {
+                write!(f, "{}, ", child)?;
+            }
+            write!(f, "]")?;
+        }
+        Ok(())
+    }
+}
+
+impl<'a> Cst<'a> {
+    pub(crate) fn dot(range: Range) -> Self {
+        Self {
+            kind: FilterKind::Dot,
+            children: Vec::new(),
+            range,
+            value: ".",
+        }
+    }
+
+    pub(crate) fn hole(range: Range) -> Self {
+        Self {
+            kind: FilterKind::Hole,
+            range,
+            children: Vec::new(),
+            value: "??",
+        }
+    }
+    pub(crate) fn pipe(lhs: Cst<'a>, rhs: Cst<'a>, value: &'a str, range: Range) -> Self {
+        Self {
+            kind: FilterKind::Pipe,
+            children: vec![lhs, rhs],
+            range,
+            value,
+        }
+    }
+}
+
+pub fn parse(code: &str) -> (HashMap<String, Cst>, Cst) {
     let mut parser = tree_sitter::Parser::new();
     parser
         .set_language(&tree_sitter_tjq::LANGUAGE.into())
@@ -75,22 +276,22 @@ pub fn parse_defs(code: &str) -> HashMap<String, Filter> {
     defs
 }
 
-fn parse_child_or_hole(
-    code: &str,
-    root: Node<'_>,
+fn parse_child_or_hole<'a>(
+    code: &'a str,
+    root: Node<'a>,
     index: usize,
-    defs: &mut HashMap<String, Filter>,
-) -> Filter {
+    defs: &mut HashMap<String, Cst<'a>>,
+) -> Cst<'a> {
     root.child(index)
         .map(|node| parse_filter(code, node, defs))
-        .unwrap_or(Filter::Hole)
+        .unwrap_or(Cst::hole(root.range()))
 }
 
-pub(crate) fn parse_filter(
-    code: &str,
-    root: Node<'_>,
-    defs: &mut HashMap<String, Filter>,
-) -> Filter {
+pub(crate) fn parse_filter<'a>(
+    code: &'a str,
+    root: Node<'a>,
+    defs: &'a mut HashMap<String, Cst<'_>>,
+) -> Cst<'a> {
     tracing::trace!(
         "{}: {}",
         root.kind(),
@@ -98,7 +299,7 @@ pub(crate) fn parse_filter(
     );
 
     match root.kind() {
-        "dot" => Filter::Dot,
+        "dot" => Cst::dot(root.range()),
         "sequence_expression" => {
             let lhs = parse_filter(
                 code,
@@ -110,7 +311,12 @@ pub(crate) fn parse_filter(
                 root.child(2).expect("sequence should have a rhs"),
                 defs,
             );
-            Filter::Comma(Box::new(lhs), Box::new(rhs))
+            Cst::pipe(
+                lhs,
+                rhs,
+                &code[root.range().start_byte..root.range().end_byte],
+                root.range(),
+            )
         }
         "subscript_expression" => {
             let lhs = parse_filter(
@@ -130,7 +336,8 @@ pub(crate) fn parse_filter(
                 // ))
                 let rhs = root.child(2).unwrap();
                 let rhs = code[rhs.range().start_byte..rhs.range().end_byte].parse::<isize>().unwrap_or_else(|_| panic!("array index should be a valid integer(expressions in the index are not yet supported), encountered '{}'", &code[rhs.range().start_byte..rhs.range().end_byte]));
-                Filter::ArrayIndex(rhs)
+                // Filter::ArrayIndex(rhs)
+                todo!("@can: parse the rhs as a Filter")
             };
 
             match lhs {
@@ -146,7 +353,8 @@ pub(crate) fn parse_filter(
                     .expect("field access should have the second child as its field"),
                 defs,
             );
-            Filter::ObjIndex(identifier.to_string())
+            // Filter::ObjIndex(identifier.to_string())
+            todo!("@can: parse them as object indexes")
         }
         "field_id" => {
             Filter::String(code[root.range().start_byte..root.range().end_byte].to_string())
@@ -309,21 +517,20 @@ pub(crate) fn parse_filter(
                 })
                 .collect();
 
+            let tail = root
+                .child(root.child_count() - 2)
+                .expect("if expression should end with 'end' or 'else <expr> end'");
+            let tail_str = &code[tail.range().start_byte..tail.range().end_byte];
 
-                let tail = root.child(root.child_count() - 2).expect("if expression should end with 'end' or 'else <expr> end'");
-                let tail_str =  &code[tail.range().start_byte..tail.range().end_byte];
-
-                let else_ = if tail_str == "end" {
-                    Filter::Dot
-                } 
-                else if tail_str != "elseX" {
-
-                    Filter::Hole
-                }else {
-                    // if … then … else <expr> end
-                    println!("{}", tail_str);
-                    parse_filter(code, tail, defs)
-                };
+            let else_ = if tail_str == "end" {
+                Filter::Dot
+            } else if tail_str != "elseX" {
+                Filter::Hole
+            } else {
+                // if … then … else <expr> end
+                println!("{}", tail_str);
+                parse_filter(code, tail, defs)
+            };
 
             Filter::IfThenElse(
                 Box::new(cond),
@@ -434,37 +641,46 @@ pub(crate) fn parse_filter(
                     .expect("field access should have the second child as its field"),
                 defs,
             );
-            Filter::ObjIndex(identifier.to_string())
+            // Filter::ObjIndex(identifier.to_string())
+            todo!("@can: parse them as object indexes")
         }
         "reduce_expression" => {
-            
-            let bind = root.child(1)
-                .expect("reduce: expected binding_expression ");
+            let bind = root.child(1).expect("reduce: expected binding_expression ");
 
             if bind.is_missing() || bind.range().start_byte == bind.range().end_byte {
                 panic!("reduce: missing binding_expression ");
             }
 
-            let source_node = bind.child(0)
+            let source_node = bind
+                .child(0)
                 .expect("reduce: binding_expression missing source expression");
-            let var_node = bind.child(2)
+            let var_node = bind
+                .child(2)
                 .expect("reduce: binding_expression missing $variable");
 
             let generator = parse_filter(code, source_node, defs);
 
             let vtxt = &code[var_node.range().start_byte..var_node.range().end_byte];
-            let var_name = vtxt.strip_prefix('$')
+            let var_name = vtxt
+                .strip_prefix('$')
                 .unwrap_or_else(|| panic!("reduce: expected variable"))
                 .to_string();
 
-            let init_node = root.child(3).expect("reduce: missing initializer expression");
-            let upd_node  = root.child(5).expect("reduce: missing update expression");
+            let init_node = root
+                .child(3)
+                .expect("reduce: missing initializer expression");
+            let upd_node = root.child(5).expect("reduce: missing update expression");
 
-            let init   = parse_filter(code, init_node, defs);
+            let init = parse_filter(code, init_node, defs);
             let update = parse_filter(code, upd_node, defs);
 
-            Filter::ReduceExpression(var_name, Box::new(generator), Box::new(init), Box::new(update))
-        },
+            Filter::ReduceExpression(
+                var_name,
+                Box::new(generator),
+                Box::new(init),
+                Box::new(update),
+            )
+        }
         "assignment_expression" => Filter::Dot,
         "foreach_expression" => Filter::Dot,
         "field_expression" => Filter::Dot,
@@ -1176,7 +1392,6 @@ mod tests {
                 "".to_string(),
                 Box::new(Filter::Hole),
                 Box::new(Filter::Hole),
-
                 Box::new(Filter::BinOp(
                     Box::new(Filter::Dot),
                     BinOp::Add,
@@ -1461,7 +1676,6 @@ mod tests {
         let (_, expected) = parse(expected);
         //TODO check this (incomplete?)
         assert_eq!(filter, expected);
-    
     }
 
     #[test]
@@ -1518,7 +1732,7 @@ mod tests {
     }
 
     #[test]
-    fn test_if_expression2(){
+    fn test_if_expression2() {
         let code = r#"
             if true then
                 1
@@ -1534,7 +1748,7 @@ mod tests {
     }
 
     #[test]
-    fn test_if_expression3(){
+    fn test_if_expression3() {
         let code = r#"
             if true then
                 1
@@ -1548,7 +1762,7 @@ mod tests {
     }
 
     #[test]
-    fn test_if_expression4(){
+    fn test_if_expression4() {
         let code = r#"
             if true then
                 1
@@ -1558,6 +1772,4 @@ mod tests {
 
         assert!(defs.is_empty());
     }
-
-
 }

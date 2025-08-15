@@ -11,30 +11,30 @@ use crate::json::Json;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Filter {
-    Dot,                                                      // .
-    Pipe(Box<Filter>, Box<Filter>),                           // <f_1> | <f_2>
-    Comma(Box<Filter>, Box<Filter>),                          // <f_1>, <f_2>
-    ObjIndex(String),                                         // .<s>
-    ArrayIndex(isize),                                        // .[<n>]
-    ArrayIterator,                                            // .[]
-    Null,                                                     // null
-    Boolean(bool),                                            // true | false
-    Number(f64),                                              // 1, 2..
-    String(String),                                           // "abc"
-    Array(Vec<Filter>),                                       // [...]
-    Object(Vec<(Filter, Filter)>),                            // {...}
-    UnOp(UnOp, Box<Filter>),                                  // <op> <f>
-    BinOp(Box<Filter>, BinOp, Box<Filter>),                   // <f_1> <op> <f_2>
-    Empty,                                                    // Empty
-    Error,                                                    // Error
-    Call(String, Option<Vec<Filter>>),                        // <s>(<f_1>, <f_2>...)
-    IfThenElse(Box<Filter>, Box<Filter>, Box<Filter>),        // if <f_1> then <f_2> else <f_3>
-    Bound(Vec<String>, Box<Filter>),                          // \<s_1>, <s_2>... <f>
+    Dot,                                                             // .
+    Pipe(Box<Filter>, Box<Filter>),                                  // <f_1> | <f_2>
+    Comma(Box<Filter>, Box<Filter>),                                 // <f_1>, <f_2>
+    ObjIndex(Box<Filter>),                                           // .<s>
+    ArrayIndex(Box<Filter>),                                         // .[<n>]
+    ArrayIterator,                                                   // .[]
+    Null,                                                            // null
+    Boolean(bool),                                                   // true | false
+    Number(f64),                                                     // 1, 2..
+    String(String),                                                  // "abc"
+    Array(Vec<Filter>),                                              // [...]
+    Object(Vec<(Filter, Filter)>),                                   // {...}
+    UnOp(UnOp, Box<Filter>),                                         // <op> <f>
+    BinOp(Box<Filter>, BinOp, Box<Filter>),                          // <f_1> <op> <f_2>
+    Empty,                                                           // Empty
+    Error,                                                           // Error
+    Call(String, Option<Vec<Filter>>),                               // <s>(<f_1>, <f_2>...)
+    IfThenElse(Box<Filter>, Box<Filter>, Box<Filter>), // if <f_1> then <f_2> else <f_3>
+    Bound(Vec<String>, Box<Filter>),                   // \<s_1>, <s_2>... <f>
     FunctionExpression(HashMap<String, Filter>, Box<Filter>), // local_defs, <f>
-    BindingExpression(Box<Filter>, Box<Filter>),              //
-    Variable(String),                                         // $var
-    ReduceExpression(String, Box<Filter>, Box<Filter>, Box<Filter>), // reduce <f> as $<s> (<init>, <update>) 
-    // SliceExpression(i32,i32),                                        // .[<n1> : <n2>]
+    BindingExpression(Box<Filter>, Box<Filter>),       //
+    Variable(String),                                  // $var
+    ReduceExpression(String, Box<Filter>, Box<Filter>, Box<Filter>), // reduce <f> as $<s> (<init>, <update>)
+    // SliceExpression(i32,i32),                                     // .[<n1> : <n2>]
     Hole, // Placeholder for a missing value in the AST
 }
 
@@ -239,28 +239,51 @@ impl Filter {
                 Filter::filter(json, f2, global_definitions, variable_ctx),
             ]
             .concat(),
-            Filter::ObjIndex(s) => vec![match json {
-                Json::Object(obj) => Ok(obj
-                    .iter()
-                    .find(|(key, _)| key == s)
-                    .map(|(_, value)| value.clone())
-                    .unwrap_or(Json::Null)),
-                _ => Err(JQError::ObjIndexForNonObject(
-                    json.clone(),
-                    Json::String(s.clone()),
-                )),
-            }],
-            Filter::ArrayIndex(i) => vec![match json {
-                Json::Array(arr) => {
-                    let i = if *i < 0 { arr.len() as isize + i } else { *i } as usize;
-
-                    Ok(arr.get(i).cloned().unwrap_or(Json::Null))
+            Filter::ObjIndex(s) => match json {
+                Json::Object(obj) => {
+                    let s = Filter::filter(json, s, global_definitions, variable_ctx);
+                    s.into_iter()
+                        .map(|s| {
+                            if let Ok(Json::String(s)) = s {
+                                Ok(obj
+                                    .iter()
+                                    .find(|(key, _)| key.as_str() == s.as_str())
+                                    .map(|(_, value)| value.clone())
+                                    .unwrap_or(Json::Null))
+                            } else {
+                                s
+                            }
+                        })
+                        .collect::<Vec<_>>()
                 }
-                _ => Err(JQError::ArrIndexForNonArray(
-                    json.clone(),
-                    Json::Number(*i as f64),
-                )),
-            }],
+                _ => vec![Err(JQError::ObjIndexForNonObject(json.clone()))],
+            },
+            Filter::ArrayIndex(i) => match json {
+                Json::Array(arr) => {
+                    let i = Filter::filter(json, i, global_definitions, variable_ctx);
+                    i.into_iter()
+                        .map(|i| {
+                            if let Ok(Json::Number(i)) = i {
+                                if i.is_nan() || i.is_infinite() || i.fract() != 0.0 {
+                                    return Err(JQError::InvalidArrayIndex(
+                                        json.clone(),
+                                        Json::Number(i),
+                                    ));
+                                }
+
+                                let i = i as usize;
+
+                                let i = if i < 0 { arr.len() + i } else { i } as usize;
+
+                                Ok(arr.get(i).cloned().unwrap_or(Json::Null))
+                            } else {
+                                i
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                }
+                _ => vec![Err(JQError::ArrIndexForNonArray(json.clone()))],
+            },
             Filter::ArrayIterator => match json {
                 Json::Array(arr) => arr.iter().map(|value| Ok(value.clone())).collect(),
                 Json::Object(obj) => obj.iter().map(|(_, value)| Ok(value.clone())).collect(),
@@ -522,59 +545,60 @@ impl Filter {
                 }
             }
             Filter::ReduceExpression(var, gen, init, update) => {
-                    let mut gen_items = Vec::new();
-                    for r in Filter::filter(json, gen, global_definitions, variable_ctx) {
-                        match r {
-                            Ok(j) => gen_items.push(j),
-                            Err(e) => return vec![Err(e)], 
+                let mut gen_items = Vec::new();
+                for r in Filter::filter(json, gen, global_definitions, variable_ctx) {
+                    match r {
+                        Ok(j) => gen_items.push(j),
+                        Err(e) => return vec![Err(e)],
+                    }
+                }
+
+                let init_results = Filter::filter(json, init, global_definitions, variable_ctx);
+                let acc0 = match init_results.into_iter().find(|r| r.is_ok()) {
+                    Some(Ok(v)) => v,
+                    Some(Err(e)) => return vec![Err(e)],
+                    None => return vec![Err(JQError::Unknown)],
+                };
+
+                let old_binding = variable_ctx.get(var).cloned();
+
+                let mut acc = acc0;
+                for item in gen_items {
+                    // bind $var to the generated item
+                    variable_ctx.insert(var.clone(), Filter::from_json_const(&item));
+
+                    let upd_results =
+                        Filter::filter(&acc, update, global_definitions, variable_ctx);
+                    match upd_results.into_iter().find(|r| r.is_ok()) {
+                        Some(Ok(next)) => acc = next,
+                        Some(Err(e)) => {
+                            // restore binding
+                            if let Some(prev) = old_binding {
+                                variable_ctx.insert(var.clone(), prev);
+                            } else {
+                                variable_ctx.remove(var);
+                            }
+                            return vec![Err(e)];
+                        }
+                        None => {
+                            if let Some(prev) = old_binding {
+                                variable_ctx.insert(var.clone(), prev);
+                            } else {
+                                variable_ctx.remove(var);
+                            }
+                            return vec![Err(JQError::Unknown)];
                         }
                     }
+                }
 
-                    let init_results = Filter::filter(json, init, global_definitions, variable_ctx);
-                    let acc0 = match init_results.into_iter().find(|r| r.is_ok()) {
-                        Some(Ok(v)) => v,
-                        Some(Err(e)) => return vec![Err(e)],
-                        None => return vec![Err(JQError::Unknown)], 
-                    };
+                if let Some(prev) = old_binding {
+                    variable_ctx.insert(var.clone(), prev);
+                } else {
+                    variable_ctx.remove(var);
+                }
 
-                    let old_binding = variable_ctx.get(var).cloned();
-
-                    let mut acc = acc0;
-                    for item in gen_items {
-                        // bind $var to the generated item
-                        variable_ctx.insert(var.clone(), Filter::from_json_const(&item));
-
-                        let upd_results = Filter::filter(&acc, update, global_definitions, variable_ctx);
-                        match upd_results.into_iter().find(|r| r.is_ok()) {
-                            Some(Ok(next)) => acc = next,
-                            Some(Err(e)) => {
-                                // restore binding
-                                if let Some(prev) = old_binding {
-                                    variable_ctx.insert(var.clone(), prev);
-                                } else {
-                                    variable_ctx.remove(var);
-                                }
-                                return vec![Err(e)];
-                            }
-                            None => {
-                                if let Some(prev) = old_binding {
-                                    variable_ctx.insert(var.clone(), prev);
-                                } else {
-                                    variable_ctx.remove(var);
-                                }
-                                return vec![Err(JQError::Unknown)];
-                            }
-                        }
-                    }
-
-                    if let Some(prev) = old_binding {
-                        variable_ctx.insert(var.clone(), prev);
-                    } else {
-                        variable_ctx.remove(var);
-                    }
-
-                    vec![Ok(acc)]
-                },
+                vec![Ok(acc)]
+            }
 
             Filter::Hole => vec![Err(JQError::IncompleteProgram)],
         }
@@ -663,26 +687,26 @@ impl Filter {
             Filter::BindingExpression(_, _) => todo!(),
             Filter::Variable(_) => todo!(),
             Filter::ReduceExpression(var, gen, init, upd) => Filter::ReduceExpression(
-                    var.clone(),
-                    Box::new(gen.substitute(var, arg)),
-                    Box::new(init.substitute(var, arg)),
-                    Box::new(upd.substitute(var, arg)),
-                ),
-            
+                var.clone(),
+                Box::new(gen.substitute(var, arg)),
+                Box::new(init.substitute(var, arg)),
+                Box::new(upd.substitute(var, arg)),
+            ),
+
             Filter::Hole => todo!(),
         }
     }
     fn from_json_const(j: &Json) -> Filter {
         match j {
-            Json::Null        => Filter::Null,
-            Json::Boolean(b)  => Filter::Boolean(*b),
-            Json::Number(n)   => Filter::Number(*n),
-            Json::String(s)   => Filter::String(s.clone()),
-            Json::Array(a)    => Filter::Array(a.iter().map(Self::from_json_const).collect()),
-            Json::Object(o)   => Filter::Object(
+            Json::Null => Filter::Null,
+            Json::Boolean(b) => Filter::Boolean(*b),
+            Json::Number(n) => Filter::Number(*n),
+            Json::String(s) => Filter::String(s.clone()),
+            Json::Array(a) => Filter::Array(a.iter().map(Self::from_json_const).collect()),
+            Json::Object(o) => Filter::Object(
                 o.iter()
-                 .map(|(k,v)| (Filter::String(k.clone()), Self::from_json_const(v)))
-                 .collect()
+                    .map(|(k, v)| (Filter::String(k.clone()), Self::from_json_const(v)))
+                    .collect(),
             ),
         }
     }

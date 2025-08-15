@@ -48,7 +48,13 @@ fn main() {
         })
         .expect("no expression provided, either as an argument or a file path");
 
-    let (defs, filter) = parse(expression.as_str());
+    let (cst_defs, cst) = parse(expression.as_str());
+    let defs = HashMap::from(cst_defs.iter().map(|cst| {
+        let name = cst.children[0].value.to_string();
+        let filter = Filter::from(cst);
+        (name, filter)
+    }));
+    let filter = Filter::from(&cst);
 
     let json = args
         .input
@@ -64,7 +70,7 @@ fn main() {
         Json::from_serde_value(serde_json::from_str::<Value>(json.as_str()).expect("invalid JSON"));
 
     tracing::info!("input: '{}'", json);
-    tracing::info!("filter: '{}'", filter);
+    tracing::info!("filter: '{}'", cst);
 
     let mut filters = builtin_filters();
     filters.extend(defs);
