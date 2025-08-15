@@ -756,6 +756,7 @@ mod tests {
 
     fn filter(s: &str) -> Filter {
         let (_, filter) = parse(s);
+        let filter = (&filter).into();
         tracing::debug!("Parsed filter: {}", filter);
         filter
     }

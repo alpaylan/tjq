@@ -22,9 +22,8 @@ impl Display for JQError {
         write!(f, "jq: error(at <unknown>): ")?;
 
         match self {
-            JQError::ObjIndexForNonObject(json, json1)
-            | JQError::ArrIndexForNonArray(json, json1) => {
-                write!(f, "Cannot index {} with {}", json.debug(), json1.debug())
+            JQError::ObjIndexForNonObject(json) | JQError::ArrIndexForNonArray(json) => {
+                write!(f, "Cannot index {}", json.debug())
             }
             JQError::ArrIteratorForNonIterable(json) => {
                 write!(f, "Cannot iterate over {}", json.debug())
