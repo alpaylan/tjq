@@ -1,6 +1,8 @@
+use std::{array, default};
 use std::fmt::{Display, Formatter};
 use std::{collections::HashMap, vec};
 
+use serde_json::value;
 use tree_sitter::{Node, Range};
 
 use crate::printer::print_ast;
@@ -35,6 +37,10 @@ pub(crate) enum FilterKind {
     Bound,
     ReduceExpression,
     Hole,
+    Empty,
+    Error,
+    BindingExpression
+
 }
 
 impl From<&Cst<'_>> for Filter {
@@ -130,8 +136,23 @@ impl From<&Cst<'_>> for Filter {
                     Box::new((&cst.children[2]).into()),
                 )
             }
-            FilterKind::Bound => todo!(),
             FilterKind::ReduceExpression => todo!(),
+            FilterKind::Empty => {
+                assert!(cst.children.len() == 0);
+                Filter::Empty
+            }
+            FilterKind::Error => {
+                assert!(cst.children.len() == 0);
+                Filter::Error
+            }
+            FilterKind::Bound => todo!(),
+            FilterKind::BindingExpression => {
+                assert!(cst.children.len() == 2);
+                Filter::BindingExpression(
+                    Box::new((&cst.children[0]).into()),
+                    Box::new((&cst.children[1]).into()),
+                )
+            }   
         }
     }
 }
@@ -148,11 +169,11 @@ impl Display for FilterKind {
             FilterKind::IfThenElse => write!(f, "if"),
             FilterKind::Bound => write!(f, "bound"),
             FilterKind::ReduceExpression => write!(f, "reduce"),
-            FilterKind::Pipe => todo!(),
-            FilterKind::Comma => todo!(),
-            FilterKind::ObjIndex => todo!(),
+            FilterKind::Pipe => write!(f, "|"),
+            FilterKind::Comma => write!(f, ","),
+            FilterKind::ObjIndex => write!(f, ".[]"), //todo check this one
             FilterKind::ArrayIterator => todo!(),
-            FilterKind::Null => todo!(),
+            FilterKind::Null => write!(f, "null"),
             FilterKind::Boolean => todo!(),
             FilterKind::Number => todo!(),
             FilterKind::String => todo!(),
@@ -160,6 +181,9 @@ impl Display for FilterKind {
             FilterKind::BinOp(bin_op) => todo!(),
             FilterKind::UnOp(un_op) => todo!(),
             FilterKind::Variable => todo!(),
+            FilterKind::Empty => write!(f, "empty"), 
+            FilterKind::Error => write!(f, "error"),
+            FilterKind::BindingExpression => todo!()
         }
     }
 }
@@ -204,6 +228,172 @@ impl<'a> Cst<'a> {
             value,
         }
     }
+    pub(crate) fn string(range: Range, value: &'a str) -> Self {
+        Self {
+            kind: FilterKind::String        ,
+            children: Vec::new(),
+            range,
+            value,
+        }
+    }
+    pub(crate) fn object_index(range: Range, value: &'a str) -> Self {
+        Self {
+            kind: FilterKind::ObjIndex,
+            children: Vec::new(),
+            range,
+            value,
+        }
+    }
+    pub(crate) fn boolean(range: Range, value: &'a str) -> Self {
+        Self {
+            kind: FilterKind::Boolean,
+            children: Vec::new(),
+            range,
+            value,
+        }
+    }
+    pub(crate) fn null(range: Range) -> Self {
+        Self {
+            kind: FilterKind::Null,
+            children: Vec::new(),
+            range,
+            value: "null",
+        }
+    }
+    pub(crate) fn empty(range:Range) -> Self {
+        Self {
+            kind: FilterKind::Empty,
+            children: Vec::new(),
+            range,
+            value: "empty",
+        }
+    }   
+    pub(crate) fn error(range: Range) -> Self {
+        Self {
+            kind: FilterKind::Error,
+            children: Vec::new(),
+            range,
+            value: "error",
+        }
+    }
+    pub(crate)fn call(range: Range, value: &'a str, args: Option<Vec<Cst<'a>>>) -> Self {
+        let children = args.unwrap_or_else(|| Vec::new());
+        Self {
+            kind: FilterKind::Call,
+            children,
+            range,
+            value,
+        }
+    }
+    pub(crate) fn variable(range: Range, value: &'a str) -> Self {
+        Self {
+            kind: FilterKind::Variable,
+            children: Vec::new(),
+            range,
+            value,
+        }
+    }
+    pub(crate) fn array(range: Range, values: Vec<Cst<'a>>, value: &'a str) -> Self {
+        Self {
+            kind: FilterKind::Array,
+            children: values,
+            range,
+            value,
+        }
+    }
+    pub(crate) fn object(range: Range, pairs: Vec<(Cst<'a>, Cst<'a>)>, value: &'a str) -> Self {
+        Self {
+            kind: FilterKind::Object,
+            children: pairs.into_iter()
+                .flat_map(|(key, val)| [key, val])
+                .collect(),
+            range,
+            value,
+        }
+    }
+
+    pub fn number(range: Range, value: &'a str) -> Self {
+        Self {
+            kind: FilterKind::Number,
+            children: Vec::new(),
+            range,
+            value,
+        }
+    }
+
+    pub fn bin_op(range: Range, lhs: Cst<'a>, op: BinOp, rhs: Cst<'a>, value: &'a str) -> Self {
+        Self {
+            kind: FilterKind::BinOp(op),
+            children: vec![lhs, rhs],
+            range,
+            value,
+        }
+    }
+
+    pub fn un_op(range: Range, op: UnOp, rhs: Cst<'a>, value: &'a str) -> Self {
+        Self {
+            kind: FilterKind::UnOp(op),
+            children: vec![rhs],
+            range,
+            value,
+        }
+    }
+    pub fn if_then_else(
+        range: Range,
+        cond: Cst<'a>,
+        then: Cst<'a>,
+        else_: Cst<'a>,
+        value: &'a str
+    ) -> Self {
+        Self {
+            kind: FilterKind::IfThenElse,
+            children: vec![cond, then, else_],
+            range,
+            value,
+        }
+    } 
+    pub fn bound(
+            range: Range,
+            value: &'a str,
+            args: Vec<Cst<'a>>,
+            body: Cst<'a>,
+        ) -> Self {
+            Self {
+                kind: FilterKind::Bound,
+                children: args.into_iter().chain(std::iter::once(body)).collect(),
+                range,
+                value,
+            }
+        } 
+    pub fn binding_expression(
+        range: Range,
+        value: &'a str, 
+        lhs: Cst<'a>,
+        pat: Cst<'a>,
+    ) -> Self {
+        Self {
+            kind: FilterKind::BindingExpression,
+            children: vec![lhs, pat],
+            range,
+            value,
+        }
+    }
+    pub fn function_expression(
+        range: Range,
+        value: &'a str,
+        defs: HashMap<String, Cst<'a>>,
+        final_expr: Cst<'a>,
+    ) -> Self {
+        Self {
+            kind: FilterKind::FunctionExpression,
+            children: defs.into_values().chain(std::iter::once(final_expr)).collect(),
+            range,
+            value
+        }
+    }
+        
+
+
 }
 
 pub fn parse(code: &str) -> (HashMap<String, Cst>, Cst) {
@@ -218,6 +408,7 @@ pub fn parse(code: &str) -> (HashMap<String, Cst>, Cst) {
     print_ast(tree.root_node(), code, 0); // print AST
                                           //print_node_details(tree.root_node(), code, 0);
 
+                                          
     let mut defs = HashMap::new();
 
     for i in 0..tree.root_node().child_count() - 1 {
@@ -242,6 +433,7 @@ pub fn parse(code: &str) -> (HashMap<String, Cst>, Cst) {
     );
 
     (defs, f)
+    
 }
 
 pub fn parse_defs(code: &str) -> HashMap<String, Filter> {
@@ -276,16 +468,6 @@ pub fn parse_defs(code: &str) -> HashMap<String, Filter> {
     defs
 }
 
-fn parse_child_or_hole<'a>(
-    code: &'a str,
-    root: Node<'a>,
-    index: usize,
-    defs: &mut HashMap<String, Cst<'a>>,
-) -> Cst<'a> {
-    root.child(index)
-        .map(|node| parse_filter(code, node, defs))
-        .unwrap_or(Cst::hole(root.range()))
-}
 
 pub(crate) fn parse_filter<'a>(
     code: &'a str,
@@ -357,27 +539,32 @@ pub(crate) fn parse_filter<'a>(
             todo!("@can: parse them as object indexes")
         }
         "field_id" => {
-            Filter::String(code[root.range().start_byte..root.range().end_byte].to_string())
+            let value = &code[root.range().start_byte..root.range().end_byte];
+            Cst::string(root.range(), value)
         }
         "identifier" => match &code[root.range().start_byte..root.range().end_byte] {
-            "true" => Filter::Boolean(true),
-            "false" => Filter::Boolean(false),
-            "null" => Filter::Null,
-            "empty" => Filter::Empty,
-            "error" => Filter::Error,
-            "" => Filter::Hole,
-            s => Filter::Call(s.to_string(), None),
+            "true" =>Cst::boolean(root.range(), "true"),
+            "false" => Cst::boolean(root.range(), "false"),
+            "null" => Cst::null(root.range()),
+            "empty" => Cst::empty(root.range()),
+            "error" => Cst::error(root.range()),
+            "" =>Cst::hole(root.range()),
+            s => Cst::call(root.range(), s, None),
+
         },
         "variable" => {
             let name = &code[root.range().start_byte + 1..root.range().end_byte];
-            Filter::Variable(name.to_string())
+            Cst::variable(root.range(), name)
         }
         "array" => {
-            if root.child_count() == 2 {
-                return Filter::Array(vec![]);
-            }
+            let val = &code[root.range().start_byte ..root.range().end_byte];
 
-            Filter::Array(
+            if root.child_count() == 2 {
+                // return Filter::Array(vec![]);
+                return Cst::array(root.range(), vec![], val);
+            }
+            Cst::array(
+                root.range(),
                 (1..root.child_count())
                     .step_by(2)
                     .map(|i| {
@@ -388,10 +575,11 @@ pub(crate) fn parse_filter<'a>(
                         )
                     })
                     .collect(),
+                val,
             )
         }
         "object" => {
-            let mut pairs: Vec<(Filter, Filter)> = vec![];
+            let mut pairs : Vec<(Cst<'a>, Cst<'a>)> = vec![];
             for i in (1..root.child_count() - 1).step_by(2) {
                 let pair = root.child(i).unwrap();
                 let key = parse_filter(code, pair.child(0).expect("pairs should have a key"), defs);
@@ -402,28 +590,33 @@ pub(crate) fn parse_filter<'a>(
                 );
                 pairs.push((key, value));
             }
+            
 
-            Filter::Object(pairs)
+            let value = &code[root.range().start_byte..root.range().end_byte];
+
+            Cst::object(root.range(), pairs, value)
+
+   
         }
         "number" => {
-            let num = code[root.range().start_byte..root.range().end_byte]
-                .parse::<f64>()
-                .expect("number should be a valid float");
-            Filter::Number(num)
+            let value = &code[root.range().start_byte..root.range().end_byte];
+            Cst::number(root.range(), value)
         }
         "string" => {
-            let s = code[root.range().start_byte + 1..root.range().end_byte - 1].to_string();
-            Filter::String(s)
+            let s = &code[root.range().start_byte..root.range().end_byte];
+            Cst::string(root.range(), s)
         }
         "pipeline" => {
-            // let lhs = parse_filter(code, root.child(0).expect("pipe should have a lhs"), defs);
-            let lhs = parse_child_or_hole(code, root, 0, defs);
-            // let rhs = parse_filter(code, root.child(2).expect("pipe should have a rhs"), defs);
-            let rhs = parse_child_or_hole(code, root, 2, defs);
+            let value = &code[root.range().start_byte..root.range().end_byte];
+            let lhs = parse_filter(code,root.child(0).expect("pipe should have a lhs"), defs);
+            let rhs = parse_filter(code, root.child(2).expect("pipe should have a rhs"), defs);
+            Cst::pipe(lhs, rhs, value, root.range())
 
-            Filter::Pipe(Box::new(lhs), Box::new(rhs))
         }
         "binary_expression" => {
+            let value = &code
+                [root.range().start_byte..root.range().end_byte];
+
             let lhs = parse_filter(
                 code,
                 root.child(0).expect("binary expression should have a lhs"),
@@ -452,9 +645,11 @@ pub(crate) fn parse_filter<'a>(
                 "or" => BinOp::Or,
                 _ => panic!("unknown binary operator"),
             };
-            Filter::BinOp(Box::new(lhs), op, Box::new(rhs))
+            Cst::bin_op(root.range(), lhs, op, rhs, value)
         }
         "unary_expression" => {
+            let value = &code
+                [root.range().start_byte..root.range().end_byte];
             let rhs = parse_filter(
                 code,
                 root.child(1).expect("unary expression should have a rhs"),
@@ -466,28 +661,20 @@ pub(crate) fn parse_filter<'a>(
                 "-" => UnOp::Neg,
                 _ => panic!("unknown unary operator"),
             };
-            Filter::UnOp(op, Box::new(rhs))
+            
+            Cst::un_op(root.range(), op, rhs, value)
         }
-        "true" => Filter::Boolean(true),
-        "false" => Filter::Boolean(false),
-        "null" => Filter::Null,
+        "true" => Cst::boolean(root.range(), "true"),
+        "false" => Cst::boolean(root.range(),"false"),
+        "null" => Cst::null(root.range()),
         "parenthesized_expression" => parse_filter(
             code,
             root.child(1)
                 .expect("paranthesized expression should have a value"),
             defs,
         ),
-        // "paranthesized_expression" => {
-        //     let mut inner_defs = defs.clone();
-
-        //     parse_filter(code,
-        //          root.child(1)
-        //                 .expect("paranthesized expression should have a value"),
-        //          &mut inner_defs,
-
-        // )
-        // }
         "if_expression" => {
+            let value= &code[root.range().start_byte..root.range().end_byte];
             let cond = parse_filter(
                 code,
                 root.child(1)
@@ -498,8 +685,8 @@ pub(crate) fn parse_filter<'a>(
                 code,
                 root.child(3).expect("if expression should have a then"),
                 defs,
-            );
-            let elifs: Vec<(Filter, Filter)> = (4..root.child_count() - 2)
+            ); //todo validate then
+            let elifs: Vec<(Cst, Cst)> = (4..root.child_count() - 2)
                 .map(|i| {
                     let elif = root.child(i).expect("if expression should have an elif");
                     let cond = parse_filter(
@@ -523,32 +710,32 @@ pub(crate) fn parse_filter<'a>(
             let tail_str = &code[tail.range().start_byte..tail.range().end_byte];
 
             let else_ = if tail_str == "end" {
-                Filter::Dot
-            } else if tail_str != "elseX" {
-                Filter::Hole
-            } else {
+                Cst::dot(tail.range())
+            } 
+            else {
                 // if … then … else <expr> end
                 println!("{}", tail_str);
                 parse_filter(code, tail, defs)
             };
 
-            Filter::IfThenElse(
-                Box::new(cond),
-                Box::new(then),
-                Box::new(elifs.into_iter().rev().fold(else_, |acc, (cond, then)| {
-                    Filter::IfThenElse(Box::new(cond), Box::new(then), Box::new(acc))
-                })),
-            )
+            Cst::if_then_else(root.range(), cond, then, else_, value)
         }
-        "else_expression" => parse_child_or_hole(code, root, 1, defs),
+        "else_expression" => 
+            parse_filter(
+                code,
+                root.child(1)
+                    .expect("else expression should have a value"),
+                defs,
+            ),
 
         "call_expression" => {
-            let name = code[root.child(0).unwrap().range().start_byte
-                ..root.child(0).unwrap().range().end_byte]
-                .to_string();
+            let value = &code[root.range().start_byte..root.range().end_byte];
+            // let name = code[root.child(0).unwrap().range().start_byte
+            //     ..root.child(0).unwrap().range().end_byte]
+            //     .to_string();
             let args = root.child(1);
             if let Some(args) = args {
-                let args: Vec<Filter> = (1..args.child_count())
+                let args: Vec<Cst> = (1..args.child_count())
                     .step_by(2)
                     .map(|i| {
                         parse_filter(
@@ -559,45 +746,52 @@ pub(crate) fn parse_filter<'a>(
                         )
                     })
                     .collect();
-                Filter::Call(name, Some(args))
+                Cst::call(
+                    root.range(),
+                    value,
+                    Some(args.into_iter().map(|c| c.into()).collect()),
+                )
             } else {
-                Filter::Call(name, None)
+                Cst::call(root.range(), value, None)
             }
         }
         "function_definition" => {
+            let value = &code[root.range().start_byte..root.range().end_byte];
             let name = code[root.child(1).unwrap().range().start_byte
                 ..root.child(1).unwrap().range().end_byte]
                 .to_string();
             let args = root
                 .child(2)
                 .expect("function definition should have arguments");
-            let args: Vec<String> = (1..args.child_count())
+            let args : Vec<Cst> = (1..args.child_count())
                 .step_by(2)
                 .map(|i| {
-                    code[args.child(i).unwrap().range().start_byte
-                        ..args.child(i).unwrap().range().end_byte]
-                        .to_string()
+                    parse_filter(
+                        code,
+                        args.child(i).expect("function definition should have an argument"),
+                        defs,
+                    )
                 })
                 .collect();
-
             let body = parse_filter(
                 code,
                 root.child(root.child_count() - 2)
                     .expect("function definition should have a body"),
                 defs,
             );
-            tracing::trace!(
-                "Parsed function definition: {}({}) -> {}",
-                name,
-                args.join(", "),
-                body
-            );
-            defs.insert(name.clone(), Filter::Bound(args, Box::new(body)));
-            Filter::Dot
-        }
+            Cst::bound(
+                root.range(),
+                value,
+                args,
+                body,
+            )
 
+            
+
+        }
+    
         "function_expression" => {
-            let mut final_expr = Filter::Dot;
+            let mut final_expr = Cst::dot(root.range()); //todo @can fix 
             let mut inner_defs = HashMap::new();
 
             for i in 0..root.child_count() {
@@ -613,21 +807,24 @@ pub(crate) fn parse_filter<'a>(
                 }
             }
 
-            let result = Filter::FunctionExpression(inner_defs, Box::new(final_expr));
-            tracing::trace!("Parsed function expression:\n{}", result);
-            result
+            Cst::function_expression(
+                root.range(),
+                &code[root.range().start_byte..root.range().end_byte],
+                inner_defs,
+                final_expr,
+
+            )   
         }
         "binding_expression" => {
-            // println!("Child count: {}", root.child_count());
-            // for i in 0..root.child_count() {
-            //     let child = root.child(i).unwrap();
-            //     let text = &code[child.range().start_byte..child.range().end_byte];
-            //     println!("Child {}: {} = '{}'", i, child.kind(), text);
-            // }
 
             let lhs = parse_filter(code, root.child(0).unwrap(), defs);
             let pat = parse_filter(code, root.child(2).unwrap(), defs);
-            Filter::BindingExpression(Box::new(lhs), Box::new(pat))
+            Cst::binding_expression(
+                root.range(),
+                &code[root.range().start_byte..root.range().end_byte],
+                lhs,
+                pat,
+            )
         }
         "optional_expression" => {
             let field = root
@@ -681,10 +878,10 @@ pub(crate) fn parse_filter<'a>(
                 Box::new(update),
             )
         }
-        "assignment_expression" => Filter::Dot,
-        "foreach_expression" => Filter::Dot,
-        "field_expression" => Filter::Dot,
-        "hole" => Filter::Hole,
+        "assignment_expression" => todo!(),
+        "foreach_expression" => todo!(),
+        "field_expression" => todo!(),
+        "hole" => Cst::hole(root.range()),
         "slice_expression" => todo!(),
         _ => {
             tracing::warn!(
