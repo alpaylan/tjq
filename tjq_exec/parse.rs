@@ -384,6 +384,31 @@ impl<'a> Cst<'a> {
             value,
         }
     }
+    pub fn array_iterator(range:Range, value : & 'a str , lhs: Cst<'a>) -> Self {
+        Self {
+            kind: FilterKind::ArrayIterator,
+            children: vec![lhs],
+            range,
+            value,
+        }
+    }
+
+    pub fn array_index(range: Range, value: &'a str, lhs: Cst<'a>, rhs: Cst<'a>) -> Self {
+        Self {
+            kind: FilterKind::ArrayIndex,
+            children: vec![lhs, rhs],
+            range,
+            value,
+        }
+    }
+    pub fn reduce_expression(range: Range, value: &'a str, var_cst: Cst<'a>, generator: Cst<'a>, init: Cst<'a>, update: Cst<'a>) -> Self {
+        Self {
+            kind: FilterKind::ReduceExpression,
+            children: vec![var_cst, generator, init, update],
+            range,
+            value,
+        }
+    }
 }
 
 pub fn parse<'a>(code: &'a str) -> (HashMap<String, Cst<'a>>, Cst<'a>) {
@@ -442,7 +467,7 @@ pub fn parse_defs(code: &str) -> HashMap<String, Filter> {
         let child = tree.root_node().child(i).unwrap();
         match child.kind() {
             "function_definition" => {
-                let _ = parse_filter(code, child, &mut defs);
+                let _ = parse_filter(code, child);
             }
             "comment" => {
                 tracing::trace!(
@@ -483,121 +508,123 @@ pub(crate) fn parse_filter<'a>(code: &'a str, root: Node<'_>) -> (Cst<'a>, Vec<(
             )
         }
         "subscript_expression" => {
-            let lhs = parse_filter(code, root.child(0).expect("subscript should have a lhs"));
-
-            let rhs = if root.child_count() == 3 {
-                Filter::ArrayIterator
-            } else {
-                // todo: Implement expressions in the index position
-                // Filter::ArrayIndex(parse_filter(
-                //     code,
-                //     root.child(2).expect("subscript should have a rhs"),
-                //     defs,
-                // ))
-                let rhs = root.child(2).unwrap();
-                let rhs = code[rhs.range().start_byte..rhs.range().end_byte].parse::<isize>().unwrap_or_else(|_| panic!("array index should be a valid integer(expressions in the index are not yet supported), encountered '{}'", &code[rhs.range().start_byte..rhs.range().end_byte]));
-                // Filter::ArrayIndex(rhs)
-                todo!("@can: parse the rhs as a Filter")
-            };
-
-            match lhs {
-                Filter::Dot => rhs,
-                _ => Filter::Pipe(Box::new(lhs), Box::new(rhs)),
+                let (lhs, vl) = parse_filter(code, root.child(0).expect("subscript should have a lhs"));
+                let value = &code[root.range().start_byte..root.range().end_byte];
+                if root.child_count() == 3 {
+                    // Array iterator 
+                    (Cst::array_iterator(root.range(), value, lhs), vl)
+                } else {
+                    //array index -> parse the rhs
+                    let (rhs, vr) = parse_filter(
+                        code,
+                        root.child(2).expect("subscript should have a rhs"),
+                    );
+                    
+                    let v = vl.into_iter().chain(vr).collect();
+                    
+                    (Cst::array_index(root.range(), value, lhs, rhs), v)
+                }
             }
-        }
         "field" => {
             // get the second child and make it an ObjectIndex
             let identifier = parse_filter(
                 code,
                 root.child(1)
                     .expect("field access should have the second child as its field"),
-                defs,
+               
             );
             // Filter::ObjIndex(identifier.to_string())
             todo!("@can: parse them as object indexes")
         }
         "field_id" => {
             let value = &code[root.range().start_byte..root.range().end_byte];
-            Cst::string(root.range(), value)
+            (Cst::string(root.range(), value), vec![])
         }
-        "identifier" => match &code[root.range().start_byte..root.range().end_byte] {
-            "true" => Cst::boolean(root.range(), "true"),
-            "false" => Cst::boolean(root.range(), "false"),
-            "null" => Cst::null(root.range()),
-            "empty" => Cst::empty(root.range()),
-            "error" => Cst::error(root.range()),
-            "" => Cst::hole(root.range()),
-            s => Cst::call(root.range(), s, None),
-        },
+        "identifier" => {
+            let cst = match &code[root.range().start_byte..root.range().end_byte] {
+                "true" => Cst::boolean(root.range(), "true"),
+                "false" => Cst::boolean(root.range(), "false"),
+                "null" => Cst::null(root.range()),
+                "empty" => Cst::empty(root.range()),
+                "error" => Cst::error(root.range()),
+                "" => Cst::hole(root.range()),
+                s => Cst::call(root.range(), s, None),
+            };
+            (cst, vec![])
+        }
         "variable" => {
             let name = &code[root.range().start_byte + 1..root.range().end_byte];
-            Cst::variable(root.range(), name)
+            (Cst::variable(root.range(), name), vec![])
         }
         "array" => {
             let val = &code[root.range().start_byte..root.range().end_byte];
 
             if root.child_count() == 2 {
-                // return Filter::Array(vec![]);
-                return Cst::array(root.range(), vec![], val);
+                return (Cst::array(root.range(), vec![], val), vec![]);
             }
-            Cst::array(
-                root.range(),
-                (1..root.child_count())
-                    .step_by(2)
-                    .map(|i| {
-                        parse_filter(
-                            code,
-                            root.child(i).expect("array should have a value"),
-                            defs,
-                        )
-                    })
-                    .collect(),
-                val,
-            )
+            
+            let mut all_defs = vec![];
+            let children: Vec<Cst> = (1..root.child_count())
+                .step_by(2)
+                .map(|i| {
+                    let (child, child_defs) = parse_filter(
+                        code,
+                        root.child(i).expect("array should have a value"),
+                    );
+                    all_defs.extend(child_defs);
+                    child
+                })
+                .collect();
+            
+            (Cst::array(root.range(), children, val), all_defs)
         }
         "object" => {
-            let mut pairs: Vec<(Cst<'a>, Cst<'a>)> = vec![];
-            for i in (1..root.child_count() - 1).step_by(2) {
-                let pair = root.child(i).unwrap();
-                let key = parse_filter(code, pair.child(0).expect("pairs should have a key"), defs);
-                let value = parse_filter(
-                    code,
-                    pair.child(2).expect("pairs should have a value"),
-                    defs,
-                );
-                pairs.push((key, value));
-            }
+                let mut pairs: Vec<(Cst<'a>, Cst<'a>)> = vec![];
+                let mut all_defs = vec![];
+                
+                for i in (1..root.child_count() - 1).step_by(2) {
+                    let pair = root.child(i).unwrap();
+                    let (key, key_defs) = parse_filter(code, pair.child(0).expect("pairs should have a key"));
+                    let (value, value_defs) = parse_filter(
+                        code,
+                        pair.child(2).expect("pairs should have a value"),
+                    );
+                    
+                    all_defs.extend(key_defs);
+                    all_defs.extend(value_defs);
+                    pairs.push((key, value));
+                }
 
-            let value = &code[root.range().start_byte..root.range().end_byte];
+                let value = &code[root.range().start_byte..root.range().end_byte];
 
-            Cst::object(root.range(), pairs, value)
+                (Cst::object(root.range(), pairs, value), all_defs)
         }
         "number" => {
             let value = &code[root.range().start_byte..root.range().end_byte];
-            Cst::number(root.range(), value)
+            (Cst::number(root.range(), value), vec![])
         }
         "string" => {
             let s = &code[root.range().start_byte..root.range().end_byte];
-            Cst::string(root.range(), s)
+            (Cst::string(root.range(), s), vec![])
         }
         "pipeline" => {
             let value = &code[root.range().start_byte..root.range().end_byte];
-            let lhs = parse_filter(code, root.child(0).expect("pipe should have a lhs"), defs);
-            let rhs = parse_filter(code, root.child(2).expect("pipe should have a rhs"), defs);
-            Cst::pipe(lhs, rhs, value, root.range())
+            let (lhs,vl) = parse_filter(code, root.child(0).expect("pipe should have a lhs"));
+            let (rhs,vr) = parse_filter(code, root.child(2).expect("pipe should have a rhs"));
+            let v = vl.into_iter().chain(vr).collect();
+            (Cst::pipe(lhs, rhs, value, root.range()), v)
         }
         "binary_expression" => {
             let value = &code[root.range().start_byte..root.range().end_byte];
 
-            let lhs = parse_filter(
+            let (lhs,vl) = parse_filter(
                 code,
                 root.child(0).expect("binary expression should have a lhs"),
-                defs,
+                
             );
-            let rhs = parse_filter(
+            let (rhs,vr) = parse_filter(
                 code,
-                root.child(2).expect("binary expression should have a rhs"),
-                defs,
+                root.child(2).expect("binary expression should have a rhs")
             );
             let op = match &code
                 [root.child(1).unwrap().range().start_byte..root.child(1).unwrap().range().end_byte]
@@ -617,14 +644,14 @@ pub(crate) fn parse_filter<'a>(code: &'a str, root: Node<'_>) -> (Cst<'a>, Vec<(
                 "or" => BinOp::Or,
                 _ => panic!("unknown binary operator"),
             };
-            Cst::bin_op(root.range(), lhs, op, rhs, value)
+            let v = vl.into_iter().chain(vr).collect();
+            (Cst::bin_op(root.range(), lhs, op, rhs, value), v)
         }
         "unary_expression" => {
             let value = &code[root.range().start_byte..root.range().end_byte];
-            let rhs = parse_filter(
+            let (rhs,v) = parse_filter(
                 code,
                 root.child(1).expect("unary expression should have a rhs"),
-                defs,
             );
             let op = match &code
                 [root.child(0).unwrap().range().start_byte..root.child(0).unwrap().range().end_byte]
@@ -633,156 +660,178 @@ pub(crate) fn parse_filter<'a>(code: &'a str, root: Node<'_>) -> (Cst<'a>, Vec<(
                 _ => panic!("unknown unary operator"),
             };
 
-            Cst::un_op(root.range(), op, rhs, value)
+            (Cst::un_op(root.range(), op, rhs, value),v)
         }
-        "true" => Cst::boolean(root.range(), "true"),
-        "false" => Cst::boolean(root.range(), "false"),
-        "null" => Cst::null(root.range()),
+        "true" => (Cst::boolean(root.range(), "true"),vec![]),
+        "false" => (Cst::boolean(root.range(), "false"),vec![]),
+        "null" => (Cst::null(root.range()), vec![]),
         "parenthesized_expression" => parse_filter(
             code,
             root.child(1)
                 .expect("paranthesized expression should have a value"),
-            defs,
         ),
+
         "if_expression" => {
-            let value = &code[root.range().start_byte..root.range().end_byte];
-            let cond = parse_filter(
-                code,
-                root.child(1)
-                    .expect("if expression should have a condition"),
-                defs,
-            );
-            let then = parse_filter(
-                code,
-                root.child(3).expect("if expression should have a then"),
-                defs,
-            ); //todo validate then
-            let elifs: Vec<(Cst, Cst)> = (4..root.child_count() - 2)
-                .map(|i| {
+                let value = &code[root.range().start_byte..root.range().end_byte];
+                
+                let (cond, vc) = parse_filter(
+                    code,
+                    root.child(1).expect("if expression should have a condition"),
+                );
+                
+                let (then, vt) = parse_filter(
+                    code,
+                    root.child(3).expect("if expression should have a then"),
+                );
+                
+                let mut velif = vec![];
+                for i in 4..root.child_count() - 2 {
                     let elif = root.child(i).expect("if expression should have an elif");
-                    let cond = parse_filter(
+                    let (elif_cond, vec_elif_cond) = parse_filter(
                         code,
-                        elif.child(1)
-                            .expect("elif expression should have a condition"),
-                        defs,
+                        elif.child(1).expect("elif expression should have a condition"),
                     );
-                    let then = parse_filter(
+                    let (elif_then, vec_elif_then) = parse_filter(
                         code,
                         elif.child(3).expect("elif expression should have a then"),
-                        defs,
                     );
-                    (cond, then)
-                })
-                .collect();
+                    velif.extend(vec_elif_cond);
+                    velif.extend(vec_elif_then);
+                }
 
-            let tail = root
-                .child(root.child_count() - 2)
-                .expect("if expression should end with 'end' or 'else <expr> end'");
-            let tail_str = &code[tail.range().start_byte..tail.range().end_byte];
+                let tail = root
+                    .child(root.child_count() - 2)
+                    .expect("if expression should end with 'end' or 'else <expr> end'");
+                let tail_str = &code[tail.range().start_byte..tail.range().end_byte];
 
-            let else_ = if tail_str == "end" {
-                Cst::dot(tail.range())
-            } else {
-                // if … then … else <expr> end
-                println!("{}", tail_str);
-                parse_filter(code, tail, defs)
-            };
+                let (else_, ve) = if tail_str == "end" {
+                    (Cst::dot(tail.range()), vec![])
+                } else {
+                    println!("{}", tail_str);
+                    parse_filter(code, tail)
+                };
 
-            Cst::if_then_else(root.range(), cond, then, else_, value)
-        }
+                let v = vc.into_iter()
+                    .chain(vt)
+                    .chain(velif)
+                    .chain(ve)
+                    .collect();
+
+                (Cst::if_then_else(root.range(), cond, then, else_, value), v)
+            }
         "else_expression" => parse_filter(
             code,
             root.child(1).expect("else expression should have a value"),
-            defs,
         ),
 
         "call_expression" => {
             let value = &code[root.range().start_byte..root.range().end_byte];
-            // let name = code[root.child(0).unwrap().range().start_byte
-            //     ..root.child(0).unwrap().range().end_byte]
-            //     .to_string();
+            
             let args = root.child(1);
             if let Some(args) = args {
-                let args: Vec<Cst> = (1..args.child_count())
+                let mut vargs = vec![];
+                let parsed_args: Vec<Cst> = (1..args.child_count())
                     .step_by(2)
                     .map(|i| {
-                        parse_filter(
+                        let (arg, varg) = parse_filter(
                             code,
-                            args.child(i)
-                                .expect("call expression should have arguments"),
-                            defs,
-                        )
+                            args.child(i).expect("call expression should have arguments"),
+                        );
+                        vargs.extend(varg);
+                        arg
                     })
                     .collect();
-                Cst::call(
-                    root.range(),
-                    value,
-                    Some(args.into_iter().map(|c| c.into()).collect()),
-                )
+                
+                (Cst::call(root.range(), value, Some(parsed_args)), vargs)
             } else {
-                Cst::call(root.range(), value, None)
+                (Cst::call(root.range(), value, None), vec![])
             }
-        }
+        },
         "function_definition" => {
             let value = &code[root.range().start_byte..root.range().end_byte];
             let name = code[root.child(1).unwrap().range().start_byte
                 ..root.child(1).unwrap().range().end_byte]
                 .to_string();
+            
             let args = root
                 .child(2)
                 .expect("function definition should have arguments");
-            let args: Vec<Cst> = (1..args.child_count())
+            
+            let mut vargs = vec![];
+            let parsed_args: Vec<Cst> = (1..args.child_count())
                 .step_by(2)
                 .map(|i| {
-                    parse_filter(
+                    let (arg, varg) = parse_filter(
                         code,
-                        args.child(i)
-                            .expect("function definition should have an argument"),
-                        defs,
-                    )
+                        args.child(i).expect("function definition should have an argument"),
+                    );
+                    vargs.extend(varg);
+                    arg
                 })
                 .collect();
-            let body = parse_filter(
+            
+            let (body, vbody) = parse_filter(
                 code,
                 root.child(root.child_count() - 2)
                     .expect("function definition should have a body"),
-                defs,
             );
-            Cst::bound(root.range(), value, args, body)
-        }
+            
+            let function_cst = Cst::bound(root.range(), value, parsed_args, body);
+            
+            let mut v = vargs;
+            v.extend(vbody);
+            v.push((name, function_cst));
+            
+            (Cst::hole(root.range()), v)
+        },
 
         "function_expression" => {
-            let mut final_expr = Cst::dot(root.range()); //todo @can fix
+            let mut final_expr = Cst::dot(root.range());
             let mut inner_defs = HashMap::new();
+            let mut all_defs = vec![];
 
             for i in 0..root.child_count() {
                 let child = root.child(i).unwrap();
 
                 match child.kind() {
                     "function_definition" => {
-                        let _ = parse_filter(code, child, &mut inner_defs);
+                        let (_, vdef) = parse_filter(code, child);
+                        for (name, def) in vdef {
+                            inner_defs.insert(name, def);
+                        }
                     }
                     _ => {
-                        final_expr = parse_filter(code, child, &mut inner_defs);
+                        let (expr, vexpr) = parse_filter(code, child);
+                        final_expr = expr;
+                        all_defs.extend(vexpr);
                     }
                 }
             }
 
-            Cst::function_expression(
-                root.range(),
-                &code[root.range().start_byte..root.range().end_byte],
-                inner_defs,
-                final_expr,
+            (
+                Cst::function_expression(
+                    root.range(),
+                    &code[root.range().start_byte..root.range().end_byte],
+                    inner_defs,
+                    final_expr,
+                ),
+                all_defs,
             )
         }
         "binding_expression" => {
-            let lhs = parse_filter(code, root.child(0).unwrap(), defs);
-            let pat = parse_filter(code, root.child(2).unwrap(), defs);
-            Cst::binding_expression(
-                root.range(),
-                &code[root.range().start_byte..root.range().end_byte],
-                lhs,
-                pat,
+            let (lhs,vl) = parse_filter(code, root.child(0).unwrap());
+            let (pat,vpat) = parse_filter(code, root.child(2).unwrap());
+            
+            let v = vl.into_iter().chain(vpat).collect();
+            
+            (
+                Cst::binding_expression(
+                    root.range(),
+                    &code[root.range().start_byte..root.range().end_byte],
+                    lhs,
+                    pat,
+                ),
+                v,
             )
         }
         "optional_expression" => {
@@ -790,15 +839,14 @@ pub(crate) fn parse_filter<'a>(code: &'a str, root: Node<'_>) -> (Cst<'a>, Vec<(
                 .child(0)
                 .expect("optional expression should have the first child as its field");
 
-            let identifier = parse_filter(
+            let (identifier, vfield) = parse_filter(
                 code,
                 field
                     .child(1)
                     .expect("field access should have the second child as its field"),
-                defs,
             );
-            // Filter::ObjIndex(identifier.to_string())
-            todo!("@can: parse them as object indexes")
+            
+            (Cst::object_index(root.range(), &code[root.range().start_byte..root.range().end_byte]), vfield)
         }
         "reduce_expression" => {
             let bind = root.child(1).expect("reduce: expected binding_expression ");
@@ -814,33 +862,45 @@ pub(crate) fn parse_filter<'a>(code: &'a str, root: Node<'_>) -> (Cst<'a>, Vec<(
                 .child(2)
                 .expect("reduce: binding_expression missing $variable");
 
-            let generator = parse_filter(code, source_node, defs);
+            let (generator, vgen) = parse_filter(code, source_node);
 
             let vtxt = &code[var_node.range().start_byte..var_node.range().end_byte];
-            let var_name = vtxt
+            let var_name_str = vtxt
                 .strip_prefix('$')
-                .unwrap_or_else(|| panic!("reduce: expected variable"))
-                .to_string();
+                .unwrap_or_else(|| panic!("reduce: expected variable"));
+            
+            let var_cst = Cst::variable(var_node.range(), var_name_str);
 
             let init_node = root
                 .child(3)
                 .expect("reduce: missing initializer expression");
             let upd_node = root.child(5).expect("reduce: missing update expression");
 
-            let init = parse_filter(code, init_node, defs);
-            let update = parse_filter(code, upd_node, defs);
+            let (init, vinit) = parse_filter(code, init_node);
+            let (update, vupdate) = parse_filter(code, upd_node);
 
-            Filter::ReduceExpression(
-                var_name,
-                Box::new(generator),
-                Box::new(init),
-                Box::new(update),
+            let v = vgen
+                .into_iter()
+                .chain(vinit)
+                .chain(vupdate)
+                .collect::<Vec<_>>();
+
+            (
+                Cst::reduce_expression(
+                    root.range(),
+                    &code[root.range().start_byte..root.range().end_byte],
+                    var_cst,
+                    generator,
+                    init,
+                    update,
+                ),
+                v,
             )
         }
+        "hole" => (Cst::hole(root.range()), vec![]),
         "assignment_expression" => todo!(),
         "foreach_expression" => todo!(),
         "field_expression" => todo!(),
-        "hole" => Cst::hole(root.range()),
         "slice_expression" => todo!(),
         _ => {
             tracing::warn!(
@@ -848,12 +908,12 @@ pub(crate) fn parse_filter<'a>(code: &'a str, root: Node<'_>) -> (Cst<'a>, Vec<(
                 root.kind(),
                 code[root.range().start_byte..root.range().end_byte].to_string()
             );
-            // panic!(
-            //     "unknown filter {} {}",
-            //     root.kind(),
-            //     code[root.range().start_byte..root.range().end_byte].to_string()
-            // );
-            todo!("handle erroneous parse tree!")
+            panic!(
+                "unknown filter {} {}",
+                root.kind(),
+                code[root.range().start_byte..root.range().end_byte].to_string()
+            );
+        
         }
     }
 }
@@ -867,1065 +927,1067 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn test_parse() {
-        let code = r#"
-            def add(a; b): a + b;
-            add(1; 2)
-        "#;
-
-        let (defs, filter) = parse(code);
-
-        assert_eq!(
-            defs.get("add").unwrap().clone(),
-            Filter::Bound(
-                vec!["a".to_string(), "b".to_string()],
-                Box::new(Filter::BinOp(
-                    Box::new(Filter::Call("a".to_string(), None)),
-                    BinOp::Add,
-                    Box::new(Filter::Call("b".to_string(), None))
-                ))
-            )
-        );
-
-        assert_eq!(
-            filter,
-            Filter::Call(
-                "add".to_string(),
-                Some(vec![Filter::Number(1.0), Filter::Number(2.0)])
-            )
-        );
-    }
-
-    #[test]
-    fn test_parse_filter() {
-        let code = r#"
-            1 + 2
-        "#;
-
-        let (defs, filter) = parse(code);
-
-        assert_eq!(defs, HashMap::new());
-
-        assert_eq!(
-            filter,
-            Filter::BinOp(
-                Box::new(Filter::Number(1.0)),
-                BinOp::Add,
-                Box::new(Filter::Number(2.0))
-            )
-        );
-    }
-
-    #[test]
-    fn test_parse_function_definition() {
-        let code = r#"
-            (def f:  .[] ;  .) | f
-        "#;
-        let (defs, filter) = parse(code);
-        assert!(defs.is_empty());
-        assert_eq!(
-            filter,
-            Filter::Pipe(
-                Box::new(Filter::FunctionExpression(
-                    HashMap::from([(
-                        "f".to_string(),
-                        Filter::Bound(vec![], Box::new(Filter::ArrayIterator))
-                    )]),
-                    Box::new(Filter::Dot)
-                )),
-                Box::new(Filter::Call("f".to_string(), None))
-            )
-        );
-    }
-
-    #[test]
-    fn test_parse_variable() {
-        let code = r#"
-            def main:
-                def add(a; b): a + b;
-                def sub(a; b): a - b;
-                def mul(a; b): a * b;
-                add(1; 2);
-            sub(3; 1)
-        "#;
-        let (defs, filter) = parse(code);
-        assert_eq!(
-            defs.get("main").unwrap().clone(),
-            Filter::Bound(
-                vec![],
-                Box::new(Filter::FunctionExpression(
-                    HashMap::from([
-                        (
-                            "add".to_string(),
-                            Filter::Bound(
-                                vec!["a".to_string(), "b".to_string()],
-                                Box::new(Filter::BinOp(
-                                    Box::new(Filter::Call("a".to_string(), None)),
-                                    BinOp::Add,
-                                    Box::new(Filter::Call("b".to_string(), None))
-                                ))
-                            )
-                        ),
-                        (
-                            "sub".to_string(),
-                            Filter::Bound(
-                                vec!["a".to_string(), "b".to_string()],
-                                Box::new(Filter::BinOp(
-                                    Box::new(Filter::Call("a".to_string(), None)),
-                                    BinOp::Sub,
-                                    Box::new(Filter::Call("b".to_string(), None))
-                                ))
-                            )
-                        ),
-                        (
-                            "mul".to_string(),
-                            Filter::Bound(
-                                vec!["a".to_string(), "b".to_string()],
-                                Box::new(Filter::BinOp(
-                                    Box::new(Filter::Call("a".to_string(), None)),
-                                    BinOp::Mul,
-                                    Box::new(Filter::Call("b".to_string(), None))
-                                ))
-                            )
-                        ),
-                    ]),
-                    Box::new(Filter::Call(
-                        "add".to_string(),
-                        Some(vec![Filter::Number(1.0), Filter::Number(2.0)])
-                    ))
-                ))
-            )
-        );
-        assert_eq!(
-            filter,
-            Filter::Call(
-                "sub".to_string(),
-                Some(vec![Filter::Number(3.0), Filter::Number(1.0)])
-            )
-        );
-    }
-    #[test]
-    fn test_if_expression() {
-        let code = r#"
-            if true then
-                1
-            else
-                2
-                end
-        "#;
-
-        let (defs, filter) = parse(code);
-
-        assert!(defs.is_empty());
-        assert_eq!(
-            filter,
-            Filter::IfThenElse(
-                Box::new(Filter::Boolean(true)),
-                Box::new(Filter::Number(1.0)),
-                Box::new(Filter::Number(2.0))
-            )
-        );
-    }
-
-    #[test]
-    fn test_binding_expression() {
-        let code = r#"
-           . as $item 
-        "#;
-        let (defs, filter) = parse(code);
-
-        assert_eq!(
-            filter,
-            Filter::BindingExpression(
-                Box::new(Filter::Dot),
-                Box::new(Filter::Variable("item".to_string()))
-            )
-        );
-    }
-
-    #[test]
-    fn test_binding_expression2() {
-        let code = r#"
-           1 as $item  | $item
-        "#;
-        let (defs, filter) = parse(code);
-
-        assert_eq!(
-            filter,
-            Filter::Pipe(
-                (Box::new(Filter::BindingExpression(
-                    Box::new(Filter::Number(1.0)),
-                    Box::new(Filter::Variable("item".to_string()))
-                ))),
-                Box::new(Filter::Variable("item".to_string()),)
-            )
-        );
-    }
-
-    #[test]
-    fn test_binding_expression3() {
-        let code = r#"
-           [1,2,3] as $item  | $item
-        "#;
-        let (defs, filter) = parse(code);
-
-        assert_eq!(
-            filter,
-            Filter::Pipe(
-                (Box::new(Filter::BindingExpression(
-                    Box::new(Filter::Array(vec![
-                        Filter::Number(1.0),
-                        Filter::Number(2.0),
-                        Filter::Number(3.0)
-                    ])),
-                    Box::new(Filter::Variable("item".to_string()))
-                ))),
-                Box::new(Filter::Variable("item".to_string()),)
-            )
-        );
-    }
-
-    #[test]
-    fn test_incomplete_binop() {
-        let code = r#"1 + "#;
-
-        let (defs, filter) = parse(code);
-
-        assert!(defs.is_empty());
-        assert_eq!(
-            filter,
-            Filter::BinOp(
-                Box::new(Filter::Number(1.0)),
-                BinOp::Add,
-                Box::new(Filter::Hole)
-            )
-        );
-    }
-
-    #[test]
-    fn test_incomplete_binop2() {
-        let code = r#"1 == "#;
-
-        let (defs, filter) = parse(code);
-
-        assert!(defs.is_empty());
-        assert_eq!(
-            filter,
-            Filter::BinOp(
-                Box::new(Filter::Number(1.0)),
-                BinOp::Eq,
-                Box::new(Filter::Hole)
-            )
-        );
-    }
-
-    #[test]
-    fn test_incomplete_pipe() {
-        let _ = tracing_subscriber::fmt()
-            .with_target(false)
-            .with_thread_ids(false)
-            .with_thread_names(false)
-            .with_file(true)
-            .with_line_number(true)
-            .with_level(true)
-            .without_time()
-            .with_env_filter(EnvFilter::from_default_env())
-            .try_init();
-        let code = r#"1 | "#;
-        let inferred = r#"1 | ??"#;
-
-        let (_, filter) = parse(code);
-        let (_, expected) = parse(inferred);
-        assert_eq!(filter, expected);
-    }
-
-    #[test]
-    fn test_incomplete_pipe2() {
-        let code = r#" ?? | 1 "#;
-
-        let (defs, filter) = parse(code);
-
-        assert!(defs.is_empty());
-        assert_eq!(
-            filter,
-            Filter::Pipe(Box::new(Filter::Hole), Box::new(Filter::Number(1.0)))
-        );
-    }
-
-    #[test]
-    fn test_incomplete_comma() {
-        let code = r#"1, "#;
-
-        let (defs, filter) = parse(code);
-
-        assert!(defs.is_empty());
-        assert_eq!(
-            filter,
-            Filter::Comma(Box::new(Filter::Number(1.0)), Box::new(Filter::Hole))
-        );
-    }
-
-    #[test]
-    fn test_abs() {
-        let (_, filter) = parse("if . < 0 then - . end");
-        assert_eq!(
-            filter,
-            Filter::IfThenElse(
-                Box::new(Filter::BinOp(
-                    Box::new(Filter::Dot),
-                    BinOp::Lt,
-                    Box::new(Filter::Number(0.0))
-                )),
-                Box::new(Filter::UnOp(UnOp::Neg, Box::new(Filter::Dot))),
-                Box::new(Filter::Dot)
-            )
-        );
-    }
-
-    #[test]
-    fn test_incomplete_function_definition() {
-        let code = r#"
-            def f(a; b):
-        "#;
-
-        let (defs, filter) = parse(code);
-
-        assert_eq!(
-            defs.get("f"),
-            Some(&Filter::Bound(
-                vec!["a".to_string(), "b".to_string()],
-                Box::new(Filter::Hole)
-            ))
-        );
-        assert_eq!(filter, Filter::Hole);
-    }
-
-    #[test]
-    fn test_incomplete_function_definition2() {
-        let code = r#"
-            def f(a; b):
-                a*b
-        "#;
-
-        let (defs, filter) = parse(code);
-
-        assert_eq!(
-            defs.get("f"),
-            Some(&Filter::Bound(
-                vec!["a".to_string(), "b".to_string()],
-                Box::new(Filter::BinOp(
-                    Box::new(Filter::Call("a".to_string(), None)),
-                    BinOp::Mul,
-                    Box::new(Filter::Call("b".to_string(), None))
-                ))
-            ))
-        );
-        // assert_eq!(filter, Filter::Hole);
-        //check this!
-    }
-
-    #[test]
-    fn test_incomplete_function_expression() {
-        let code = r#"
-            (def f(a; b): a + b; )
-        "#;
-
-        let (defs, filter) = parse(code);
-
-        assert!(defs.is_empty());
-        assert_eq!(
-            filter,
-            Filter::FunctionExpression(
-                HashMap::from([(
-                    "f".to_string(),
-                    Filter::Bound(
-                        vec!["a".to_string(), "b".to_string()],
-                        Box::new(Filter::BinOp(
-                            Box::new(Filter::Call("a".to_string(), None)),
-                            BinOp::Add,
-                            Box::new(Filter::Call("b".to_string(), None))
-                        ))
-                    )
-                )]),
-                Box::new(Filter::Hole)
-            )
-        );
-    }
-
-    #[test]
-    fn test_incomplete_nested_function_expression() {
-        let code = r#"
-            (def f(a; b): 
-                def g(c; d):
-            )
-
-        "#;
-
-        let (defs, filter) = parse(code);
-
-        assert!(defs.is_empty());
-        assert_eq!(
-            filter,
-            Filter::FunctionExpression(
-                HashMap::from([(
-                    "f".to_string(),
-                    Filter::Bound(
-                        vec!["a".to_string(), "b".to_string()],
-                        Box::new(Filter::FunctionExpression(
-                            HashMap::from([(
-                                "g".to_string(),
-                                Filter::Bound(
-                                    vec!["c".to_string(), "d".to_string()],
-                                    Box::new(Filter::Hole)
-                                )
-                            )]),
-                            Box::new(Filter::Hole)
-                        ))
-                    )
-                )]),
-                Box::new(Filter::Hole)
-            )
-        );
-    }
-
-    #[test]
-    fn test_incomplete_nested_function_expression2() {
-        let code = r#"
-            (def f(a; b): 
-                def g(c; d):
-                    c + d;
-            )
-
-        "#;
-
-        let (defs, filter) = parse(code);
-
-        assert!(defs.is_empty());
-        assert_eq!(
-            filter,
-            Filter::FunctionExpression(
-                HashMap::from([(
-                    "f".to_string(),
-                    Filter::Bound(
-                        vec!["a".to_string(), "b".to_string()],
-                        Box::new(Filter::FunctionExpression(
-                            HashMap::from([(
-                                "g".to_string(),
-                                Filter::Bound(
-                                    vec!["c".to_string(), "d".to_string()],
-                                    Box::new(Filter::BinOp(
-                                        Box::new(Filter::Call("c".to_string(), None)),
-                                        BinOp::Add,
-                                        Box::new(Filter::Call("d".to_string(), None))
-                                    ))
-                                )
-                            )]),
-                            Box::new(Filter::Hole)
-                        ))
-                    )
-                )]),
-                Box::new(Filter::Hole)
-            )
-        );
-    }
-
-    #[test]
-    fn test_incomplete_nested_function_expression3() {
-        let code = r#"
-            (def f(a; b): 
-                def g(c; d):
-                    c + d;
-                e + f;
-            )
-
-        "#;
-
-        let (defs, filter) = parse(code);
-
-        assert!(defs.is_empty());
-        assert_eq!(
-            filter,
-            Filter::FunctionExpression(
-                HashMap::from([(
-                    "f".to_string(),
-                    Filter::Bound(
-                        vec!["a".to_string(), "b".to_string()],
-                        Box::new(Filter::FunctionExpression(
-                            HashMap::from([(
-                                "g".to_string(),
-                                Filter::Bound(
-                                    vec!["c".to_string(), "d".to_string()],
-                                    Box::new(Filter::BinOp(
-                                        Box::new(Filter::Call("c".to_string(), None)),
-                                        BinOp::Add,
-                                        Box::new(Filter::Call("d".to_string(), None))
-                                    ))
-                                )
-                            )]),
-                            Box::new(Filter::BinOp(
-                                Box::new(Filter::Call("e".to_string(), None)),
-                                BinOp::Add,
-                                Box::new(Filter::Call("f".to_string(), None))
-                            ))
-                        ))
-                    )
-                )]),
-                Box::new(Filter::Hole)
-            )
-        );
-    }
-
-    #[test]
-    fn test_incomplete_if_then_else() {
-        let code = r#"
-            if true then
-                1
-            else  ?? end
-            
-        "#;
-
-        let (defs, filter) = parse(code);
-
-        assert!(defs.is_empty());
-        assert_eq!(
-            filter,
-            Filter::IfThenElse(
-                Box::new(Filter::Boolean(true)),
-                Box::new(Filter::Number(1.0)),
-                Box::new(Filter::Hole)
-            )
-        );
-    }
-
-    #[test]
-    fn test_incomplete_if_then_else2() {
-        let code = r#"
-            if true then
-                1
-        "#;
-
-        let (defs, filter) = parse(code);
-
-        assert!(defs.is_empty());
-        assert_eq!(
-            filter,
-            Filter::IfThenElse(
-                Box::new(Filter::Boolean(true)),
-                Box::new(Filter::Number(1.0)),
-                Box::new(Filter::Hole)
-            )
-        );
-    }
-
-    #[test]
-    fn test_incomplete_if_then_else3() {
-        let code = r#"
-            if true then end
-        "#;
-
-        let (defs, filter) = parse(code);
-
-        assert!(defs.is_empty());
-        assert_eq!(
-            filter,
-            Filter::IfThenElse(
-                Box::new(Filter::Boolean(true)),
-                Box::new(Filter::Hole),
-                Box::new(Filter::Hole)
-            )
-        );
-    }
-
-    #[test]
-    fn test_incomplete_if_then_else4() {
-        let code = r#"
-            if true 
-        "#;
-
-        let (defs, filter) = parse(code);
-
-        assert!(defs.is_empty());
-        assert_eq!(
-            filter,
-            Filter::IfThenElse(
-                Box::new(Filter::Boolean(true)),
-                Box::new(Filter::Hole),
-                Box::new(Filter::Hole)
-            )
-        );
-    }
-
-    #[test]
-    fn test_incomplete_if_then_else5() {
-        let code = r#"
-            if
-        "#;
-
-        let (defs, filter) = parse(code);
-
-        assert!(defs.is_empty());
-        assert_eq!(
-            filter,
-            Filter::IfThenElse(
-                Box::new(Filter::Hole),
-                Box::new(Filter::Hole),
-                Box::new(Filter::Hole)
-            )
-        );
-    }
-
-    #[test]
-    fn test_hole_token() {
-        let code = r#" . | ?? "#;
-
-        let (defs, filter) = parse(code);
-        assert!(defs.is_empty());
-        assert_eq!(
-            filter,
-            Filter::Pipe(Box::new(Filter::Dot), Box::new(Filter::Hole))
-        );
-    }
-    #[test]
-    fn test_reduce_expression() {
-        let code = r#"
-            reduce .[] as $item ( 0; . + 1 )
-        "#;
-
-        let (defs, filter) = parse(code);
-
-        assert!(defs.is_empty());
-        assert_eq!(
-            filter,
-            Filter::ReduceExpression(
-                "item".to_string(),
-                Box::new(Filter::ArrayIterator),
-                Box::new(Filter::Number(0.0)),
-                Box::new(Filter::BinOp(
-                    Box::new(Filter::Dot),
-                    BinOp::Add,
-                    Box::new(Filter::Number(1.0))
-                ))
-            )
-        );
-    }
-    #[test]
-
-    fn test_incomplete_unop() {}
-
-    #[test]
-    fn test_incomplete_reduce() {
-        let code = r#"
-            reduce .[] as $item 
-        "#;
-
-        let (defs, filter) = parse(code);
-
-        assert!(defs.is_empty());
-        assert_eq!(
-            filter,
-            Filter::ReduceExpression(
-                "item".to_string(),
-                Box::new(Filter::Number(0.0)),
-                Box::new(Filter::Hole),
-                Box::new(Filter::Hole)
-            )
-        );
-    }
-
-    #[test]
-    fn test_incomplete_reduce2() {
-        let code = r#"
-            reduce  (;  . + 1 )
-        "#;
-
-        let (defs, filter) = parse(code);
-
-        assert!(defs.is_empty());
-        assert_eq!(
-            filter,
-            Filter::ReduceExpression(
-                "".to_string(),
-                Box::new(Filter::Hole),
-                Box::new(Filter::Hole),
-                Box::new(Filter::BinOp(
-                    Box::new(Filter::Dot),
-                    BinOp::Add,
-                    Box::new(Filter::Number(1.0))
-                )),
-            )
-        );
-    }
-
-    #[test]
-    fn test_incomplete_reduce3() {
-        let code = r#"reduce .[] as $item (  )"#;
-        let expected = r#"reduce .[] as $item (??; ??)"#;
-
-        let (_, filter) = parse(code);
-        let (_, expected) = parse(expected);
-        //TODO check this (incomplete?)
-        assert_eq!(filter, expected);
-    }
-
-    #[test]
-
-    fn test_incomplete_binding() {
-        let code = r#"
-            . as 
-        "#;
-
-        let (defs, filter) = parse(code);
-
-        assert!(defs.is_empty());
-        assert_eq!(
-            filter,
-            Filter::BindingExpression(Box::new(Filter::Dot), Box::new(Filter::Hole))
-        );
-    }
-
-    #[test]
-
-    fn test_incomplete_binding2() {
-        let code = r#"
-            as $item 
-        "#;
-
-        let (defs, filter) = parse(code);
-
-        assert!(defs.is_empty());
-        assert_eq!(
-            filter,
-            Filter::BindingExpression(Box::new(Filter::Hole), Box::new(Filter::Hole))
-        );
-    }
-
-    #[test]
-    fn test_incomplete_array() {
-        let code = r#"
-            [1,2,3,4
-        "#;
-
-        let (defs, filter) = parse(code);
-
-        assert!(defs.is_empty());
-        assert_eq!(
-            filter,
-            Filter::Array(vec![
-                Filter::Number(1.0),
-                Filter::Number(2.0),
-                Filter::Number(3.0),
-                Filter::Number(4.0),
-            ])
-        );
-    }
-
-    #[test]
-    fn test_call_expression() {
-        let code = r#"
-            add(1; 2)
-        "#;
-
-        let (defs, filter) = parse(code);
-
-        assert!(defs.is_empty());
-        assert_eq!(
-            filter,
-            Filter::Call(
-                "add".to_string(),
-                Some(vec![Filter::Number(1.0), Filter::Number(2.0)])
-            )
-        );
-    }
-
-    #[test]
-    fn test_incomplete_call_expression() {
-        let code = r#"
-            add(1; )
-        "#;
-
-        let (defs, filter) = parse(code);
-
-        assert!(defs.is_empty());
-        assert_eq!(
-            filter,
-            Filter::Call(
-                "add".to_string(),
-                Some(vec![Filter::Number(1.0), Filter::Hole])
-            )
-        );
-    }
-    #[test]
-    fn test_incomplete_call_expression2() {
-        let code = r#"
-            add(; 1)
-        "#;
-
-        let (defs, filter) = parse(code);
-
-        assert!(defs.is_empty());
-        assert_eq!(
-            filter,
-            Filter::Call(
-                "add".to_string(),
-                Some(vec![Filter::Hole, Filter::Number(1.0)])
-            )
-        );
-    }
-
-    #[test]
-    fn test_subscript_expression() {
-        let code = r#"
-           . | .[2]
-        "#;
-
-        let (defs, filter) = parse(code);
-        assert!(defs.is_empty());
-        assert_eq!(
-            filter,
-            Filter::Pipe(Box::new(Filter::Dot), Box::new(Filter::ArrayIndex(2)))
-        );
-    }
-    // #[test]
-    // fn test_array_slice() {
-    //     let code = r#"
-    //         .[1:3]
-    //     "#;
-
-    //     let (defs, filter) = parse(code);
-    //     assert!(defs.is_empty());
-    //     assert_eq!(
-    //         filter,
-    //         Filter::SliceExpression(1, 3)
-    //     );
-    // }
-    #[test]
-    fn test_incomplete_unary_expression() {
-        let code = r#"-"#;
-
-        let (defs, filter) = parse(code);
-
-        assert!(defs.is_empty());
-        assert_eq!(filter, Filter::UnOp(UnOp::Neg, Box::new(Filter::Hole)));
-    }
-
-    #[test]
-    fn test_incomplete_object() {
-        let code = r#"{"name": "john", "age":"#;
-
-        let (defs, filter) = parse(code);
-
-        assert!(defs.is_empty());
-        assert_eq!(
-            filter,
-            Filter::Object(vec![
-                (
-                    Filter::String("name".to_string()),
-                    Filter::String("john".to_string())
-                ),
-                (Filter::String("age".to_string()), Filter::Hole)
-            ])
-        );
-    }
-
-    #[test]
-    fn test_incomplete_object_key() {
-        let code = r#"{: "value"}"#;
-
-        let (defs, filter) = parse(code);
-
-        assert!(defs.is_empty());
-        assert_eq!(
-            filter,
-            Filter::Object(vec![(Filter::Hole, Filter::String("value".to_string()))])
-        );
-    }
-
-    #[test]
-    fn test_incomplete_parenthesized() {
-        let code = r#"("#;
-
-        let (defs, filter) = parse(code);
-
-        assert!(defs.is_empty());
-        assert_eq!(filter, Filter::Hole);
-    }
-
-    #[test]
-    fn test_incomplete_parenthesized_with_content() {
-        let code = r#"(1 + "#;
-
-        let (defs, filter) = parse(code);
-
-        assert!(defs.is_empty());
-        assert_eq!(
-            filter,
-            Filter::BinOp(
-                Box::new(Filter::Number(1.0)),
-                BinOp::Add,
-                Box::new(Filter::Hole)
-            )
-        );
-    }
-    #[test]
-    fn test_incomplete_subscript() {
-        let code = r#".[1"#;
-
-        let (defs, filter) = parse(code);
-        //TODO : determine the output
-        assert!(defs.is_empty());
-        // This should handle incomplete array access
-        assert_eq!(filter, Filter::ArrayIndex(1));
-    }
-
-    // #[test]
-    // fn test_incomplete_try_catch() {
-    //     let code = r#"try"#;
-
-    //     let (defs, filter) = parse(code);
-
-    //     assert!(defs.is_empty());
-    //     // This should parse as a try expression with missing body
-    //     assert_eq!(
-    //         filter,
-    //         Filter::TryExpression(Box::new(Filter::Hole), None)
-    //     );
-    // }
-
-    // #[test]
-    // fn test_incomplete_try2() {
-    //     let code = r#"try .foo catch"#;
-
-    //     let (defs, filter) = parse(code);
-
-    //     assert!(defs.is_empty());
-    //     assert_eq!(
-    //         filter,
-    //         Filter::TryExpression(
-    //             Box::new(Filter::ObjIndex("foo".to_string())),
-    //             Some(Box::new(Filter::Hole))
-    //         )
-    //     );
-    // }
-
-    #[test]
-    fn test_multiple_incomplete_pipes() {
-        let code = r#". | | ."#;
-
-        let (defs, filter) = parse(code);
-
-        assert!(defs.is_empty());
-        assert_eq!(
-            filter,
-            Filter::Pipe(
-                Box::new(Filter::Dot),
-                Box::new(Filter::Pipe(Box::new(Filter::Hole), Box::new(Filter::Dot)))
-            )
-        );
-    }
-
-    #[test]
-    fn test_incomplete_sequence() {
-        let code = r#"1, 2,"#;
-        let expected = r#"1, 2, ??"#;
-        let (_, filter) = parse(code);
-        let (_, expected) = parse(expected);
-        //TODO check this (incomplete?)
-        assert_eq!(filter, expected);
-    }
-
-    #[test]
-    fn test_incomplete_nested_arrays() {
-        let code = r#"[[1, 2], [3,"#;
-
-        let (defs, filter) = parse(code);
-
-        assert!(defs.is_empty());
-        assert_eq!(
-            filter,
-            Filter::Array(vec![
-                Filter::Array(vec![Filter::Number(1.0), Filter::Number(2.0)]),
-                Filter::Array(vec![Filter::Number(3.0), Filter::Hole])
-            ])
-        );
-    }
-
-    #[test]
-    fn test_incomplete_variable_reference() {
-        let code = r#"$"#;
-
-        let (defs, filter) = parse(code);
-
-        assert!(defs.is_empty());
-        assert_eq!(filter, Filter::Variable("".to_string()));
-    }
-
-    // #[test]
-    // fn test_incomplete_assignment() {
-    //     let code = r#".foo ="#;
-
-    //     let (defs, filter) = parse(code);
-
-    //     assert!(defs.is_empty());
-    //     assert_eq!(
-    //         filter,
-    //         Filter::AssignmentExpression(
-    //             Box::new(Filter::ObjIndex("foo".to_string())),
-    //             "=".to_string(),
-    //             Box::new(Filter::Hole)
-    //         )
-    //     );
-    // }
-
-    #[test]
-    fn test_incomplete_optional_operator() {
-        let code = r#".foo?"#;
-
-        let (defs, filter) = parse(code);
-        // TODO check !
-        assert!(defs.is_empty());
-        assert_eq!(filter, Filter::ObjIndex("foo".to_string()),);
-    }
-
-    #[test]
-    fn test_if_expression2() {
-        let code = r#"
-            if true then
-                1
-            elif 3>2 then
-                2
-            
-            end
-        "#;
-
-        let (defs, filter) = parse(code);
-
-        assert!(defs.is_empty());
-    }
-
-    #[test]
-    fn test_if_expression3() {
-        let code = r#"
-            if true then
-                1
-
-            end
-        "#;
-
-        let (defs, filter) = parse(code);
-
-        assert!(defs.is_empty());
-    }
-
-    #[test]
-    fn test_if_expression4() {
-        let code = r#"
-            if true then
-                1
-        "#;
-
-        let (defs, filter) = parse(code);
-
-        assert!(defs.is_empty());
-    }
 }
+
+//     #[test]
+//     fn test_parse() {
+//         let code = r#"
+//             def add(a; b): a + b;
+//             add(1; 2)
+//         "#;
+
+//         let (defs, filter) = parse(code);
+
+//         assert_eq!(
+//             defs.get("add").unwrap().clone(),
+//             Filter::Bound(
+//                 vec!["a".to_string(), "b".to_string()],
+//                 Box::new(Filter::BinOp(
+//                     Box::new(Filter::Call("a".to_string(), None)),
+//                     BinOp::Add,
+//                     Box::new(Filter::Call("b".to_string(), None))
+//                 ))
+//             )
+//         );
+
+//         assert_eq!(
+//             filter,
+//             Filter::Call(
+//                 "add".to_string(),
+//                 Some(vec![Filter::Number(1.0), Filter::Number(2.0)])
+//             )
+//         );
+//     }
+
+//     #[test]
+//     fn test_parse_filter() {
+//         let code = r#"
+//             1 + 2
+//         "#;
+
+//         let (defs, filter) = parse(code);
+
+//         assert_eq!(defs, HashMap::new());
+
+//         assert_eq!(
+//             filter,
+//             Filter::BinOp(
+//                 Box::new(Filter::Number(1.0)),
+//                 BinOp::Add,
+//                 Box::new(Filter::Number(2.0))
+//             )
+//         );
+//     }
+
+//     #[test]
+//     fn test_parse_function_definition() {
+//         let code = r#"
+//             (def f:  .[] ;  .) | f
+//         "#;
+//         let (defs, filter) = parse(code);
+//         assert!(defs.is_empty());
+//         assert_eq!(
+//             filter,
+//             Filter::Pipe(
+//                 Box::new(Filter::FunctionExpression(
+//                     HashMap::from([(
+//                         "f".to_string(),
+//                         Filter::Bound(vec![], Box::new(Filter::ArrayIterator))
+//                     )]),
+//                     Box::new(Filter::Dot)
+//                 )),
+//                 Box::new(Filter::Call("f".to_string(), None))
+//             )
+//         );
+//     }
+
+//     #[test]
+//     fn test_parse_variable() {
+//         let code = r#"
+//             def main:
+//                 def add(a; b): a + b;
+//                 def sub(a; b): a - b;
+//                 def mul(a; b): a * b;
+//                 add(1; 2);
+//             sub(3; 1)
+//         "#;
+//         let (defs, filter) = parse(code);
+//         assert_eq!(
+//             defs.get("main").unwrap().clone(),
+//             Filter::Bound(
+//                 vec![],
+//                 Box::new(Filter::FunctionExpression(
+//                     HashMap::from([
+//                         (
+//                             "add".to_string(),
+//                             Filter::Bound(
+//                                 vec!["a".to_string(), "b".to_string()],
+//                                 Box::new(Filter::BinOp(
+//                                     Box::new(Filter::Call("a".to_string(), None)),
+//                                     BinOp::Add,
+//                                     Box::new(Filter::Call("b".to_string(), None))
+//                                 ))
+//                             )
+//                         ),
+//                         (
+//                             "sub".to_string(),
+//                             Filter::Bound(
+//                                 vec!["a".to_string(), "b".to_string()],
+//                                 Box::new(Filter::BinOp(
+//                                     Box::new(Filter::Call("a".to_string(), None)),
+//                                     BinOp::Sub,
+//                                     Box::new(Filter::Call("b".to_string(), None))
+//                                 ))
+//                             )
+//                         ),
+//                         (
+//                             "mul".to_string(),
+//                             Filter::Bound(
+//                                 vec!["a".to_string(), "b".to_string()],
+//                                 Box::new(Filter::BinOp(
+//                                     Box::new(Filter::Call("a".to_string(), None)),
+//                                     BinOp::Mul,
+//                                     Box::new(Filter::Call("b".to_string(), None))
+//                                 ))
+//                             )
+//                         ),
+//                     ]),
+//                     Box::new(Filter::Call(
+//                         "add".to_string(),
+//                         Some(vec![Filter::Number(1.0), Filter::Number(2.0)])
+//                     ))
+//                 ))
+//             )
+//         );
+//         assert_eq!(
+//             filter,
+//             Filter::Call(
+//                 "sub".to_string(),
+//                 Some(vec![Filter::Number(3.0), Filter::Number(1.0)])
+//             )
+//         );
+//     }
+//     #[test]
+//     fn test_if_expression() {
+//         let code = r#"
+//             if true then
+//                 1
+//             else
+//                 2
+//                 end
+//         "#;
+
+//         let (defs, filter) = parse(code);
+
+//         assert!(defs.is_empty());
+//         assert_eq!(
+//             filter,
+//             Filter::IfThenElse(
+//                 Box::new(Filter::Boolean(true)),
+//                 Box::new(Filter::Number(1.0)),
+//                 Box::new(Filter::Number(2.0))
+//             )
+//         );
+//     }
+
+//     #[test]
+//     fn test_binding_expression() {
+//         let code = r#"
+//            . as $item 
+//         "#;
+//         let (defs, filter) = parse(code);
+
+//         assert_eq!(
+//             filter,
+//             Filter::BindingExpression(
+//                 Box::new(Filter::Dot),
+//                 Box::new(Filter::Variable("item".to_string()))
+//             )
+//         );
+//     }
+
+//     #[test]
+//     fn test_binding_expression2() {
+//         let code = r#"
+//            1 as $item  | $item
+//         "#;
+//         let (defs, filter) = parse(code);
+
+//         assert_eq!(
+//             filter,
+//             Filter::Pipe(
+//                 (Box::new(Filter::BindingExpression(
+//                     Box::new(Filter::Number(1.0)),
+//                     Box::new(Filter::Variable("item".to_string()))
+//                 ))),
+//                 Box::new(Filter::Variable("item".to_string()),)
+//             )
+//         );
+//     }
+
+//     #[test]
+//     fn test_binding_expression3() {
+//         let code = r#"
+//            [1,2,3] as $item  | $item
+//         "#;
+//         let (defs, filter) = parse(code);
+
+//         assert_eq!(
+//             filter,
+//             Filter::Pipe(
+//                 (Box::new(Filter::BindingExpression(
+//                     Box::new(Filter::Array(vec![
+//                         Filter::Number(1.0),
+//                         Filter::Number(2.0),
+//                         Filter::Number(3.0)
+//                     ])),
+//                     Box::new(Filter::Variable("item".to_string()))
+//                 ))),
+//                 Box::new(Filter::Variable("item".to_string()),)
+//             )
+//         );
+//     }
+
+//     #[test]
+//     fn test_incomplete_binop() {
+//         let code = r#"1 + "#;
+
+//         let (defs, filter) = parse(code);
+
+//         assert!(defs.is_empty());
+//         assert_eq!(
+//             filter,
+//             Filter::BinOp(
+//                 Box::new(Filter::Number(1.0)),
+//                 BinOp::Add,
+//                 Box::new(Filter::Hole)
+//             )
+//         );
+//     }
+
+//     #[test]
+//     fn test_incomplete_binop2() {
+//         let code = r#"1 == "#;
+
+//         let (defs, filter) = parse(code);
+
+//         assert!(defs.is_empty());
+//         assert_eq!(
+//             filter,
+//             Filter::BinOp(
+//                 Box::new(Filter::Number(1.0)),
+//                 BinOp::Eq,
+//                 Box::new(Filter::Hole)
+//             )
+//         );
+//     }
+
+//     #[test]
+//     fn test_incomplete_pipe() {
+//         let _ = tracing_subscriber::fmt()
+//             .with_target(false)
+//             .with_thread_ids(false)
+//             .with_thread_names(false)
+//             .with_file(true)
+//             .with_line_number(true)
+//             .with_level(true)
+//             .without_time()
+//             .with_env_filter(EnvFilter::from_default_env())
+//             .try_init();
+//         let code = r#"1 | "#;
+//         let inferred = r#"1 | ??"#;
+
+//         let (_, filter) = parse(code);
+//         let (_, expected) = parse(inferred);
+//         assert_eq!(filter, expected);
+//     }
+
+//     #[test]
+//     fn test_incomplete_pipe2() {
+//         let code = r#" ?? | 1 "#;
+
+//         let (defs, filter) = parse(code);
+
+//         assert!(defs.is_empty());
+//         assert_eq!(
+//             filter,
+//             Filter::Pipe(Box::new(Filter::Hole), Box::new(Filter::Number(1.0)))
+//         );
+//     }
+
+//     #[test]
+//     fn test_incomplete_comma() {
+//         let code = r#"1, "#;
+
+//         let (defs, filter) = parse(code);
+
+//         assert!(defs.is_empty());
+//         assert_eq!(
+//             filter,
+//             Filter::Comma(Box::new(Filter::Number(1.0)), Box::new(Filter::Hole))
+//         );
+//     }
+
+//     #[test]
+//     fn test_abs() {
+//         let (_, filter) = parse("if . < 0 then - . end");
+//         assert_eq!(
+//             filter,
+//             Filter::IfThenElse(
+//                 Box::new(Filter::BinOp(
+//                     Box::new(Filter::Dot),
+//                     BinOp::Lt,
+//                     Box::new(Filter::Number(0.0))
+//                 )),
+//                 Box::new(Filter::UnOp(UnOp::Neg, Box::new(Filter::Dot))),
+//                 Box::new(Filter::Dot)
+//             )
+//         );
+//     }
+
+//     #[test]
+//     fn test_incomplete_function_definition() {
+//         let code = r#"
+//             def f(a; b):
+//         "#;
+
+//         let (defs, filter) = parse(code);
+
+//         assert_eq!(
+//             defs.get("f"),
+//             Some(&Filter::Bound(
+//                 vec!["a".to_string(), "b".to_string()],
+//                 Box::new(Filter::Hole)
+//             ))
+//         );
+//         assert_eq!(filter, Filter::Hole);
+//     }
+
+//     #[test]
+//     fn test_incomplete_function_definition2() {
+//         let code = r#"
+//             def f(a; b):
+//                 a*b
+//         "#;
+
+//         let (defs, filter) = parse(code);
+
+//         assert_eq!(
+//             defs.get("f"),
+//             Some(&Filter::Bound(
+//                 vec!["a".to_string(), "b".to_string()],
+//                 Box::new(Filter::BinOp(
+//                     Box::new(Filter::Call("a".to_string(), None)),
+//                     BinOp::Mul,
+//                     Box::new(Filter::Call("b".to_string(), None))
+//                 ))
+//             ))
+//         );
+//         // assert_eq!(filter, Filter::Hole);
+//         //check this!
+//     }
+
+//     #[test]
+//     fn test_incomplete_function_expression() {
+//         let code = r#"
+//             (def f(a; b): a + b; )
+//         "#;
+
+//         let (defs, filter) = parse(code);
+
+//         assert!(defs.is_empty());
+//         assert_eq!(
+//             filter,
+//             Filter::FunctionExpression(
+//                 HashMap::from([(
+//                     "f".to_string(),
+//                     Filter::Bound(
+//                         vec!["a".to_string(), "b".to_string()],
+//                         Box::new(Filter::BinOp(
+//                             Box::new(Filter::Call("a".to_string(), None)),
+//                             BinOp::Add,
+//                             Box::new(Filter::Call("b".to_string(), None))
+//                         ))
+//                     )
+//                 )]),
+//                 Box::new(Filter::Hole)
+//             )
+//         );
+//     }
+
+//     #[test]
+//     fn test_incomplete_nested_function_expression() {
+//         let code = r#"
+//             (def f(a; b): 
+//                 def g(c; d):
+//             )
+
+//         "#;
+
+//         let (defs, filter) = parse(code);
+
+//         assert!(defs.is_empty());
+//         assert_eq!(
+//             filter,
+//             Filter::FunctionExpression(
+//                 HashMap::from([(
+//                     "f".to_string(),
+//                     Filter::Bound(
+//                         vec!["a".to_string(), "b".to_string()],
+//                         Box::new(Filter::FunctionExpression(
+//                             HashMap::from([(
+//                                 "g".to_string(),
+//                                 Filter::Bound(
+//                                     vec!["c".to_string(), "d".to_string()],
+//                                     Box::new(Filter::Hole)
+//                                 )
+//                             )]),
+//                             Box::new(Filter::Hole)
+//                         ))
+//                     )
+//                 )]),
+//                 Box::new(Filter::Hole)
+//             )
+//         );
+//     }
+
+//     #[test]
+//     fn test_incomplete_nested_function_expression2() {
+//         let code = r#"
+//             (def f(a; b): 
+//                 def g(c; d):
+//                     c + d;
+//             )
+
+//         "#;
+
+//         let (defs, filter) = parse(code);
+
+//         assert!(defs.is_empty());
+//         assert_eq!(
+//             filter,
+//             Filter::FunctionExpression(
+//                 HashMap::from([(
+//                     "f".to_string(),
+//                     Filter::Bound(
+//                         vec!["a".to_string(), "b".to_string()],
+//                         Box::new(Filter::FunctionExpression(
+//                             HashMap::from([(
+//                                 "g".to_string(),
+//                                 Filter::Bound(
+//                                     vec!["c".to_string(), "d".to_string()],
+//                                     Box::new(Filter::BinOp(
+//                                         Box::new(Filter::Call("c".to_string(), None)),
+//                                         BinOp::Add,
+//                                         Box::new(Filter::Call("d".to_string(), None))
+//                                     ))
+//                                 )
+//                             )]),
+//                             Box::new(Filter::Hole)
+//                         ))
+//                     )
+//                 )]),
+//                 Box::new(Filter::Hole)
+//             )
+//         );
+//     }
+
+//     #[test]
+//     fn test_incomplete_nested_function_expression3() {
+//         let code = r#"
+//             (def f(a; b): 
+//                 def g(c; d):
+//                     c + d;
+//                 e + f;
+//             )
+
+//         "#;
+
+//         let (defs, filter) = parse(code);
+
+//         assert!(defs.is_empty());
+//         assert_eq!(
+//             filter,
+//             Filter::FunctionExpression(
+//                 HashMap::from([(
+//                     "f".to_string(),
+//                     Filter::Bound(
+//                         vec!["a".to_string(), "b".to_string()],
+//                         Box::new(Filter::FunctionExpression(
+//                             HashMap::from([(
+//                                 "g".to_string(),
+//                                 Filter::Bound(
+//                                     vec!["c".to_string(), "d".to_string()],
+//                                     Box::new(Filter::BinOp(
+//                                         Box::new(Filter::Call("c".to_string(), None)),
+//                                         BinOp::Add,
+//                                         Box::new(Filter::Call("d".to_string(), None))
+//                                     ))
+//                                 )
+//                             )]),
+//                             Box::new(Filter::BinOp(
+//                                 Box::new(Filter::Call("e".to_string(), None)),
+//                                 BinOp::Add,
+//                                 Box::new(Filter::Call("f".to_string(), None))
+//                             ))
+//                         ))
+//                     )
+//                 )]),
+//                 Box::new(Filter::Hole)
+//             )
+//         );
+//     }
+
+//     #[test]
+//     fn test_incomplete_if_then_else() {
+//         let code = r#"
+//             if true then
+//                 1
+//             else  ?? end
+            
+//         "#;
+
+//         let (defs, filter) = parse(code);
+
+//         assert!(defs.is_empty());
+//         assert_eq!(
+//             filter,
+//             Filter::IfThenElse(
+//                 Box::new(Filter::Boolean(true)),
+//                 Box::new(Filter::Number(1.0)),
+//                 Box::new(Filter::Hole)
+//             )
+//         );
+//     }
+
+//     #[test]
+//     fn test_incomplete_if_then_else2() {
+//         let code = r#"
+//             if true then
+//                 1
+//         "#;
+
+//         let (defs, filter) = parse(code);
+
+//         assert!(defs.is_empty());
+//         assert_eq!(
+//             filter,
+//             Filter::IfThenElse(
+//                 Box::new(Filter::Boolean(true)),
+//                 Box::new(Filter::Number(1.0)),
+//                 Box::new(Filter::Hole)
+//             )
+//         );
+//     }
+
+//     #[test]
+//     fn test_incomplete_if_then_else3() {
+//         let code = r#"
+//             if true then end
+//         "#;
+
+//         let (defs, filter) = parse(code);
+
+//         assert!(defs.is_empty());
+//         assert_eq!(
+//             filter,
+//             Filter::IfThenElse(
+//                 Box::new(Filter::Boolean(true)),
+//                 Box::new(Filter::Hole),
+//                 Box::new(Filter::Hole)
+//             )
+//         );
+//     }
+
+//     #[test]
+//     fn test_incomplete_if_then_else4() {
+//         let code = r#"
+//             if true 
+//         "#;
+
+//         let (defs, filter) = parse(code);
+
+//         assert!(defs.is_empty());
+//         assert_eq!(
+//             filter,
+//             Filter::IfThenElse(
+//                 Box::new(Filter::Boolean(true)),
+//                 Box::new(Filter::Hole),
+//                 Box::new(Filter::Hole)
+//             )
+//         );
+//     }
+
+//     #[test]
+//     fn test_incomplete_if_then_else5() {
+//         let code = r#"
+//             if
+//         "#;
+
+//         let (defs, filter) = parse(code);
+
+//         assert!(defs.is_empty());
+//         assert_eq!(
+//             filter,
+//             Filter::IfThenElse(
+//                 Box::new(Filter::Hole),
+//                 Box::new(Filter::Hole),
+//                 Box::new(Filter::Hole)
+//             )
+//         );
+//     }
+
+//     #[test]
+//     fn test_hole_token() {
+//         let code = r#" . | ?? "#;
+
+//         let (defs, filter) = parse(code);
+//         assert!(defs.is_empty());
+//         assert_eq!(
+//             filter,
+//             Filter::Pipe(Box::new(Filter::Dot), Box::new(Filter::Hole))
+//         );
+//     }
+//     #[test]
+//     fn test_reduce_expression() {
+//         let code = r#"
+//             reduce .[] as $item ( 0; . + 1 )
+//         "#;
+
+//         let (defs, filter) = parse(code);
+
+//         assert!(defs.is_empty());
+//         assert_eq!(
+//             filter,
+//             Filter::ReduceExpression(
+//                 "item".to_string(),
+//                 Box::new(Filter::ArrayIterator),
+//                 Box::new(Filter::Number(0.0)),
+//                 Box::new(Filter::BinOp(
+//                     Box::new(Filter::Dot),
+//                     BinOp::Add,
+//                     Box::new(Filter::Number(1.0))
+//                 ))
+//             )
+//         );
+//     }
+//     #[test]
+
+//     fn test_incomplete_unop() {}
+
+//     #[test]
+//     fn test_incomplete_reduce() {
+//         let code = r#"
+//             reduce .[] as $item 
+//         "#;
+
+//         let (defs, filter) = parse(code);
+
+//         assert!(defs.is_empty());
+//         assert_eq!(
+//             filter,
+//             Filter::ReduceExpression(
+//                 "item".to_string(),
+//                 Box::new(Filter::Number(0.0)),
+//                 Box::new(Filter::Hole),
+//                 Box::new(Filter::Hole)
+//             )
+//         );
+//     }
+
+//     #[test]
+//     fn test_incomplete_reduce2() {
+//         let code = r#"
+//             reduce  (;  . + 1 )
+//         "#;
+
+//         let (defs, filter) = parse(code);
+
+//         assert!(defs.is_empty());
+//         assert_eq!(
+//             filter,
+//             Filter::ReduceExpression(
+//                 "".to_string(),
+//                 Box::new(Filter::Hole),
+//                 Box::new(Filter::Hole),
+//                 Box::new(Filter::BinOp(
+//                     Box::new(Filter::Dot),
+//                     BinOp::Add,
+//                     Box::new(Filter::Number(1.0))
+//                 )),
+//             )
+//         );
+//     }
+
+//     #[test]
+//     fn test_incomplete_reduce3() {
+//         let code = r#"reduce .[] as $item (  )"#;
+//         let expected = r#"reduce .[] as $item (??; ??)"#;
+
+//         let (_, filter) = parse(code);
+//         let (_, expected) = parse(expected);
+//         //TODO check this (incomplete?)
+//         assert_eq!(filter, expected);
+//     }
+
+//     #[test]
+
+//     fn test_incomplete_binding() {
+//         let code = r#"
+//             . as 
+//         "#;
+
+//         let (defs, filter) = parse(code);
+
+//         assert!(defs.is_empty());
+//         assert_eq!(
+//             filter,
+//             Filter::BindingExpression(Box::new(Filter::Dot), Box::new(Filter::Hole))
+//         );
+//     }
+
+//     #[test]
+
+//     fn test_incomplete_binding2() {
+//         let code = r#"
+//             as $item 
+//         "#;
+
+//         let (defs, filter) = parse(code);
+
+//         assert!(defs.is_empty());
+//         assert_eq!(
+//             filter,
+//             Filter::BindingExpression(Box::new(Filter::Hole), Box::new(Filter::Hole))
+//         );
+//     }
+
+//     #[test]
+//     fn test_incomplete_array() {
+//         let code = r#"
+//             [1,2,3,4
+//         "#;
+
+//         let (defs, filter) = parse(code);
+
+//         assert!(defs.is_empty());
+//         assert_eq!(
+//             filter,
+//             Filter::Array(vec![
+//                 Filter::Number(1.0),
+//                 Filter::Number(2.0),
+//                 Filter::Number(3.0),
+//                 Filter::Number(4.0),
+//             ])
+//         );
+//     }
+
+//     #[test]
+//     fn test_call_expression() {
+//         let code = r#"
+//             add(1; 2)
+//         "#;
+
+//         let (defs, filter) = parse(code);
+
+//         assert!(defs.is_empty());
+//         assert_eq!(
+//             filter,
+//             Filter::Call(
+//                 "add".to_string(),
+//                 Some(vec![Filter::Number(1.0), Filter::Number(2.0)])
+//             )
+//         );
+//     }
+
+//     #[test]
+//     fn test_incomplete_call_expression() {
+//         let code = r#"
+//             add(1; )
+//         "#;
+
+//         let (defs, filter) = parse(code);
+
+//         assert!(defs.is_empty());
+//         assert_eq!(
+//             filter,
+//             Filter::Call(
+//                 "add".to_string(),
+//                 Some(vec![Filter::Number(1.0), Filter::Hole])
+//             )
+//         );
+//     }
+//     #[test]
+//     fn test_incomplete_call_expression2() {
+//         let code = r#"
+//             add(; 1)
+//         "#;
+
+//         let (defs, filter) = parse(code);
+
+//         assert!(defs.is_empty());
+//         assert_eq!(
+//             filter,
+//             Filter::Call(
+//                 "add".to_string(),
+//                 Some(vec![Filter::Hole, Filter::Number(1.0)])
+//             )
+//         );
+//     }
+
+//     #[test]
+//     fn test_subscript_expression() {
+//         let code = r#"
+//            . | .[2]
+//         "#;
+
+//         let (defs, filter) = parse(code);
+//         assert!(defs.is_empty());
+//         assert_eq!(
+//             filter,
+//             Filter::Pipe(Box::new(Filter::Dot), Box::new(Filter::ArrayIndex(2)))
+//         );
+//     }
+//     // #[test]
+//     // fn test_array_slice() {
+//     //     let code = r#"
+//     //         .[1:3]
+//     //     "#;
+
+//     //     let (defs, filter) = parse(code);
+//     //     assert!(defs.is_empty());
+//     //     assert_eq!(
+//     //         filter,
+//     //         Filter::SliceExpression(1, 3)
+//     //     );
+//     // }
+//     #[test]
+//     fn test_incomplete_unary_expression() {
+//         let code = r#"-"#;
+
+//         let (defs, filter) = parse(code);
+
+//         assert!(defs.is_empty());
+//         assert_eq!(filter, Filter::UnOp(UnOp::Neg, Box::new(Filter::Hole)));
+//     }
+
+//     #[test]
+//     fn test_incomplete_object() {
+//         let code = r#"{"name": "john", "age":"#;
+
+//         let (defs, filter) = parse(code);
+
+//         assert!(defs.is_empty());
+//         assert_eq!(
+//             filter,
+//             Filter::Object(vec![
+//                 (
+//                     Filter::String("name".to_string()),
+//                     Filter::String("john".to_string())
+//                 ),
+//                 (Filter::String("age".to_string()), Filter::Hole)
+//             ])
+//         );
+//     }
+
+//     #[test]
+//     fn test_incomplete_object_key() {
+//         let code = r#"{: "value"}"#;
+
+//         let (defs, filter) = parse(code);
+
+//         assert!(defs.is_empty());
+//         assert_eq!(
+//             filter,
+//             Filter::Object(vec![(Filter::Hole, Filter::String("value".to_string()))])
+//         );
+//     }
+
+//     #[test]
+//     fn test_incomplete_parenthesized() {
+//         let code = r#"("#;
+
+//         let (defs, filter) = parse(code);
+
+//         assert!(defs.is_empty());
+//         assert_eq!(filter, Filter::Hole);
+//     }
+
+//     #[test]
+//     fn test_incomplete_parenthesized_with_content() {
+//         let code = r#"(1 + "#;
+
+//         let (defs, filter) = parse(code);
+
+//         assert!(defs.is_empty());
+//         assert_eq!(
+//             filter,
+//             Filter::BinOp(
+//                 Box::new(Filter::Number(1.0)),
+//                 BinOp::Add,
+//                 Box::new(Filter::Hole)
+//             )
+//         );
+//     }
+//     #[test]
+//     fn test_incomplete_subscript() {
+//         let code = r#".[1"#;
+
+//         let (defs, filter) = parse(code);
+//         //TODO : determine the output
+//         assert!(defs.is_empty());
+//         // This should handle incomplete array access
+//         assert_eq!(filter, Filter::ArrayIndex(1));
+//     }
+
+//     // #[test]
+//     // fn test_incomplete_try_catch() {
+//     //     let code = r#"try"#;
+
+//     //     let (defs, filter) = parse(code);
+
+//     //     assert!(defs.is_empty());
+//     //     // This should parse as a try expression with missing body
+//     //     assert_eq!(
+//     //         filter,
+//     //         Filter::TryExpression(Box::new(Filter::Hole), None)
+//     //     );
+//     // }
+
+//     // #[test]
+//     // fn test_incomplete_try2() {
+//     //     let code = r#"try .foo catch"#;
+
+//     //     let (defs, filter) = parse(code);
+
+//     //     assert!(defs.is_empty());
+//     //     assert_eq!(
+//     //         filter,
+//     //         Filter::TryExpression(
+//     //             Box::new(Filter::ObjIndex("foo".to_string())),
+//     //             Some(Box::new(Filter::Hole))
+//     //         )
+//     //     );
+//     // }
+
+//     #[test]
+//     fn test_multiple_incomplete_pipes() {
+//         let code = r#". | | ."#;
+
+//         let (defs, filter) = parse(code);
+
+//         assert!(defs.is_empty());
+//         assert_eq!(
+//             filter,
+//             Filter::Pipe(
+//                 Box::new(Filter::Dot),
+//                 Box::new(Filter::Pipe(Box::new(Filter::Hole), Box::new(Filter::Dot)))
+//             )
+//         );
+//     }
+
+//     #[test]
+//     fn test_incomplete_sequence() {
+//         let code = r#"1, 2,"#;
+//         let expected = r#"1, 2, ??"#;
+//         let (_, filter) = parse(code);
+//         let (_, expected) = parse(expected);
+//         //TODO check this (incomplete?)
+//         assert_eq!(filter, expected);
+//     }
+
+//     #[test]
+//     fn test_incomplete_nested_arrays() {
+//         let code = r#"[[1, 2], [3,"#;
+
+//         let (defs, filter) = parse(code);
+
+//         assert!(defs.is_empty());
+//         assert_eq!(
+//             filter,
+//             Filter::Array(vec![
+//                 Filter::Array(vec![Filter::Number(1.0), Filter::Number(2.0)]),
+//                 Filter::Array(vec![Filter::Number(3.0), Filter::Hole])
+//             ])
+//         );
+//     }
+
+//     #[test]
+//     fn test_incomplete_variable_reference() {
+//         let code = r#"$"#;
+
+//         let (defs, filter) = parse(code);
+
+//         assert!(defs.is_empty());
+//         assert_eq!(filter, Filter::Variable("".to_string()));
+//     }
+
+//     // #[test]
+//     // fn test_incomplete_assignment() {
+//     //     let code = r#".foo ="#;
+
+//     //     let (defs, filter) = parse(code);
+
+//     //     assert!(defs.is_empty());
+//     //     assert_eq!(
+//     //         filter,
+//     //         Filter::AssignmentExpression(
+//     //             Box::new(Filter::ObjIndex("foo".to_string())),
+//     //             "=".to_string(),
+//     //             Box::new(Filter::Hole)
+//     //         )
+//     //     );
+//     // }
+
+//     #[test]
+//     fn test_incomplete_optional_operator() {
+//         let code = r#".foo?"#;
+
+//         let (defs, filter) = parse(code);
+//         // TODO check !
+//         assert!(defs.is_empty());
+//         assert_eq!(filter, Filter::ObjIndex("foo".to_string()),);
+//     }
+
+//     #[test]
+//     fn test_if_expression2() {
+//         let code = r#"
+//             if true then
+//                 1
+//             elif 3>2 then
+//                 2
+            
+//             end
+//         "#;
+
+//         let (defs, filter) = parse(code);
+
+//         assert!(defs.is_empty());
+//     }
+
+//     #[test]
+//     fn test_if_expression3() {
+//         let code = r#"
+//             if true then
+//                 1
+
+//             end
+//         "#;
+
+//         let (defs, filter) = parse(code);
+
+//         assert!(defs.is_empty());
+//     }
+
+//     #[test]
+//     fn test_if_expression4() {
+//         let code = r#"
+//             if true then
+//                 1
+//         "#;
+
+//         let (defs, filter) = parse(code);
+
+//         assert!(defs.is_empty());
+//     }
+// }
