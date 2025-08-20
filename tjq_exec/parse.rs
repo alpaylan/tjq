@@ -1153,4 +1153,172 @@ mod tests {
         let filter: Filter = (&cst).into();
         assert_eq!(filter, Filter::Array(vec![]));
     }
+    #[test]
+    fn test_populated_array_conversion() {
+        //todo @can : is this possible in jq? mixed types?
+
+        let elem1 = Cst::number(test_range(), "1");
+        let elem2 = Cst::number(test_range(), "2");
+        let elem3 = Cst::string(test_range(), "hello");
+        let cst = Cst::array(test_range(), vec![elem1, elem2, elem3], "[1, 2, \"hello\"]");
+        
+        let filter: Filter = (&cst).into();
+        assert_eq!(
+            filter,
+            Filter::Array(vec![
+                Filter::Number(1.0),
+                Filter::Number(2.0),
+                Filter::String("hello".to_string())
+            ])
+        );
+    }
+    #[test]
+    fn test_object_conversion() {
+        let key1 = Cst::string(test_range(), "name");
+        let val1 = Cst::string(test_range(), "John");
+        let key2 = Cst::string(test_range(), "age");
+        let val2 = Cst::number(test_range(), "30");
+        
+        let pairs = vec![(key1, val1), (key2, val2)];
+        let cst = Cst::object(test_range(), pairs, "{\"name\": \"John\", \"age\": 30}");
+        
+        let filter: Filter = (&cst).into();
+        assert_eq!(
+            filter,
+            Filter::Object(vec![
+                (Filter::String("name".to_string()), Filter::String("John".to_string())),
+                (Filter::String("age".to_string()), Filter::Number(30.0))
+            ])
+        );
+    }
+
+    #[test]
+    fn test_pipe_conversion() {
+        let lhs = Cst::dot(test_range());
+        let rhs = Cst::object_index(test_range(), "field");
+        let cst = Cst::pipe(lhs, rhs, ". | .field", test_range());
+        
+        let filter: Filter = (&cst).into();
+        assert_eq!(
+            filter,
+            Filter::Pipe(
+                Box::new(Filter::Dot),
+                Box::new(Filter::ObjIndex(Box::new(Filter::String("field".to_string())))
+            )
+        )
+        );
+    }
+    #[test]
+    fn test_binary_add_conversion() {
+        let lhs = Cst::number(test_range(), "1");
+        let rhs = Cst::number(test_range(), "2");
+        let cst = Cst::bin_op(test_range(), lhs, BinOp::Add, rhs, "1 + 2");
+        
+        let filter: Filter = (&cst).into();
+        assert_eq!(
+            filter,
+            Filter::BinOp(
+                Box::new(Filter::Number(1.0)),
+                BinOp::Add,
+                Box::new(Filter::Number(2.0))
+            )
+        );
+    }
+      #[test]
+    fn test_parse_and_convert_simple_dot() {
+        let code = ".";
+        let (_, cst) = parse(code);
+        let filter: Filter = (&cst).into();
+        assert_eq!(filter, Filter::Dot);
+    }
+    #[test]
+    fn test_parse_and_convert_number() {
+        let code = "42";
+        let (_, cst) = parse(code);
+        let filter: Filter = (&cst).into();
+        assert_eq!(filter, Filter::Number(42.0));
+    }
+     #[test]
+    fn test_parse_and_convert_string() {
+        let code = "\"hello\"";
+        let (_, cst) = parse(code);
+        let filter: Filter = (&cst).into();
+        assert_eq!(filter, Filter::String("\"hello\"".to_string()));
+    }
+    #[test]
+    fn test_parse_and_convert_binary_expression() {
+        let code = "1 + 2";
+        let (_, cst) = parse(code);
+        let filter: Filter = (&cst).into();
+        assert_eq!(
+            filter,
+            Filter::BinOp(
+                Box::new(Filter::Number(1.0)),
+                BinOp::Add,
+                Box::new(Filter::Number(2.0))
+            )
+        );
+    }
+    #[test]
+    fn test_parse_and_convert_pipe_expression() {
+        let code = ". | length";
+        let (_, cst) = parse(code);
+        let filter: Filter = (&cst).into();
+        assert_eq!(
+            filter,
+            Filter::Pipe(
+                Box::new(Filter::Dot),
+                Box::new(Filter::Call("length".to_string(), None))
+            )
+        );
+    }
+     #[test]
+    fn test_parse_and_convert_with_function_definition() {
+        let code = r#"
+            def double(x): x * 2;
+            double(5)
+        "#;
+        let (defs, main_filter) = parse(code);
+        
+        assert!(defs.contains_key("double"));
+        
+        let func_filter: Filter = defs.get("double").unwrap().into();
+        let expected_func = Filter::Bound(
+            vec!["x".to_string()],
+            Box::new(Filter::BinOp(
+                Box::new(Filter::Call("x".to_string(), None)),
+                BinOp::Mul,
+                Box::new(Filter::Number(2.0))
+            ))
+        );
+        assert_eq!(func_filter, expected_func);
+        
+       
+    }
+
+    #[test]
+    fn test_parse_and_call_function() {
+
+        //todo @can : something wrong
+        let code = r#"
+            def add(x; y): x + y;
+            add(3; 4)
+        "#;
+        let (_, cst) = parse(code);
+        let filter: Filter = (&cst).into();
+        
+        assert_eq!(
+            filter,
+            Filter::Call(
+                "add".to_string(),
+                Some(vec![
+                    Filter::Number(3.0),
+                    Filter::Number(4.0)
+                ])
+            )
+        );
+    }
 }
+
+
+
