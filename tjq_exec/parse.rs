@@ -189,8 +189,8 @@ impl From<&Cst<'_>> for Filter {
                     } else {
                         Filter::Dot
                     };
-                    
-                    // For now, we'll create a simple function expression
+                    //todo @can : utilize hashmap from nodekind and fix up here
+                   
                     Filter::FunctionExpression(HashMap::new(), Box::new(final_expr))
                 }
                 FilterKind::Bound => {
