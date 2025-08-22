@@ -49,11 +49,12 @@ fn main() {
         .expect("no expression provided, either as an argument or a file path");
 
     let (cst_defs, cst) = parse(expression.as_str());
-    let defs = HashMap::from(cst_defs.iter().map(|cst| {
-        let name = cst.children[0].value.to_string();
-        let filter = Filter::from(cst);
-        (name, filter)
-    }));
+    let mut defs = HashMap::new();
+    for (name, cst) in cst_defs {
+        let filter = (&cst).into();
+        defs.insert(name, filter);
+    }
+
     let filter = Filter::from(&cst);
 
     let json = args

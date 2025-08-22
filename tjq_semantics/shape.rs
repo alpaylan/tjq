@@ -618,122 +618,128 @@ impl Shape {
                 let s2 = Shape::build_shape(f2, shapes, ctx, filters);
                 [s1, s2].concat()
             }
-            Filter::ObjIndex(s) => shapes
-                .into_iter()
-                .map(|shape| match shape {
-                    Shape::Blob => {
-                        let new_type_var = ctx.fresh();
-                        ctx.insert(new_type_var, Shape::tvar(new_type_var));
-                        // todo: check this
-                        Shape::tvar(new_type_var)
-                    }
-                    Shape::TVar(t) => {
-                        let new_type_var = ctx.fresh();
-                        let current_shape = ctx.get(&t).unwrap().clone();
-                        // <'I> + {s: <'T>}
-                        let current_shape = Shape::merge_shapes(
-                            current_shape,
-                            Shape::Object(vec![(s.clone(), Shape::tvar(new_type_var))]),
-                            ctx,
-                        );
-                        ctx.insert(t, current_shape);
-                        ctx.insert(new_type_var, Shape::tvar(new_type_var));
-                        Shape::tvar(new_type_var)
-                    }
-                    Shape::Null => Shape::Null,
-                    Shape::Bool(b) => Shape::Mismatch(
-                        Box::new(Shape::Bool(b)),
-                        Box::new(Shape::Object(vec![(s.clone(), Shape::Blob)])),
-                    ),
-                    Shape::Number(n) => Shape::Mismatch(
-                        Box::new(Shape::Number(n)),
-                        Box::new(Shape::Object(vec![(s.clone(), Shape::Blob)])),
-                    ),
-                    Shape::String(s_) => Shape::Mismatch(
-                        Box::new(Shape::String(s_)),
-                        Box::new(Shape::Object(vec![(s.clone(), Shape::Blob)])),
-                    ),
-                    Shape::Array(arr, u) => Shape::Mismatch(
-                        Box::new(Shape::Array(arr, u)),
-                        Box::new(Shape::Object(vec![(s.clone(), Shape::Blob)])),
-                    ),
-                    Shape::Tuple(tuple) => Shape::Mismatch(
-                        Box::new(Shape::Tuple(tuple)),
-                        Box::new(Shape::Object(vec![(s.clone(), Shape::Blob)])),
-                    ),
-                    Shape::Object(mut obj) => {
-                        let has_key = obj.iter().any(|(k, _)| k == s);
+            Filter::ObjIndex(s) => {
+                // shapes
+                //     .into_iter()
+                //     .map(|shape| match shape {
+                //         Shape::Blob => {
+                //             let new_type_var = ctx.fresh();
+                //             ctx.insert(new_type_var, Shape::tvar(new_type_var));
+                //             // todo: check this
+                //             Shape::tvar(new_type_var)
+                //         }
+                //         Shape::TVar(t) => {
+                //             let new_type_var = ctx.fresh();
+                //             let current_shape = ctx.get(&t).unwrap().clone();
+                //             // <'I> + {s: <'T>}
+                //             let current_shape = Shape::merge_shapes(
+                //                 current_shape,
+                //                 Shape::Object(vec![(s.clone(), Shape::tvar(new_type_var))]),
+                //                 ctx,
+                //             );
+                //             ctx.insert(t, current_shape);
+                //             ctx.insert(new_type_var, Shape::tvar(new_type_var));
+                //             Shape::tvar(new_type_var)
+                //         }
+                //         Shape::Null => Shape::Null,
+                //         Shape::Bool(b) => Shape::Mismatch(
+                //             Box::new(Shape::Bool(b)),
+                //             Box::new(Shape::Object(vec![(s.clone(), Shape::Blob)])),
+                //         ),
+                //         Shape::Number(n) => Shape::Mismatch(
+                //             Box::new(Shape::Number(n)),
+                //             Box::new(Shape::Object(vec![(s.clone(), Shape::Blob)])),
+                //         ),
+                //         Shape::String(s_) => Shape::Mismatch(
+                //             Box::new(Shape::String(s_)),
+                //             Box::new(Shape::Object(vec![(s.clone(), Shape::Blob)])),
+                //         ),
+                //         Shape::Array(arr, u) => Shape::Mismatch(
+                //             Box::new(Shape::Array(arr, u)),
+                //             Box::new(Shape::Object(vec![(s.clone(), Shape::Blob)])),
+                //         ),
+                //         Shape::Tuple(tuple) => Shape::Mismatch(
+                //             Box::new(Shape::Tuple(tuple)),
+                //             Box::new(Shape::Object(vec![(s.clone(), Shape::Blob)])),
+                //         ),
+                //         Shape::Object(mut obj) => {
+                //             let has_key = obj.iter().any(|(k, _)| k == s);
 
-                        let new_type_var = ctx.fresh();
+                //             let new_type_var = ctx.fresh();
 
-                        if !has_key {
-                            obj.push((s.clone(), Shape::tvar(new_type_var)));
-                        }
+                //             if !has_key {
+                //                 obj.push((s.clone(), Shape::tvar(new_type_var)));
+                //             }
 
-                        Shape::Object(obj)
-                    }
-                    Shape::Mismatch(_, _) => todo!(),
-                    Shape::Union(_, _) => todo!(),
-                    Shape::Neg(shape) => todo!(),
-                    Shape::Cond(shape, shape1) => todo!(),
-                })
-                .collect(),
-            Filter::ArrayIndex(u) => shapes
-                .into_iter()
-                .map(|shape| match shape {
-                    Shape::Blob => {
-                        let new_type_var = ctx.fresh();
-                        ctx.insert(new_type_var, Shape::tvar(new_type_var));
-                        Shape::tvar(new_type_var)
-                    }
-                    Shape::TVar(t) => {
-                        let new_type_var = ctx.fresh();
-                        let current_shape = ctx.get(&t).unwrap().clone();
-                        // <'I> + {s: <'T>}
-                        let current_shape = Shape::merge_shapes(
-                            current_shape,
-                            Shape::Array(Box::new(Shape::tvar(new_type_var)), Some(*u)),
-                            ctx,
-                        );
+                //             Shape::Object(obj)
+                //         }
+                //         Shape::Mismatch(_, _) => todo!(),
+                //         Shape::Union(_, _) => todo!(),
+                //         Shape::Neg(shape) => todo!(),
+                //         Shape::Cond(shape, shape1) => todo!(),
+                //     })
+                //     .collect()
+                todo!()
+            }
+            Filter::ArrayIndex(u) => {
+                // shapes
+                //     .into_iter()
+                //     .map(|shape| match shape {
+                //         Shape::Blob => {
+                //             let new_type_var = ctx.fresh();
+                //             ctx.insert(new_type_var, Shape::tvar(new_type_var));
+                //             Shape::tvar(new_type_var)
+                //         }
+                //         Shape::TVar(t) => {
+                //             let new_type_var = ctx.fresh();
+                //             let current_shape = ctx.get(&t).unwrap().clone();
+                //             // <'I> + {s: <'T>}
+                //             let current_shape = Shape::merge_shapes(
+                //                 current_shape,
+                //                 Shape::Array(Box::new(Shape::tvar(new_type_var)), Some(*u)),
+                //                 ctx,
+                //             );
 
-                        ctx.insert(t, current_shape);
-                        ctx.insert(new_type_var, Shape::tvar(new_type_var));
+                //             ctx.insert(t, current_shape);
+                //             ctx.insert(new_type_var, Shape::tvar(new_type_var));
 
-                        Shape::tvar(new_type_var)
-                    }
-                    Shape::Null => Shape::Null,
-                    Shape::Bool(b) => Shape::Mismatch(
-                        Box::new(Shape::Bool(b)),
-                        Box::new(Shape::Array(Box::new(Shape::Blob), Some(*u))),
-                    ),
-                    Shape::Number(n) => Shape::Mismatch(
-                        Box::new(Shape::Number(n)),
-                        Box::new(Shape::Array(Box::new(Shape::Blob), Some(*u))),
-                    ),
-                    Shape::String(s) => Shape::Mismatch(
-                        Box::new(Shape::String(s)),
-                        Box::new(Shape::Array(Box::new(Shape::Blob), Some(*u))),
-                    ),
-                    Shape::Array(shape, None) => Shape::Array(shape, Some(*u)),
-                    Shape::Array(shape, Some(u_)) => Shape::Array(shape, Some(*u.max(&u_))),
-                    Shape::Tuple(mut tuple) => {
-                        while (*u).max(0) as usize >= tuple.len() {
-                            let new_type_var = ctx.fresh();
-                            tuple.push(Shape::tvar(new_type_var));
-                        }
+                //             Shape::tvar(new_type_var)
+                //         }
+                //         Shape::Null => Shape::Null,
+                //         Shape::Bool(b) => Shape::Mismatch(
+                //             Box::new(Shape::Bool(b)),
+                //             Box::new(Shape::Array(Box::new(Shape::Blob), Some(*u))),
+                //         ),
+                //         Shape::Number(n) => Shape::Mismatch(
+                //             Box::new(Shape::Number(n)),
+                //             Box::new(Shape::Array(Box::new(Shape::Blob), Some(*u))),
+                //         ),
+                //         Shape::String(s) => Shape::Mismatch(
+                //             Box::new(Shape::String(s)),
+                //             Box::new(Shape::Array(Box::new(Shape::Blob), Some(*u))),
+                //         ),
+                //         Shape::Array(shape, None) => Shape::Array(shape, Some(*u)),
+                //         Shape::Array(shape, Some(u_)) => Shape::Array(shape, Some(*u.max(&u_))),
+                //         Shape::Tuple(mut tuple) => {
+                //             while (*u).max(0) as usize >= tuple.len() {
+                //                 let new_type_var = ctx.fresh();
+                //                 tuple.push(Shape::tvar(new_type_var));
+                //             }
 
-                        Shape::Tuple(tuple)
-                    }
-                    Shape::Object(obj) => Shape::Mismatch(
-                        Box::new(Shape::Object(obj)),
-                        Box::new(Shape::Array(Box::new(Shape::Blob), Some(*u))),
-                    ),
-                    Shape::Mismatch(_, _) => todo!(),
-                    Shape::Union(_, _) => todo!(),
-                    Shape::Neg(shape) => todo!(),
-                    Shape::Cond(shape, shape1) => todo!(),
-                })
-                .collect(),
+                //             Shape::Tuple(tuple)
+                //         }
+                //         Shape::Object(obj) => Shape::Mismatch(
+                //             Box::new(Shape::Object(obj)),
+                //             Box::new(Shape::Array(Box::new(Shape::Blob), Some(*u))),
+                //         ),
+                //         Shape::Mismatch(_, _) => todo!(),
+                //         Shape::Union(_, _) => todo!(),
+                //         Shape::Neg(shape) => todo!(),
+                //         Shape::Cond(shape, shape1) => todo!(),
+                //     })
+                //     .collect()
+                todo!()
+            }
             Filter::ArrayIterator => shapes
                 .into_iter()
                 .flat_map(|shape| match shape {
@@ -1286,7 +1292,7 @@ impl Shape {
             }
             Filter::BindingExpression(_, _) => todo!(),
             Filter::Variable(_) => todo!(),
-            Filter::ReduceExpression(_, _, _,_) => todo!(),
+            Filter::ReduceExpression(_, _, _, _) => todo!(),
             Filter::Hole => todo!(),
         }
     }
@@ -1943,6 +1949,7 @@ mod shape_computation_tests {
             .try_init();
 
         let (_, filter) = parse(expression);
+        let filter = (&filter).into();
         let (i, o) = Shape::new(&filter, &builtin_filters());
         (
             i.canonicalize(),
@@ -1964,6 +1971,7 @@ mod shape_computation_tests {
             .try_init();
 
         let (_, filter) = parse(expression);
+        let filter = (&filter).into();
         let (i, o) = Shape::new(&filter, &builtin_filters());
         println!("{:?}", (i.clone(), o[0].clone()));
         (i.canonicalize(), o[0].canonicalize())

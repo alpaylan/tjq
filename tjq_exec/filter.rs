@@ -710,6 +710,32 @@ impl Filter {
             ),
         }
     }
+
+    pub fn is_const_computable(&self) -> bool {
+        match self {
+            Filter::Dot => false,
+            // The right side of the pipe only sees the output of lhs, so if left is const computable right is too
+            Filter::Pipe(lhs, _) => lhs.is_const_computable(),
+            Filter::Comma(lhs, rhs) => lhs.is_const_computable() && rhs.is_const_computable(),
+            Filter::ObjIndex(f) | Filter::ArrayIndex(f) => f.is_const_computable(),
+            Filter::ArrayIterator => true,
+            Filter::Null | Filter::Boolean(_) | Filter::Number(_) | Filter::String(_) => true,
+            Filter::Array(filters) => filters.iter().all(|f| f.is_const_computable()),
+            Filter::Object(items) => items.iter().all(|(_, f)| f.is_const_computable()),
+            Filter::UnOp(_, f) => f.is_const_computable(),
+            Filter::BinOp(lhs, _, rhs) => lhs.is_const_computable() && rhs.is_const_computable(),
+            Filter::Empty => true,
+            Filter::Error => true,
+            Filter::IfThenElse(if_, then, else_) => {
+                if_.is_const_computable()
+                    && then.is_const_computable()
+                    && else_.is_const_computable()
+            }
+            Filter::Hole => false,
+            // todo@alp: implement const computability for all filters, remove this catchall
+            _ => false,
+        }
+    }
 }
 
 impl From<&str> for Filter {

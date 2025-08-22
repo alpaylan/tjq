@@ -5,7 +5,7 @@ use std::{
     fmt::{self, Display, Formatter},
 };
 
-use tjq_exec::{BinOp, Filter, UnOp};
+use tjq_exec::{BinOp, Filter, Json, UnOp};
 
 use crate::{Shape, Subtyping};
 
@@ -388,11 +388,15 @@ fn solve(constraints: Vec<Constraint>, ctx: &Context) -> Result<TypeEnv, TypeErr
 
 pub struct Context {
     pub vars: usize,
+    pub const_value: Json,
 }
 
 impl Context {
     fn new() -> Self {
-        Context { vars: 0 }
+        Context {
+            vars: 0,
+            const_value: Json::Null,
+        }
     }
 
     fn fresh(&mut self) -> usize {
@@ -408,6 +412,32 @@ pub fn compute_shape(
     output_type: usize,
     filters: &HashMap<String, Filter>,
 ) -> Constraints {
+    println!("computing shape for filter: {}", f);
+    if f.is_const_computable() {
+        // The output type should be equal to the result of the computation
+        let output = Filter::filter(
+            &ctx.const_value,
+            f,
+            &Default::default(),
+            &mut Default::default(),
+        );
+        // Assume a single output for now
+        let output = output.first().unwrap();
+        match output {
+            Ok(output) => {
+                let output_shape = Shape::from_json(output.clone());
+                return vec![Constraint::Rel {
+                    t1: Shape::TVar(output_type),
+                    rel: Relation::Equality(Equality::Equal),
+                    t2: output_shape,
+                }];
+            }
+            Err(err) => {
+                return vec![Constraint::False];
+            }
+        }
+    }
+
     match f {
         Filter::Dot => {
             vec![Constraint::Rel {
@@ -459,40 +489,45 @@ pub fn compute_shape(
         }
         Filter::ObjIndex(s) => {
             // input_type <: { s: output_type }
-            vec![Constraint::Rel {
-                t1: Shape::TVar(input_type),
-                rel: Relation::Subtyping(Subtyping::Subtype),
-                t2: Shape::Object(vec![(s.clone(), Shape::TVar(output_type))]),
-            }]
+            // todo@alp: if you can const compute, do it.
+            // vec![Constraint::Rel {
+            //     t1: Shape::TVar(input_type),
+            //     rel: Relation::Subtyping(Subtyping::Subtype),
+            //     t2: Shape::Object(vec![(s.clone(), Shape::TVar(output_type))]),
+            // }]
+            vec![]
         }
         Filter::ArrayIndex(n) => {
             // input_type <: [output_type]
-            if *n >= 0 {
-                vec![Constraint::Rel {
-                    t1: Shape::TVar(input_type),
-                    rel: Relation::Subtyping(Subtyping::Subtype),
-                    t2: Shape::Tuple(
-                        [
-                            vec![Shape::Blob; *n as usize],
-                            vec![Shape::TVar(output_type)],
-                        ]
-                        .concat(),
-                    ),
-                }]
-            } else {
-                vec![
-                    Constraint::Rel {
-                        t1: Shape::TVar(input_type),
-                        rel: Relation::Subtyping(Subtyping::Subtype),
-                        t2: Shape::Array(Box::new(Shape::Blob), Some(*n)),
-                    },
-                    Constraint::Rel {
-                        t1: Shape::TVar(output_type),
-                        rel: Relation::Equality(Equality::Equal),
-                        t2: Shape::Null,
-                    },
-                ]
-            }
+            // todo: if n is a constant, compute it.
+
+            // if *n >= 0 {
+            //     vec![Constraint::Rel {
+            //         t1: Shape::TVar(input_type),
+            //         rel: Relation::Subtyping(Subtyping::Subtype),
+            //         t2: Shape::Tuple(
+            //             [
+            //                 vec![Shape::Blob; *n as usize],
+            //                 vec![Shape::TVar(output_type)],
+            //             ]
+            //             .concat(),
+            //         ),
+            //     }]
+            // } else {
+            //     vec![
+            //         Constraint::Rel {
+            //             t1: Shape::TVar(input_type),
+            //             rel: Relation::Subtyping(Subtyping::Subtype),
+            //             t2: Shape::Array(Box::new(Shape::Blob), Some(*n)),
+            //         },
+            //         Constraint::Rel {
+            //             t1: Shape::TVar(output_type),
+            //             rel: Relation::Equality(Equality::Equal),
+            //             t2: Shape::Null,
+            //         },
+            //     ]
+            // }
+            vec![]
         }
         Filter::ArrayIterator => {
             // todo: figure out object iteration
@@ -621,17 +656,16 @@ pub fn compute_shape(
             }
             cs
         }
-        Filter::BinOp(filter, bin_op, filter1) => {
+        Filter::BinOp(lhs, bin_op, rhs) => {
             let left_type = ctx.fresh();
             let right_type = ctx.fresh();
 
             let mut cs = vec![];
-            cs.extend(compute_shape(filter, ctx, input_type, left_type, filters));
-            cs.extend(compute_shape(filter1, ctx, input_type, right_type, filters));
+            cs.extend(compute_shape(lhs, ctx, input_type, left_type, filters));
+            cs.extend(compute_shape(rhs, ctx, input_type, right_type, filters));
 
             match bin_op {
                 BinOp::Add => {
-                    // If both left and right are known to be concrete values of a type, we can do type level computation
                     // let sum_num_num = Constraint::Computation {
                     //     values: vec![
                     //         |s| {
@@ -953,7 +987,7 @@ pub fn compute_shape(
         Filter::FunctionExpression(_, _) => todo!(),
         Filter::BindingExpression(filter, filter1) => todo!(),
         Filter::Variable(_) => todo!(),
-        Filter::ReduceExpression(var_name,init , generator, update) => todo!(),
+        Filter::ReduceExpression(var_name, init, generator, update) => todo!(),
         Filter::Hole => todo!(),
     }
 }
@@ -969,6 +1003,7 @@ mod constraint_tests {
     #[test]
     fn test_subtyping() {
         let (_, filter) = parse(r#".a | .b"#);
+        let filter = (&filter).into();
         let mut context = Context::new();
         let i = context.fresh();
         let o = context.fresh();
@@ -986,6 +1021,7 @@ mod constraint_tests {
     #[test]
     fn test_subtyping2() {
         let (_, filter) = parse(r#"{ "a": .a, "b": .b}"#);
+        let filter = (&filter).into();
         let mut context = Context::new();
         let i = context.fresh();
         let o = context.fresh();
@@ -1003,6 +1039,7 @@ mod constraint_tests {
     #[test]
     fn test_subtyping3() {
         let (_, filter) = parse(r#".[3]"#);
+        let filter = (&filter).into();
         let mut context = Context::new();
         let i = context.fresh();
         let o = context.fresh();
@@ -1020,6 +1057,7 @@ mod constraint_tests {
     #[test]
     fn test_subtyping4() {
         let (_, filter) = parse(r#". == true or . == false"#);
+        let filter = (&filter).into();
         let mut context = Context::new();
         let i = context.fresh();
         let o = context.fresh();
@@ -1037,6 +1075,7 @@ mod constraint_tests {
     #[test]
     fn test_subtyping5() {
         let (_, filter) = parse(r#"if . == true or . == false then 1 else error end"#);
+        let filter = (&filter).into();
         let mut context = Context::new();
         let i = context.fresh();
         let o = context.fresh();
@@ -1190,6 +1229,7 @@ mod solver_tests {
 
     fn solve_constraints(expression: &str) -> (Shape, Shape) {
         let (_, filter) = parse(expression);
+        let filter = (&filter).into();
         let mut context = Context::new();
         let i = context.fresh();
         let o = context.fresh();
@@ -1287,12 +1327,44 @@ mod solver_tests {
     }
 
     #[test]
-    #[ignore = "We cannot actually do type-level computation until we can create constraints that do computation somehow"]
     fn test_solver_add_definite() {
         let (tin, tout) = solve_constraints(r#"1 + 1"#);
         // t: T -> T
         assert_eq!(tin, Shape::TVar(1));
         assert_eq!(tout, Shape::Number(Some(2.0)));
+    }
+
+    #[test]
+    fn test_solver_add_definite_nested() {
+        let (tin, tout) = solve_constraints(r#"1 + 1 - 2"#);
+        // t: T -> T
+        assert_eq!(tin, Shape::TVar(1));
+        assert_eq!(tout, Shape::Number(Some(0.0)));
+    }
+
+    #[test]
+    fn test_solver_compute_string_addition() {
+        let (tin, tout) = solve_constraints(r#""hello" + " world""#);
+        // t: T -> T
+        assert_eq!(tin, Shape::TVar(1));
+        assert_eq!(tout, Shape::String(Some("hello world".to_string())));
+    }
+
+    #[test]
+    fn test_solver_compute_array_indexing() {
+        let (tin, tout) = solve_constraints(r#"[1, 2, 3][0]"#);
+        panic!("There is a bug here");
+        // t: T -> T
+        assert_eq!(tin, Shape::TVar(1));
+        assert_eq!(tout, Shape::Number(Some(1.0)));
+    }
+
+    #[test]
+    fn test_solver_compute_array_indexing2() {
+        let (tin, tout) = solve_constraints(r#"[1, 2, 3] | .[0]"#);
+        // t: T -> T
+        assert_eq!(tin, Shape::TVar(1));
+        assert_eq!(tout, Shape::Number(Some(1.0)));
     }
 
     #[test]
