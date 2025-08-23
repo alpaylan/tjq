@@ -607,7 +607,7 @@ impl Enc {
             &is_arr_x,
             &is_arr_y,
             &sub_elem,
-            &self.maybe_int_leq(&len_x, &len_y),
+            &self.maybe_int_leq_math(&len_x, &len_y),
         ]);
 
         // 8) Tuples: same length + element-wise ≤ (handled by TupLeq)
@@ -621,6 +621,7 @@ impl Enc {
             &case_bot, &case_top, &case_null, &case_bool, &case_num, &case_str, &case_arr,
             &case_tup, &case_obj,
         ]);
+        println!("Subtype body: {}", body);
 
         // Add recursive definition: Subtype(x,y) := body
         self.subtype.add_def(&[&x, &y], &body);
@@ -735,6 +736,48 @@ impl Enc {
 
         z3::ast::Bool::or(&[
             z3::ast::Bool::and(&[&a_some, &b_some, &aval._eq(&bval)]),
+            z3::ast::Bool::and(&[&a_some, &b_none]),
+            z3::ast::Bool::and(&[&a_none, &b_none]),
+        ])
+    }
+
+    pub fn maybe_int_leq_math(
+        &self,
+        a: &z3::ast::Datatype,
+        b: &z3::ast::Datatype,
+    ) -> z3::ast::Bool {
+        let a_none = self.maybe_int.variants[0]
+            .tester
+            .apply(&[a])
+            .as_bool()
+            .unwrap();
+        let a_some = self.maybe_int.variants[1]
+            .tester
+            .apply(&[a])
+            .as_bool()
+            .unwrap();
+        let b_none = self.maybe_int.variants[0]
+            .tester
+            .apply(&[b])
+            .as_bool()
+            .unwrap();
+        let b_some = self.maybe_int.variants[1]
+            .tester
+            .apply(&[b])
+            .as_bool()
+            .unwrap();
+
+        let aval = self.maybe_int.variants[1].accessors[0]
+            .apply(&[a])
+            .as_int()
+            .unwrap();
+        let bval = self.maybe_int.variants[1].accessors[0]
+            .apply(&[b])
+            .as_int()
+            .unwrap();
+
+        z3::ast::Bool::or(&[
+            z3::ast::Bool::and(&[&a_some, &b_some, &aval.ge(&bval)]),
             z3::ast::Bool::and(&[&a_some, &b_none]),
             z3::ast::Bool::and(&[&a_none, &b_none]),
         ])
@@ -1310,22 +1353,25 @@ mod tests {
     }
 
     #[test]
-    fn test_collection_subtyping() {
+    fn test_array_subtyping() {
         let enc = Enc::new();
         let solver = Solver::new();
         enc.define_subtype();
         let empty_array = to_z3_shape(&enc, &Shape::array(Shape::blob(), None));
         let non_empty_array = to_z3_shape(&enc, &Shape::array(Shape::blob(), Some(5)));
-        // Check that the empty array is a subtype of the non-empty array
+        let longer_array = to_z3_shape(&enc, &Shape::array(Shape::blob(), Some(10)));
+        let non_blob_empty_array = to_z3_shape(&enc, &Shape::array(Shape::number_(), None));
+        let non_blob_non_empty_array = to_z3_shape(&enc, &Shape::array(Shape::number_(), Some(5)));
+        // Check that the non-empty array is a subtype of the empty array
         solver.assert(
             enc.subtype
-                .apply(&[&empty_array, &non_empty_array])
+                .apply(&[&non_empty_array, &empty_array])
                 .as_bool()
                 .unwrap(),
         );
         assert!(solver.check() == SatResult::Sat);
         solver.reset();
-        // Check that the non-empty array is not a subtype of the empty array
+        // Check that the empty array is not a subtype of the non-empty array
         solver.assert(
             !enc.subtype
                 .apply(&[&non_empty_array, &empty_array])
@@ -1333,6 +1379,154 @@ mod tests {
                 .unwrap(),
         );
         assert!(solver.check() == SatResult::Unsat);
+
         solver.reset();
+        solver.assert(!enc.is_array(&longer_array));
+        assert!(
+            solver.check() == SatResult::Unsat,
+            "{longer_array} is not an array"
+        );
+
+        solver.reset();
+        solver.assert(!enc.is_array(&non_empty_array));
+        assert!(
+            solver.check() == SatResult::Unsat,
+            "{non_empty_array} is not an array"
+        );
+
+        let longer_array_elem = longer_array.nth_child(0).unwrap().as_datatype().unwrap();
+        let non_empty_array_elem = non_empty_array.nth_child(0).unwrap().as_datatype().unwrap();
+        solver.reset();
+        solver.assert(
+            !enc.subtype
+                .apply(&[&longer_array_elem, &non_empty_array_elem])
+                .as_bool()
+                .unwrap(),
+        );
+        assert!(
+            solver.check() == SatResult::Unsat,
+            "Element types of {longer_array_elem} and {non_empty_array_elem} are not in a subtyping relation"
+        );
+
+        let longer_array_len = longer_array.nth_child(1).unwrap().as_datatype().unwrap();
+        let non_empty_array_len = non_empty_array.nth_child(1).unwrap().as_datatype().unwrap();
+        solver.reset();
+        solver.assert(!enc.maybe_int_leq_math(&longer_array_len, &non_empty_array_len));
+        assert!(
+            solver.check() == SatResult::Unsat,
+            "Lengths of {longer_array_len} and {non_empty_array_len} are not in a subtyping relation"
+        );
+        solver.reset();
+        // assert!(longer_array.nth_child(0).unwrap().is_blob());
+        // Check that longer array is a subtype of shorter array
+        solver.reset();
+        solver.assert(
+            !enc.subtype
+                .apply(&[&longer_array, &non_empty_array])
+                .as_bool()
+                .unwrap(),
+        );
+        assert!(
+            solver.check() == SatResult::Unsat,
+            "{longer_array} is not a subtype of {non_empty_array}"
+        );
+        solver.reset();
+        // Check that non-blob arrays are subtypes of blob arrays
+        solver.assert(
+            !enc.subtype
+                .apply(&[&non_blob_empty_array, &empty_array])
+                .as_bool()
+                .unwrap(),
+        );
+        assert!(solver.check() == SatResult::Unsat);
+
+        solver.reset();
+        solver.assert(
+            !enc.subtype
+                .apply(&[&non_blob_non_empty_array, &non_empty_array])
+                .as_bool()
+                .unwrap(),
+        );
+        assert!(
+            solver.check() == SatResult::Unsat,
+            "Non-blob-non-empty-array {} is not a subtype of {}",
+            non_blob_non_empty_array,
+            non_empty_array
+        );
+
+        solver.reset();
+        solver.assert(
+            !enc.subtype
+                .apply(&[&longer_array, &non_empty_array])
+                .as_bool()
+                .unwrap(),
+        );
+        assert!(solver.check() == SatResult::Unsat);
+        solver.reset();
+    }
+
+    #[test]
+    fn test_object_subtyping() {
+        let solver = Solver::new();
+        let enc = Enc::new();
+        enc.define_subtype();
+
+        let empty_object = to_z3_shape(&enc, &Shape::Object(vec![]));
+        let singleton_empty_object =
+            to_z3_shape(&enc, &Shape::Object(vec![("a".into(), Shape::number_())]));
+        let two_field_object = to_z3_shape(
+            &enc,
+            &Shape::Object(vec![
+                ("a".into(), Shape::number_()),
+                ("b".into(), Shape::bool_()),
+            ]),
+        );
+        let unrelated_object =
+            to_z3_shape(&enc, &Shape::Object(vec![("c".into(), Shape::string_())]));
+
+        // Every object is a subtype of the empty object
+        solver.reset();
+        solver.assert(
+            !enc.subtype
+                .apply(&[&singleton_empty_object, &empty_object])
+                .as_bool()
+                .unwrap(),
+        );
+        assert!(solver.check() == SatResult::Unsat);
+        solver.reset();
+        solver.assert(
+            !enc.subtype
+                .apply(&[&two_field_object, &empty_object])
+                .as_bool()
+                .unwrap(),
+        );
+        assert!(solver.check() == SatResult::Unsat);
+        solver.reset();
+        solver.assert(
+            !enc.subtype
+                .apply(&[&unrelated_object, &empty_object])
+                .as_bool()
+                .unwrap(),
+        );
+        assert!(solver.check() == SatResult::Unsat);
+
+        // An object with keys a,b should be a subtype of an object with key a
+        solver.reset();
+        solver.assert(
+            !enc.subtype
+                .apply(&[&two_field_object, &singleton_empty_object])
+                .as_bool()
+                .unwrap(),
+        );
+        assert!(solver.check() == SatResult::Unsat);
+        // An object with keys a,b should be not be a subtype of an object with key c
+        solver.reset();
+        solver.assert(
+            enc.subtype
+                .apply(&[&two_field_object, &unrelated_object])
+                .as_bool()
+                .unwrap(),
+        );
+        assert!(solver.check() == SatResult::Unsat);
     }
 }
