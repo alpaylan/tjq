@@ -717,7 +717,7 @@ impl Filter {
             // The right side of the pipe only sees the output of lhs, so if left is const computable right is too
             Filter::Pipe(lhs, _) => lhs.is_const_computable(),
             Filter::Comma(lhs, rhs) => lhs.is_const_computable() && rhs.is_const_computable(),
-            Filter::ObjIndex(f) | Filter::ArrayIndex(f) => f.is_const_computable(),
+            Filter::ObjIndex(f) | Filter::ArrayIndex(f) => false,
             Filter::ArrayIterator => true,
             Filter::Null | Filter::Boolean(_) | Filter::Number(_) | Filter::String(_) => true,
             Filter::Array(filters) => filters.iter().all(|f| f.is_const_computable()),

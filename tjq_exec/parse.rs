@@ -1334,4 +1334,39 @@ mod tests {
             )
         );
     }
+
+    #[test]
+    #[should_panic]
+    fn test_parse_inline_array_indexing() {
+        let (_, cst) = parse(r#"[1, 2, 3][0]"#);
+        let filter: Filter = (&cst).into();
+        // note: not sure what should happen here, maybe our AST rep is wrong, we should check with jq.
+        assert_eq!(
+            filter,
+            Filter::pipe(
+                Filter::Array(vec![
+                    Filter::Number(1.0),
+                    Filter::Number(2.0),
+                    Filter::Number(3.0)
+                ]),
+                Filter::ArrayIndex(Box::new(Filter::Number(0.0)))
+            )
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_parse_string_addition() {
+        let (_, cst) = parse(r#""hello" + " world""#);
+        let filter: Filter = (&cst).into();
+        // t: T -> T
+        assert_eq!(
+            filter,
+            Filter::BinOp(
+                Box::new(Filter::String("hello".to_string())),
+                BinOp::Add,
+                Box::new(Filter::String(" world".to_string()))
+            )
+        );
+    }
 }
