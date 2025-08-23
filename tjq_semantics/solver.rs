@@ -21,6 +21,8 @@ pub struct Enc {
     str: Sort,
     // Subtype : Shape × Shape → Bool
     subtype: RecFuncDecl,
+    kind_rank: RecFuncDecl,
+    ordering: RecFuncDecl,
 
     // helpers (declare later in `declare_rec_helpers`)
     pub tup_leq: Option<z3::RecFuncDecl>,
@@ -158,6 +160,8 @@ impl Enc {
             &[&list_field.sort, &list_field.sort],
             &Sort::bool(),
         );
+        let kind_rank = z3::RecFuncDecl::new("JQKindRank", &[&shape.sort], &Sort::int());
+        let ordering = z3::RecFuncDecl::new("JQLt", &[&shape.sort, &shape.sort], &Sort::bool());
 
         Self {
             // sorts
@@ -174,6 +178,8 @@ impl Enc {
 
             // recursive functions
             subtype,
+            kind_rank,
+            ordering,
             tup_leq: Some(tup_leq),
             has_field: Some(has_field),
             obj_leq: Some(obj_leq),
@@ -626,6 +632,156 @@ impl Enc {
         // Add recursive definition: Subtype(x,y) := body
         self.subtype.add_def(&[&x, &y], &body);
     }
+
+    pub fn define_ordering(&self) {
+        // -------------------------
+        // JQKindRank(x) : Int
+        // -------------------------
+        let x = Datatype::new_const("x", &self.shape.sort);
+
+        let is_null = self.shape.variants[IDX_NULL]
+            .tester
+            .apply(&[&x])
+            .as_bool()
+            .unwrap();
+        let is_bool = self.shape.variants[IDX_BOOL]
+            .tester
+            .apply(&[&x])
+            .as_bool()
+            .unwrap();
+        let is_num = self.shape.variants[IDX_NUM]
+            .tester
+            .apply(&[&x])
+            .as_bool()
+            .unwrap();
+        let is_str = self.shape.variants[IDX_STR]
+            .tester
+            .apply(&[&x])
+            .as_bool()
+            .unwrap();
+        let is_arr = self.shape.variants[IDX_ARR]
+            .tester
+            .apply(&[&x])
+            .as_bool()
+            .unwrap();
+        let is_obj = self.shape.variants[IDX_OBJ]
+            .tester
+            .apply(&[&x])
+            .as_bool()
+            .unwrap();
+
+        // rank(null)=0, bool=1, num=2, str=3, arr=4, obj=5
+        let body_rank = Bool::ite(
+            &is_null,
+            &Int::from_i64(0),
+            &Bool::ite(
+                &is_bool,
+                &Int::from_i64(1),
+                &Bool::ite(
+                    &is_num,
+                    &Int::from_i64(2),
+                    &Bool::ite(
+                        &is_str,
+                        &Int::from_i64(3),
+                        &Bool::ite(&is_arr, &Int::from_i64(4), &Int::from_i64(5)),
+                    ),
+                ),
+            ),
+        );
+
+        self.kind_rank.add_def(&[&x], &body_rank);
+
+        // -------------------------
+        // JQLt(x,y) : Bool
+        // -------------------------
+        let y = Datatype::new_const("y", &self.shape.sort);
+
+        let kx = self.kind_rank.apply(&[&x]).as_int().unwrap();
+        let ky = self.kind_rank.apply(&[&y]).as_int().unwrap();
+
+        let kinds_lt = kx.lt(&ky);
+        let kinds_eq = kx._eq(&ky);
+
+        // Within-kind: Booleans (false < true)
+        // Bool(opt: MaybeBool)
+        let is_bool_x = self.shape.variants[IDX_BOOL]
+            .tester
+            .apply(&[&x])
+            .as_bool()
+            .unwrap();
+        let is_bool_y = self.shape.variants[IDX_BOOL]
+            .tester
+            .apply(&[&y])
+            .as_bool()
+            .unwrap();
+        let bopt_x = self.shape.variants[IDX_BOOL].accessors[0]
+            .apply(&[&x])
+            .as_datatype()
+            .unwrap();
+        let bopt_y = self.shape.variants[IDX_BOOL].accessors[0]
+            .apply(&[&y])
+            .as_datatype()
+            .unwrap();
+
+        // MaybeBool = MBNone | MBSome(val: Bool)
+        let x_b_some = self.maybe_bool.variants[1]
+            .tester
+            .apply(&[&bopt_x])
+            .as_bool()
+            .unwrap();
+        let y_b_some = self.maybe_bool.variants[1]
+            .tester
+            .apply(&[&bopt_y])
+            .as_bool()
+            .unwrap();
+        let x_b_val = self.maybe_bool.variants[1].accessors[0]
+            .apply(&[&bopt_x])
+            .as_bool()
+            .unwrap();
+        let y_b_val = self.maybe_bool.variants[1].accessors[0]
+            .apply(&[&bopt_y])
+            .as_bool()
+            .unwrap();
+
+        // false < true  is  (!x) & y
+        let bool_lt = Bool::and(&[&x_b_some, &y_b_some, &x_b_val.not(), &y_b_val]);
+
+        // Within-kind: Numbers (Real)
+        let is_num_x = self.shape.variants[IDX_NUM]
+            .tester
+            .apply(&[&x])
+            .as_bool()
+            .unwrap();
+        let is_num_y = self.shape.variants[IDX_NUM]
+            .tester
+            .apply(&[&y])
+            .as_bool()
+            .unwrap();
+        let nopt_x = self.shape.variants[IDX_NUM].accessors[0]
+            .apply(&[&x])
+            .as_datatype()
+            .unwrap(); // MaybeReal
+        let nopt_y = self.shape.variants[IDX_NUM].accessors[0]
+            .apply(&[&y])
+            .as_datatype()
+            .unwrap();
+
+        let (x_n_val, x_n_some) = self.unwrap_maybe_float(&nopt_x); // -> (Real, Bool)
+        let (y_n_val, y_n_some) = self.unwrap_maybe_float(&nopt_y);
+
+        let num_lt = Bool::and(&[&x_n_some, &y_n_some, &x_n_val.lt(&y_n_val)]);
+
+        // Combine within-kind comparators we support
+        let within_kind_lt = Bool::or(&[
+            Bool::and(&[&is_bool_x, &is_bool_y, &bool_lt]),
+            Bool::and(&[&is_num_x, &is_num_y, &num_lt]),
+            // Strings/arrays/objects have no tie-breaker here (fine for is* tests).
+        ]);
+
+        let body_lt = Bool::or(&[&kinds_lt, &Bool::and(&[&kinds_eq, &within_kind_lt])]);
+
+        self.ordering.add_def(&[&x, &y], &body_lt);
+    }
 }
 
 impl Enc {
@@ -1033,7 +1189,7 @@ impl Enc {
 }
 
 impl Enc {
-    pub fn unwrap_maybe_float(&self, m: &z3::ast::Datatype) -> (z3::ast::Real, z3::ast::Bool) {
+    pub fn unwrap_maybe_float(&self, m: &z3::ast::Datatype) -> (z3::ast::Float, z3::ast::Bool) {
         let is_some = self.maybe_float.variants[1]
             .tester
             .apply(&[m])
@@ -1041,7 +1197,7 @@ impl Enc {
             .unwrap();
         let val = self.maybe_float.variants[1].accessors[0]
             .apply(&[m])
-            .as_real()
+            .as_float()
             .unwrap();
         (val, is_some)
     }
@@ -1527,6 +1683,50 @@ mod tests {
                 .as_bool()
                 .unwrap(),
         );
+        assert!(solver.check() == SatResult::Unsat);
+    }
+
+    #[test]
+    fn test_simple_ordering() {
+        let solver = Solver::new();
+        let enc = Enc::new();
+        enc.define_ordering();
+
+        let false_ = to_z3_shape(&enc, &Shape::bool(false));
+        let true_ = to_z3_shape(&enc, &Shape::bool(true));
+        let bool_ = to_z3_shape(&enc, &Shape::bool_());
+
+        let five_ = to_z3_shape(&enc, &Shape::number(5));
+        let ten_ = to_z3_shape(&enc, &Shape::number(10));
+        let num_ = to_z3_shape(&enc, &Shape::number_());
+
+        let hello_ = to_z3_shape(&enc, &Shape::string("hello"));
+        let str_ = to_z3_shape(&enc, &Shape::string_());
+
+        solver.reset();
+        solver.assert(!enc.ordering.apply(&[&false_, &true_]).as_bool().unwrap());
+        assert!(solver.check() == SatResult::Unsat);
+        solver.reset();
+        solver.assert(!enc.ordering.apply(&[&five_, &ten_]).as_bool().unwrap());
+        assert!(solver.check() == SatResult::Unsat);
+        solver.reset();
+        solver.assert(!enc.ordering.apply(&[&five_, &str_]).as_bool().unwrap());
+        assert!(solver.check() == SatResult::Unsat);
+        solver.reset();
+        solver.assert(!enc.ordering.apply(&[&true_, &hello_]).as_bool().unwrap());
+        assert!(solver.check() == SatResult::Unsat);
+        solver.reset();
+        solver.assert(!enc.ordering.apply(&[&false_, &str_]).as_bool().unwrap());
+        assert!(solver.check() == SatResult::Unsat);
+
+        solver.reset();
+        solver.assert(!enc.ordering.apply(&[&bool_, &num_]).as_bool().unwrap());
+        assert!(solver.check() == SatResult::Unsat);
+        solver.reset();
+        solver.assert(!enc.ordering.apply(&[&bool_, &five_]).as_bool().unwrap());
+        assert!(solver.check() == SatResult::Unsat);
+        solver.reset();
+        solver.assert(!enc.ordering.apply(&[&num_, &hello_]).as_bool().unwrap());
         assert!(solver.check() == SatResult::Unsat);
     }
 }
