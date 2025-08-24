@@ -5,7 +5,7 @@ use z3::{
 };
 
 use crate::{
-    experimental_type_inference::{Constraint, Equality, Relation},
+    experimental_type_inference::{Comparison, Constraint, Equality, Relation},
     Shape, Subtyping,
 };
 
@@ -1625,11 +1625,14 @@ pub fn lower_constraint(enc: &Enc, c: &Constraint) -> Bool {
                     enc.subtype.apply(&[&b, &a]).as_bool().unwrap()
                 }
                 // Comparisons only valid on numbers or lengths; enforce guards:
-                Relation::Comparison(rel) => {
-                    // Extract numeric refinements; add guards that both are Num(Some r)
-                    todo!("")
-                }
-                Relation::Subtyping(Subtyping::Incompatible) => todo!(),
+                Relation::Comparison(rel) => match rel {
+                    Comparison::GreaterThan => enc.ordering.apply(&[&b, &a]).as_bool().unwrap(),
+                    Comparison::LessThan => enc.ordering.apply(&[&a, &b]).as_bool().unwrap(),
+                },
+                Relation::Subtyping(Subtyping::Incompatible) => Bool::and(&[
+                    enc.subtype.apply(&[&a, &b]).as_bool().unwrap().not(),
+                    enc.subtype.apply(&[&b, &a]).as_bool().unwrap().not(),
+                ]),
             }
         }
         Constraint::Conditional { c1, c2 } => {

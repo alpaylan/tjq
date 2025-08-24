@@ -312,12 +312,13 @@ fn solve_via_z3(constraints: Vec<Constraint>, ctx: &Context) {
     let mut enc = Enc::new();
 
     // 3) Declare recursive helper funcs and define them
-    enc.declare_rec_helpers(); // creates TupLeq, HasField, ObjLeq and adds their bodies
+    // enc.declare_rec_helpers(); // creates TupLeq, HasField, ObjLeq and adds their bodies
     enc.define_subtype(); // defines Subtype with calls to the helpers
     enc.define_ordering();
+    enc.define_score();
 
-    let sh_in = Shape::TVar(0); // “what comes out?”
-    let sh_out = Shape::TVar(1); // “what comes out?”
+    let sh_in = Shape::TVar(1); // “what comes out?”
+    let sh_out = Shape::TVar(2); // “what comes out?”
 
     let z_in = to_z3_shape(&enc, &sh_in); // Datatype (Shape)
     let z_out = to_z3_shape(&enc, &sh_out); // Datatype (Shape)
@@ -326,30 +327,9 @@ fn solve_via_z3(constraints: Vec<Constraint>, ctx: &Context) {
     use Relation as R;
     use Subtyping as S;
 
-    let elem_fresh = Shape::TVar(1);
-    let z_elem = to_z3_shape(&enc, &elem_fresh);
-
-    // in ≤ Arr(elem, None)
-    let need_array = C::Rel {
-        t1: sh_in.clone(),
-        rel: R::Subtyping(S::Subtype),
-        t2: Shape::Array(Box::new(elem_fresh.clone()), None),
-    };
-    // out ≤ elem
-    let out_is_elem = C::Rel {
-        t1: sh_out.clone(),
-        rel: R::Subtyping(S::Subtype),
-        t2: elem_fresh.clone(),
-    };
-    // (optional) out ≤ Num(None)
-    let out_is_num = C::Rel {
-        t1: sh_out.clone(),
-        rel: R::Subtyping(S::Subtype),
-        t2: Shape::Number(None),
-    };
-
     // Lower & assert
-    for c in [need_array, out_is_elem, out_is_num] {
+    for c in constraints {
+        println!("Constraint: {}", c);
         let b = lower_constraint(&enc, &c); // -> Bool
         solver.assert(&b);
     }
@@ -358,8 +338,11 @@ fn solve_via_z3(constraints: Vec<Constraint>, ctx: &Context) {
         z3::SatResult::Sat => {
             let model = solver.get_model().unwrap();
             let out = to_z3_shape(&enc, &sh_out); // Datatype var
-            let val = model.eval(&out, true).unwrap(); // Ground constructor tree
-            println!("Inferred out shape: {}", val); // e.g. Num(MRNone) or Num(MRSome(…))
+            let out = model.get_const_interp(&out);
+            let in_ = to_z3_shape(&enc, &sh_in);
+            let in_ = model.get_const_interp(&in_);
+            println!("Inferred input shape: {:?}", in_);
+            println!("Inferred out shape: {:?}", out);
         }
         z3::SatResult::Unsat => {
             eprintln!("Type error.");
@@ -772,23 +755,54 @@ pub fn compute_shape(
                         }
                         .not(),
                     );
-                    // the types must be equal, or null
+                    // enumerate the possibilities
                     cs.push(Constraint::Or(vec![
-                        Constraint::Rel {
-                            t1: Shape::TVar(left_type),
-                            rel: Relation::Equality(Equality::Equal),
-                            t2: Shape::TVar(right_type),
-                        },
-                        Constraint::Rel {
-                            t1: Shape::TVar(left_type),
-                            rel: Relation::Equality(Equality::Equal),
-                            t2: Shape::Null,
-                        },
-                        Constraint::Rel {
-                            t1: Shape::TVar(right_type),
-                            rel: Relation::Equality(Equality::Equal),
-                            t2: Shape::Null,
-                        },
+                        // Numbers
+                        Constraint::And(vec![
+                            Constraint::Rel {
+                                t1: Shape::TVar(left_type),
+                                rel: Relation::Subtyping(Subtyping::Subtype),
+                                t2: Shape::Number(None),
+                            },
+                            Constraint::Rel {
+                                t1: Shape::TVar(right_type),
+                                rel: Relation::Subtyping(Subtyping::Subtype),
+                                t2: Shape::Number(None),
+                            },
+                            Constraint::Rel {
+                                t1: Shape::TVar(output_type),
+                                rel: Relation::Subtyping(Subtyping::Subtype),
+                                t2: Shape::Number(None),
+                            },
+                        ]),
+                        // Strings
+                        Constraint::And(vec![
+                            Constraint::Rel {
+                                t1: Shape::TVar(left_type),
+                                rel: Relation::Subtyping(Subtyping::Subtype),
+                                t2: Shape::String(None),
+                            },
+                            Constraint::Rel {
+                                t1: Shape::TVar(right_type),
+                                rel: Relation::Subtyping(Subtyping::Subtype),
+                                t2: Shape::String(None),
+                            },
+                            Constraint::Rel {
+                                t1: Shape::TVar(output_type),
+                                rel: Relation::Subtyping(Subtyping::Subtype),
+                                t2: Shape::String(None),
+                            },
+                        ]),
+                        // Constraint::Rel {
+                        //     t1: Shape::TVar(left_type),
+                        //     rel: Relation::Equality(Equality::Equal),
+                        //     t2: Shape::Null,
+                        // },
+                        // Constraint::Rel {
+                        //     t1: Shape::TVar(right_type),
+                        //     rel: Relation::Equality(Equality::Equal),
+                        //     t2: Shape::Null,
+                        // },
                     ]));
                     // if one of the types is not null, then that will be the output type
                     // note: below we encode the reverse of this logic
@@ -1437,6 +1451,18 @@ mod solver_tests {
     // #[ignore = "We can't solve subtyping constraints yet"]
     fn test_solver_math() {
         let (tin, tout) = solve_constraints(r#". + 1"#);
+        // t: T -> T
+        assert_eq!(
+            tin,
+            Shape::Union(Box::new(Shape::Null), Box::new(Shape::Number(None)))
+        );
+        assert_eq!(tout, Shape::Number(None));
+    }
+
+    #[test]
+    // #[ignore = "We can't solve subtyping constraints yet"]
+    fn test_solver_math2() {
+        let (tin, tout) = solve_constraints(r#". + ."#);
         // t: T -> T
         assert_eq!(
             tin,
