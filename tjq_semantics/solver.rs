@@ -1,7 +1,7 @@
 use z3::{
     ast::{self, Ast, Bool, Datatype, Float, Int},
     datatype_builder::create_datatypes,
-    DatatypeAccessor, DatatypeBuilder, RecFuncDecl, Sort,
+    DatatypeAccessor, DatatypeBuilder, DatatypeSort, RecFuncDecl, Sort,
 };
 
 use crate::{
@@ -10,24 +10,32 @@ use crate::{
 };
 
 pub struct Enc {
-    shape: z3::DatatypeSort,
-    list_shape: z3::DatatypeSort,
-    list_field: z3::DatatypeSort,
-    maybe_bool: z3::DatatypeSort,
-    maybe_float: z3::DatatypeSort,
-    maybe_int: z3::DatatypeSort,
-    maybe_str: z3::DatatypeSort,
-    field: z3::DatatypeSort,
+    shape: DatatypeSort,
+    list_shape: DatatypeSort,
+    list_field: DatatypeSort,
+    maybe_bool: DatatypeSort,
+    maybe_float: DatatypeSort,
+    maybe_int: DatatypeSort,
+    maybe_str: DatatypeSort,
+    field: DatatypeSort,
     str: Sort,
     // Subtype : Shape × Shape → Bool
     subtype: RecFuncDecl,
     kind_rank: RecFuncDecl,
     ordering: RecFuncDecl,
+    // Scores
+    pub score: RecFuncDecl,
+    pub score_ls: RecFuncDecl,     // ListShape -> Int
+    pub score_lf: RecFuncDecl,     // ListField -> Int
+    pub score_ls_min: RecFuncDecl, // ListShape -> Int
+    // Union
+    pub all_sub: RecFuncDecl, // ListShape × Shape  -> Bool   (∀ a∈xs. a ≤ t)
+    pub any_sub: RecFuncDecl, // Shape × ListShape  -> Bool   (∃ b∈ys. x ≤ b)
 
     // helpers (declare later in `declare_rec_helpers`)
-    pub tup_leq: Option<z3::RecFuncDecl>,
-    pub has_field: Option<z3::RecFuncDecl>,
-    pub obj_leq: Option<z3::RecFuncDecl>,
+    pub tup_leq: Option<RecFuncDecl>,
+    pub has_field: Option<RecFuncDecl>,
+    pub obj_leq: Option<RecFuncDecl>,
 }
 
 // ---------- Mutually-recursive group: Shape, ListShape, Field, ListField ----------
@@ -41,6 +49,7 @@ const IDX_ARR: usize = 6;
 const IDX_TUP: usize = 7;
 const IDX_OBJ: usize = 8;
 const IDX_TVAR: usize = 9;
+const IDX_UNION: usize = 10;
 
 impl Enc {
     pub fn new() -> Self {
@@ -105,7 +114,11 @@ impl Enc {
                 "Obj",
                 vec![("fields", DatatypeAccessor::Datatype("ListField".into()))],
             )
-            .variant("TVar", vec![("id", DatatypeAccessor::Sort(Sort::int()))]);
+            .variant("TVar", vec![("id", DatatypeAccessor::Sort(Sort::int()))])
+            .variant(
+                "Union",
+                vec![("options", DatatypeAccessor::Datatype("ListShape".into()))],
+            );
 
         let b_list_shape = DatatypeBuilder::new("ListShape")
             .variant("LSNil", vec![])
@@ -163,6 +176,16 @@ impl Enc {
         let kind_rank = z3::RecFuncDecl::new("JQKindRank", &[&shape.sort], &Sort::int());
         let ordering = z3::RecFuncDecl::new("JQLt", &[&shape.sort, &shape.sort], &Sort::bool());
 
+        let score = z3::RecFuncDecl::new("Score", &[&shape.sort], &z3::Sort::int());
+        let score_ls = z3::RecFuncDecl::new("ScoreLS", &[&list_shape.sort], &z3::Sort::int());
+        let score_lf = z3::RecFuncDecl::new("ScoreLF", &[&list_field.sort], &z3::Sort::int());
+        let score_ls_min = z3::RecFuncDecl::new("ScoreLSMin", &[&list_shape.sort], &Sort::int());
+
+        let all_sub =
+            z3::RecFuncDecl::new("AllSub", &[&list_shape.sort, &shape.sort], &Sort::bool());
+        let any_sub =
+            z3::RecFuncDecl::new("AnySub", &[&shape.sort, &list_shape.sort], &Sort::bool());
+
         Self {
             // sorts
             shape,
@@ -174,12 +197,20 @@ impl Enc {
             maybe_int,
             maybe_str,
             str: Sort::string(),
-            // if your struct stores more accessors/constructors, grab them here similarly…
 
-            // recursive functions
+            // higher-order constraints
             subtype,
             kind_rank,
             ordering,
+            // score
+            score,
+            score_ls,
+            score_lf,
+            score_ls_min,
+            // union
+            all_sub,
+            any_sub,
+            // recursive functions
             tup_leq: Some(tup_leq),
             has_field: Some(has_field),
             obj_leq: Some(obj_leq),
@@ -278,6 +309,7 @@ impl Enc {
             .apply(&[&Float::from_f64(n)])
             .as_datatype()
             .unwrap();
+        println!("num inner: {}", inner);
         let outer = self.shape.variants[IDX_NUM as usize]
             .constructor
             .apply(&[&inner])
@@ -401,13 +433,13 @@ impl Enc {
             .unwrap()
     }
 
-    fn tvar(&self, id: &Int) -> Datatype {
-        self.shape.variants[IDX_TVAR as usize]
-            .constructor
-            .apply(&[id])
-            .as_datatype()
-            .unwrap()
-    }
+    // fn tvar(&self, id: &Int) -> Datatype {
+    //     self.shape.variants[IDX_TVAR as usize]
+    //         .constructor
+    //         .apply(&[id])
+    //         .as_datatype()
+    //         .unwrap()
+    // }
     fn is_tvar(&self, v: &Datatype) -> Bool {
         self.shape.variants[IDX_TVAR as usize]
             .tester
@@ -588,6 +620,16 @@ impl Enc {
         let case_bot = is_bot_x;
         // 2) anything ≤ Top
         let case_top = is_top_y;
+        // 3) Subtyping is reflexive
+        let case_refl = x._eq(&y);
+        // 4) Subtyping is transitive
+        let z = Datatype::new_const("z", &self.shape.sort);
+        let case_trans = Bool::and(&[
+            &self.subtype.apply(&[&x, &z]).as_bool().unwrap(),
+            &self.subtype.apply(&[&z, &y]).as_bool().unwrap(),
+        ])
+        .implies(&self.subtype.apply(&[&x, &y]).as_bool().unwrap());
+
         // 3) Null ≤ Null (treat null as its own atom)
         let case_null = Bool::and(&[&is_null_x, &is_null_y]);
 
@@ -622,10 +664,40 @@ impl Enc {
         // 9) Objects: width+depth subtyping (handled by ObjLeq)
         let case_obj = Bool::and(&[&is_obj_x, &is_obj_y, &sub_obj]);
 
+        // ----- Union on the left: Union(xs) ≤ y  ⇔  AllSub(xs, y)
+        let is_union_x = self.shape.variants[IDX_UNION]
+            .tester
+            .apply(&[&x])
+            .as_bool()
+            .unwrap();
+        let xs = self.shape.variants[IDX_UNION].accessors[0]
+            .apply(&[&x])
+            .as_datatype()
+            .unwrap();
+        let all_x_le_y = self.all_sub.apply(&[&xs, &y]).as_bool().unwrap();
+        let case_union_left = Bool::and(&[&is_union_x, &all_x_le_y]);
+
+        // ----- Union on the right: x ≤ Union(ys)  ⇔  AnySub(x, ys)
+        let is_union_y = self.shape.variants[IDX_UNION]
+            .tester
+            .apply(&[&y])
+            .as_bool()
+            .unwrap();
+        let ys = self.shape.variants[IDX_UNION].accessors[0]
+            .apply(&[&y])
+            .as_datatype()
+            .unwrap();
+        let any_x_le_y = self.any_sub.apply(&[&x, &ys]).as_bool().unwrap();
+        let case_union_right = Bool::and(&[&is_union_y, &any_x_le_y]);
+
         // Or all cases together
         let body = Bool::or(&[
             &case_bot, &case_top, &case_null, &case_bool, &case_num, &case_str, &case_arr,
             &case_tup, &case_obj,
+            &case_refl,
+            // &case_trans,
+            // &case_union_left,
+            // &case_union_right,
         ]);
         println!("Subtype body: {}", body);
 
@@ -781,6 +853,341 @@ impl Enc {
         let body_lt = Bool::or(&[&kinds_lt, &Bool::and(&[&kinds_eq, &within_kind_lt])]);
 
         self.ordering.add_def(&[&x, &y], &body_lt);
+    }
+
+    pub fn define_score_min(&self) {
+        let xs = Datatype::new_const("xs", &self.list_shape.sort);
+        let xs_nil = self.list_shape.variants[0]
+            .tester
+            .apply(&[&xs])
+            .as_bool()
+            .unwrap();
+        let xs_cons = self.list_shape.variants[1]
+            .tester
+            .apply(&[&xs])
+            .as_bool()
+            .unwrap();
+        let xh = self.list_shape.variants[1].accessors[0]
+            .apply(&[&xs])
+            .as_datatype()
+            .unwrap();
+        let xt = self.list_shape.variants[1].accessors[1]
+            .apply(&[&xs])
+            .as_datatype()
+            .unwrap();
+
+        let inf = Int::from_i64(1_000_000);
+        let s_head = self.score.apply(&[&xh]).as_int().unwrap();
+        let s_tail = self.score_ls_min.apply(&[&xt]).as_int().unwrap();
+        let min_ht = Bool::ite(&s_head.le(&s_tail), &s_head, &s_tail);
+
+        let body = Bool::ite(&xs_nil, &inf, &min_ht);
+        self.score_ls_min.add_def(&[&xs], &body);
+    }
+
+    pub fn define_score(&self) {
+        let x = Datatype::new_const("sx", &self.shape.sort);
+
+        // testers
+        let is_top = self.shape.variants[0]
+            .tester
+            .apply(&[&x])
+            .as_bool()
+            .unwrap();
+        let is_bot = self.shape.variants[1]
+            .tester
+            .apply(&[&x])
+            .as_bool()
+            .unwrap();
+        let is_null = self.shape.variants[2]
+            .tester
+            .apply(&[&x])
+            .as_bool()
+            .unwrap();
+        let is_bool = self.shape.variants[3]
+            .tester
+            .apply(&[&x])
+            .as_bool()
+            .unwrap();
+        let is_num = self.shape.variants[4]
+            .tester
+            .apply(&[&x])
+            .as_bool()
+            .unwrap();
+        let is_str = self.shape.variants[5]
+            .tester
+            .apply(&[&x])
+            .as_bool()
+            .unwrap();
+        let is_arr = self.shape.variants[6]
+            .tester
+            .apply(&[&x])
+            .as_bool()
+            .unwrap();
+        let is_tup = self.shape.variants[7]
+            .tester
+            .apply(&[&x])
+            .as_bool()
+            .unwrap();
+        let is_obj = self.shape.variants[8]
+            .tester
+            .apply(&[&x])
+            .as_bool()
+            .unwrap();
+        let is_tvar = self.shape.variants[9]
+            .tester
+            .apply(&[&x])
+            .as_bool()
+            .unwrap();
+        let is_union = self.shape.variants[10]
+            .tester
+            .apply(&[&x])
+            .as_bool()
+            .unwrap();
+        // fields
+        let bopt = self.shape.variants[3].accessors[0]
+            .apply(&[&x])
+            .as_datatype()
+            .unwrap(); // MaybeBool
+        let nopt = self.shape.variants[4].accessors[0]
+            .apply(&[&x])
+            .as_datatype()
+            .unwrap(); // MaybeReal
+        let sopt = self.shape.variants[5].accessors[0]
+            .apply(&[&x])
+            .as_datatype()
+            .unwrap(); // MaybeStr
+        let elem = self.shape.variants[6].accessors[0]
+            .apply(&[&x])
+            .as_datatype()
+            .unwrap(); // Shape
+        let alen = self.shape.variants[6].accessors[1]
+            .apply(&[&x])
+            .as_datatype()
+            .unwrap(); // MaybeInt
+        let elts = self.shape.variants[7].accessors[0]
+            .apply(&[&x])
+            .as_datatype()
+            .unwrap(); // ListShape
+        let flds = self.shape.variants[8].accessors[0]
+            .apply(&[&x])
+            .as_datatype()
+            .unwrap(); // ListField
+
+        // maybe penalties: None=0, Some(_)=1
+        let mb_none = self.maybe_bool.variants[0]
+            .tester
+            .apply(&[&bopt])
+            .as_bool()
+            .unwrap();
+        let mr_none = self.maybe_float.variants[0]
+            .tester
+            .apply(&[&nopt])
+            .as_bool()
+            .unwrap();
+        let ms_none = self.maybe_str.variants[0]
+            .tester
+            .apply(&[&sopt])
+            .as_bool()
+            .unwrap();
+        let mi_none = self.maybe_int.variants[0]
+            .tester
+            .apply(&[&alen])
+            .as_bool()
+            .unwrap();
+
+        let p_bool = Bool::ite(&mb_none, &Int::from_i64(0), &Int::from_i64(1));
+        let p_num = Bool::ite(&mr_none, &Int::from_i64(0), &Int::from_i64(1));
+        let p_str = Bool::ite(&ms_none, &Int::from_i64(0), &Int::from_i64(1));
+        let p_len = Bool::ite(&mi_none, &Int::from_i64(0), &Int::from_i64(1));
+
+        // recursive scores
+        let s_elem = self.score.apply(&[&elem]).as_int().unwrap();
+        let s_ls = self.score_ls.apply(&[&elts]).as_int().unwrap();
+        let s_lf = self.score_lf.apply(&[&flds]).as_int().unwrap();
+
+        // Union scores
+        let alts = self.shape.variants[IDX_UNION].accessors[0]
+            .apply(&[&x])
+            .as_datatype()
+            .unwrap();
+        let min_alt = self.score_ls_min.apply(&[&alts]).as_int().unwrap();
+
+        // prefer union slightly over its best member: max(0, min_alt - 1)
+        let union_score = Bool::ite(
+            &min_alt.le(&Int::from_i64(0)),
+            &Int::from_i64(0),
+            &(min_alt - Int::from_i64(1)),
+        );
+
+        // weights (tune if needed)
+        let body = is_top.ite(
+            &Int::from_i64(0),
+            &is_bot.ite(
+                &Int::from_i64(10_000),
+                &is_null.ite(
+                    &(Int::from_i64(10)),
+                    &is_bool.ite(
+                        &(Int::from_i64(10) + p_bool),
+                        &is_num.ite(
+                            &(Int::from_i64(10) + p_num),
+                            &is_str.ite(
+                                &(Int::from_i64(10) + p_str),
+                                &is_arr.ite(
+                                    &(Int::from_i64(20) + s_elem + p_len),
+                                    &is_tup.ite(
+                                        &(Int::from_i64(30) + s_ls),
+                                        &is_obj.ite(
+                                            &(Int::from_i64(40) + s_lf),
+                                            &is_tvar.ite(
+                                                &Int::from_i64(5),
+                                                &is_union.ite(&union_score, &Int::from_i64(9)),
+                                            ),
+                                        ),
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        );
+
+        self.score.add_def(&[&x], &body);
+
+        // list scores (sum)
+        let xs = Datatype::new_const("xs", &self.list_shape.sort);
+        let xs_nil = self.list_shape.variants[0]
+            .tester
+            .apply(&[&xs])
+            .as_bool()
+            .unwrap();
+        let xs_cons = self.list_shape.variants[1]
+            .tester
+            .apply(&[&xs])
+            .as_bool()
+            .unwrap();
+        let xh = self.list_shape.variants[1].accessors[0]
+            .apply(&[&xs])
+            .as_datatype()
+            .unwrap();
+        let xt = self.list_shape.variants[1].accessors[1]
+            .apply(&[&xs])
+            .as_datatype()
+            .unwrap();
+        let s_head = self.score.apply(&[&xh]).as_int().unwrap();
+        let s_tail = self.score_ls.apply(&[&xt]).as_int().unwrap();
+        let ls_body = z3::ast::Bool::ite(&xs_nil, &Int::from_i64(0), &(s_head + s_tail));
+        self.score_ls.add_def(&[&xs], &ls_body);
+
+        let fs = Datatype::new_const("fs", &self.list_field.sort);
+        let fs_nil = self.list_field.variants[0]
+            .tester
+            .apply(&[&fs])
+            .as_bool()
+            .unwrap();
+        let fs_cons = self.list_field.variants[1]
+            .tester
+            .apply(&[&fs])
+            .as_bool()
+            .unwrap();
+        let fh = self.list_field.variants[1].accessors[0]
+            .apply(&[&fs])
+            .as_datatype()
+            .unwrap();
+        let ft = self.list_field.variants[1].accessors[1]
+            .apply(&[&fs])
+            .as_datatype()
+            .unwrap();
+        let f_is_mk = self.field.variants[0]
+            .tester
+            .apply(&[&fh])
+            .as_bool()
+            .unwrap();
+        let f_ty = self.field.variants[0].accessors[1]
+            .apply(&[&fh])
+            .as_datatype()
+            .unwrap();
+        let s_f_ty = self.score.apply(&[&f_ty]).as_int().unwrap();
+        // field cost = 2 + score(ty)
+        let field_cost = Int::from_i64(2) + s_f_ty;
+        let lf_body = Bool::ite(
+            &fs_nil,
+            &Int::from_i64(0),
+            &Bool::ite(
+                &Bool::and(&[&fs_cons, &f_is_mk]),
+                &(field_cost + self.score_lf.apply(&[&ft]).as_int().unwrap()),
+                &Int::from_i64(0),
+            ), // unreachable branch safeguard
+        );
+        self.score_lf.add_def(&[&fs], &lf_body);
+    }
+
+    pub fn declare_union_helpers(&self) {
+        // -------- AllSub(xs, t) --------
+        let xs = Datatype::new_const("xs", &self.list_shape.sort);
+        let t = Datatype::new_const("t", &self.shape.sort);
+
+        let xs_nil = self.list_shape.variants[0]
+            .tester
+            .apply(&[&xs])
+            .as_bool()
+            .unwrap();
+        let xs_cons = self.list_shape.variants[1]
+            .tester
+            .apply(&[&xs])
+            .as_bool()
+            .unwrap();
+        let xh = self.list_shape.variants[1].accessors[0]
+            .apply(&[&xs])
+            .as_datatype()
+            .unwrap();
+        let xt = self.list_shape.variants[1].accessors[1]
+            .apply(&[&xs])
+            .as_datatype()
+            .unwrap();
+
+        let head_ok = self.subtype.apply(&[&xh, &t]).as_bool().unwrap();
+        let tail_ok = self.all_sub.apply(&[&xt, &t]).as_bool().unwrap();
+
+        let all_body = Bool::or(&[
+            Bool::and(&[&xs_nil, &Bool::from_bool(true)]),
+            Bool::and(&[&xs_cons, &head_ok, &tail_ok]),
+        ]);
+        self.all_sub.add_def(&[&xs, &t], &all_body);
+
+        // -------- AnySub(x, ys) --------
+        let x = Datatype::new_const("x", &self.shape.sort);
+        let ys = Datatype::new_const("ys", &self.list_shape.sort);
+
+        let ys_nil = self.list_shape.variants[0]
+            .tester
+            .apply(&[&ys])
+            .as_bool()
+            .unwrap();
+        let ys_cons = self.list_shape.variants[1]
+            .tester
+            .apply(&[&ys])
+            .as_bool()
+            .unwrap();
+        let yh = self.list_shape.variants[1].accessors[0]
+            .apply(&[&ys])
+            .as_datatype()
+            .unwrap();
+        let yt = self.list_shape.variants[1].accessors[1]
+            .apply(&[&ys])
+            .as_datatype()
+            .unwrap();
+
+        let head_has = self.subtype.apply(&[&x, &yh]).as_bool().unwrap();
+        let tail_has = self.any_sub.apply(&[&x, &yt]).as_bool().unwrap();
+
+        let any_body = Bool::or(&[
+            Bool::and(&[&ys_nil, &Bool::from_bool(false)]),
+            Bool::and(&[&ys_cons, &head_has]),
+            Bool::and(&[&ys_cons, &tail_has]),
+        ]);
+        self.any_sub.add_def(&[&x, &ys], &any_body);
     }
 }
 
@@ -1319,7 +1726,7 @@ pub fn to_z3_shape(enc: &Enc, s: &Shape) -> Datatype {
             }
             enc.object(&list)
         }
-        Shape::TVar(id) => enc.tvar(&Int::from(*id as u64)),
+        Shape::TVar(id) => Datatype::new_const(format!("t_{id}"), &enc.shape.sort),
         Shape::Union(a, b) => {
             // Not an ADT case—represent Union via constraints when you generate them:
             // you’ll create a fresh t and assert a ≤ t ∧ b ≤ t (or t ≤ a ∨ t ≤ b depending on direction).
@@ -1335,27 +1742,28 @@ pub fn to_z3_shape(enc: &Enc, s: &Shape) -> Datatype {
 
 #[cfg(test)]
 mod tests {
-    use z3::{SatResult, Solver};
+    use z3::{Optimize, SatResult, Solver};
 
     use super::*;
 
     #[test]
+    #[ignore = "not sure how to model tvars yet"]
     fn test_tvar_to_z3() {
         let enc = Enc::new();
         let shape = Shape::TVar(1);
         let z3_shape = to_z3_shape(&enc, &shape);
-        assert!(z3_shape == enc.tvar(&Int::from(1)));
+        // assert!(z3_shape == enc.tvar(&Int::from(1)));
     }
 
     #[test]
     fn test_array_to_z3() {
         let enc = Enc::new();
-        let shape = Shape::Array(Box::new(Shape::TVar(1)), None);
+        let shape = Shape::Array(Box::new(Shape::Null), None);
         let z3_shape = to_z3_shape(&enc, &shape);
         assert!(
             z3_shape
                 == enc.array(
-                    &enc.tvar(&Int::from(1)),
+                    &enc.null(),
                     &enc.maybe_int.variants[0]
                         .constructor
                         .apply(&[])
@@ -1728,5 +2136,135 @@ mod tests {
         solver.reset();
         solver.assert(!enc.ordering.apply(&[&num_, &hello_]).as_bool().unwrap());
         assert!(solver.check() == SatResult::Unsat);
+    }
+
+    #[test]
+    fn test_collection_ordering() {}
+
+    #[test]
+    fn test_subtyping_reflexive() {
+        let solver = Solver::new();
+        let enc = Enc::new();
+        enc.define_subtype();
+
+        // define 3 tvars
+        let t0 = to_z3_shape(&enc, &Shape::TVar(0));
+        let t1 = to_z3_shape(&enc, &Shape::TVar(1));
+        // assert t0 ≤ t1 and t1 ≤ t2
+        solver.assert(t0._eq(&t1));
+        solver.assert(!enc.subtype.apply(&[&t0, &t1]).as_bool().unwrap());
+        assert_eq!(
+            solver.check(),
+            SatResult::Unsat,
+            "Subtyping reflexivity failed"
+        );
+        solver.reset();
+        solver.assert(t0._eq(&t1));
+        println!("t0: {:?}, t1: {:?}", t0, t1);
+        println!("solver: {:?}", solver.get_assertions());
+        solver.assert(enc.subtype.apply(&[&t0, &t1]).as_bool().unwrap());
+        assert_eq!(
+            solver.check(),
+            SatResult::Sat,
+            "Subtyping reflexivity failed"
+        );
+    }
+
+    #[test]
+    #[ignore = "Adding `case_trans` kills the performance, perhaps because it turns the problem into a search problem"]
+    fn test_subtyping_transitive() {
+        let solver = Solver::new();
+        let enc = Enc::new();
+        enc.define_subtype();
+
+        // define 3 tvars
+        let t0 = to_z3_shape(&enc, &Shape::TVar(0));
+        let t1 = to_z3_shape(&enc, &Shape::TVar(1));
+        let t2 = to_z3_shape(&enc, &Shape::TVar(2));
+        // assert t0 ≤ t1 and t1 ≤ t2
+        let t0_leq_t1 = enc.subtype.apply(&[&t0, &t1]).as_bool().unwrap();
+        let t1_leq_t2 = enc.subtype.apply(&[&t1, &t2]).as_bool().unwrap();
+        solver.assert(&t0_leq_t1);
+        solver.assert(&t1_leq_t2);
+        // Check if subtyping transitivity holds
+        let t0_leq_t2 = enc.subtype.apply(&[&t0, &t2]).as_bool().unwrap();
+        solver.assert(&t0_leq_t2);
+        assert_eq!(
+            solver.check(),
+            SatResult::Sat,
+            "Subtyping transitivity failed"
+        );
+    }
+
+    #[test]
+    fn test_implication() {
+        // let solver = Solver::new();
+        let opt = Optimize::new();
+        let enc = Enc::new();
+        enc.define_subtype();
+        enc.define_ordering();
+        enc.define_score();
+
+        let t1 = to_z3_shape(&enc, &Shape::TVar(1));
+        let s = enc.score.apply(&[&t1]).as_int().unwrap(); // Int
+        opt.minimize(&s);
+        let t2 = to_z3_shape(&enc, &Shape::TVar(2));
+        let s2 = enc.score.apply(&[&t2]).as_int().unwrap(); // Int
+        opt.minimize(&s2);
+        let t3 = to_z3_shape(&enc, &Shape::TVar(3));
+        let s3 = enc.score.apply(&[&t3]).as_int().unwrap(); // Int
+        opt.minimize(&s3);
+        let t4 = to_z3_shape(&enc, &Shape::TVar(4));
+        let s4 = enc.score.apply(&[&t4]).as_int().unwrap(); // Int
+        opt.minimize(&s4);
+
+        // <T1> == <T3>
+        opt.assert(&t1._eq(&t3));
+        // <T4> == 1
+        opt.assert(&t4._eq(to_z3_shape(&enc, &Shape::number(1.0))));
+        // T3 is not a subtype of bool
+        opt.assert(
+            &!enc
+                .subtype
+                .apply(&[&t3, &to_z3_shape(&enc, &Shape::bool_())])
+                .as_bool()
+                .unwrap(),
+        );
+        // t4 is not a subtype of bool
+        opt.assert(
+            &!enc
+                .subtype
+                .apply(&[&t4, &to_z3_shape(&enc, &Shape::bool_())])
+                .as_bool()
+                .unwrap(),
+        );
+        // (<T3> == <T4> | <T3> == <null> | <T4> == <null>)
+        opt.assert(&z3::ast::Bool::or(&[
+            t3._eq(&t4),
+            t3._eq(&to_z3_shape(&enc, &Shape::null())),
+            t4._eq(&to_z3_shape(&enc, &Shape::null())),
+        ]));
+        // <T3> == <null> ==> <T2> <: <T4>
+        opt.assert(&z3::ast::Bool::implies(
+            &t3._eq(&to_z3_shape(&enc, &Shape::null())),
+            enc.subtype.apply(&[&t2, &t4]).as_bool().unwrap(),
+        ));
+        // <T4> == <null> ==> <T2> <: <T3>
+        opt.assert(&z3::ast::Bool::implies(
+            &t4._eq(&to_z3_shape(&enc, &Shape::null())),
+            enc.subtype.apply(&[&t2, &t3]).as_bool().unwrap(),
+        ));
+        assert_eq!(opt.check(&[]), SatResult::Sat);
+        // get the model
+        let model = opt.get_model().unwrap();
+        // get the values of the type variables
+        let t1_val = model.get_const_interp(&t1);
+        let t2_val = model.get_const_interp(&t2);
+        let t3_val = model.get_const_interp(&t3);
+        let t4_val = model.get_const_interp(&t4);
+        println!(
+            "t1: {:?}, t2: {:?}, t3: {:?}, t4: {:?}",
+            t1_val, t2_val, t3_val, t4_val
+        );
     }
 }

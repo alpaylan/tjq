@@ -314,6 +314,7 @@ fn solve_via_z3(constraints: Vec<Constraint>, ctx: &Context) {
     // 3) Declare recursive helper funcs and define them
     enc.declare_rec_helpers(); // creates TupLeq, HasField, ObjLeq and adds their bodies
     enc.define_subtype(); // defines Subtype with calls to the helpers
+    enc.define_ordering();
 
     let sh_in = Shape::TVar(0); // “what comes out?”
     let sh_out = Shape::TVar(1); // “what comes out?”
