@@ -610,7 +610,8 @@ pub(crate) fn parse_filter<'a>(code: &'a str, root: Node<'_>) -> (Cst<'a>, Vec<(
             )
         }
         "subscript_expression" => {
-            let (lhs, vl) = parse_filter(code, root.child(0).expect("subscript should have a lhs"));
+            //[1,2,3][0] .[0] -> todo @can
+            let (lhs,  vl) = parse_filter(code, root.child(0).expect("subscript should have a lhs"));
             let value = &code[root.range().start_byte..root.range().end_byte];
             if root.child_count() == 3 {
                 // Array iterator
@@ -708,8 +709,15 @@ pub(crate) fn parse_filter<'a>(code: &'a str, root: Node<'_>) -> (Cst<'a>, Vec<(
             (Cst::number(root.range(), value), vec![])
         }
         "string" => {
-            let s = &code[root.range().start_byte..root.range().end_byte];
-            (Cst::string(root.range(), s), vec![])
+            //if it is quoted strip em 
+        let raw = &code[root.range().start_byte..root.range().end_byte];
+            let s = if (raw.starts_with('"') && raw.ends_with('"')) || (raw.starts_with('\'') && raw.ends_with('\''))
+                {
+                    &raw[1..raw.len() - 1]
+                } else {
+                    raw
+                };
+                (Cst::string(root.range(), s), vec![])
         }
         "pipeline" => {
             let value = &code[root.range().start_byte..root.range().end_byte];
@@ -1355,11 +1363,12 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
     fn test_parse_string_addition() {
         let (_, cst) = parse(r#""hello" + " world""#);
         let filter: Filter = (&cst).into();
         // t: T -> T
+        
+        println!("Filter: {:?}", filter);
         assert_eq!(
             filter,
             Filter::BinOp(
