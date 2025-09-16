@@ -1,0 +1,69 @@
+{
+  "name": "tjq-lsp-extension",
+  "displayName": "TJQ Language Support",
+  "description": "Language support for TJQ files with LSP",
+  "version": "0.1.0",
+  "publisher": "tjq",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/alpaylan/tjq"
+  },
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": ["Programming Languages"],
+  "activationEvents": [
+    "onLanguage:tjq",
+    "onLanguage:jq"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "tjq",
+        "aliases": ["TJQ", "tjq"],
+        "extensions": [".tjq", ".jq"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "tjq",
+        "scopeName": "source.tjq",
+        "path": "./syntaxes/tjq.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "type": "object",
+      "title": "TJQ",
+      "properties": {
+        "tjq.lspBinaryPath": {
+          "type": "string",
+          "default": "/Users/cank/Desktop/tjq/target/debug/tjq-lsp",
+          "description": "Path to the TJQ LSP binary. If not set, will search in default locations."
+        },
+        "tjq.trace.server": {
+          "type": "string",
+          "enum": ["off", "messages", "verbose"],
+          "default": "off",
+          "description": "Traces the communication between VS Code and the TJQ language server."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.75.0",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0",
+    "@vscode/vsce": "^2.22.0"
+  }
+}

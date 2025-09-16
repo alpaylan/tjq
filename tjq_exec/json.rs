@@ -133,7 +133,6 @@ impl Ord for Json {
             (Json::String(_), _) => std::cmp::Ordering::Less,
             (_, Json::String(_)) => std::cmp::Ordering::Greater,
             (Json::Array(a1), Json::Array(a2)) => {
-                println!("a1: {:?}, a2: {:?}", a1, a2);
                 for (j1, j2) in a1.iter().zip(a2.iter()) {
                     match j1.cmp(j2) {
                         std::cmp::Ordering::Equal => continue,

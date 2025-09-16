@@ -14,14 +14,15 @@ pub fn print_ast(node: Node, source: &str, indent: usize) {
     } else {
         node.kind()
     };
-    tracing::debug!(
-        "{}{}[{}..{}]: {:?}",
-        indent_str,
-        kind,
-        node.start_byte(),
-        node.end_byte(),
-        node_text
-    );
+    // Don't output debug info during LSP operation
+    // tracing::debug!(
+    //     "{}{}[{}..{}]: {:?}",
+    //     indent_str,
+    //     kind,
+    //     node.start_byte(),
+    //     node.end_byte(),
+    //     node_text
+    // );
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {

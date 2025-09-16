@@ -1,0 +1,5 @@
+{
+    "cmake.ignoreCMakeListsMissing": true,
+    "tjq.lspPath": "/Users/cank/Desktop/tjq/target/release/tjq-lsp",
+    "tjq.trace.server": "messages"
+}
