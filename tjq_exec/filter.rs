@@ -273,7 +273,7 @@ impl Filter {
 
                                 let i = i as usize;
 
-                                let i = if i < 0 { arr.len() + i } else { i } as usize;
+                                let i = if i < 0 { arr.len() + i } else { i };
 
                                 Ok(arr.get(i).cloned().unwrap_or(Json::Null))
                             } else {
@@ -467,7 +467,7 @@ impl Filter {
                             tracing::trace!("Substituted filter: {}", filter);
                         }
 
-                        Filter::filter(json, &filter, &global_definitions, variable_ctx)
+                        Filter::filter(json, &filter, global_definitions, variable_ctx)
                     } else {
                         vec![Err(JQError::FilterNotDefined(name.clone(), args.len()))]
                     }
@@ -718,7 +718,7 @@ impl Filter {
             Filter::Pipe(lhs, _) => lhs.is_const_computable(),
             Filter::Comma(lhs, rhs) => lhs.is_const_computable() && rhs.is_const_computable(),
             Filter::ObjIndex(f) | Filter::ArrayIndex(f) => false,
-            Filter::ArrayIterator => true,
+            Filter::ArrayIterator => false,
             Filter::Null | Filter::Boolean(_) | Filter::Number(_) | Filter::String(_) => true,
             Filter::Array(filters) => filters.iter().all(|f| f.is_const_computable()),
             Filter::Object(items) => items.iter().all(|(_, f)| f.is_const_computable()),

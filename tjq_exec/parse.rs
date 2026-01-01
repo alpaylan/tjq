@@ -51,11 +51,11 @@ impl From<&Cst<'_>> for Filter {
         match &cst.kind {
             NodeKind::FilterKind(filter_kind) => match filter_kind {
                 FilterKind::Hole => {
-                    assert!(cst.children.len() == 0);
+                    assert!(cst.children.is_empty());
                     Filter::Hole
                 }
                 FilterKind::Dot => {
-                    assert!(cst.children.len() == 0);
+                    assert!(cst.children.is_empty());
                     Filter::Dot
                 }
                 FilterKind::Pipe => {
@@ -73,7 +73,7 @@ impl From<&Cst<'_>> for Filter {
                     )
                 }
                 FilterKind::ObjIndex => {
-                    assert!(cst.children.len() == 0);
+                    assert!(cst.children.is_empty());
                     Filter::ObjIndex(Box::new(cst.value.into()))
                 }
                 FilterKind::ArrayIndex => {
@@ -85,19 +85,19 @@ impl From<&Cst<'_>> for Filter {
                     Filter::ArrayIterator
                 }
                 FilterKind::Null => {
-                    assert!(cst.children.len() == 0);
+                    assert!(cst.children.is_empty());
                     Filter::Null
                 }
                 FilterKind::Boolean => {
-                    assert!(cst.children.len() == 0);
+                    assert!(cst.children.is_empty());
                     Filter::Boolean(cst.value == "true")
                 }
                 FilterKind::Number => {
-                    assert!(cst.children.len() == 0);
+                    assert!(cst.children.is_empty());
                     Filter::Number(cst.value.parse().unwrap())
                 }
                 FilterKind::String => {
-                    assert!(cst.children.len() == 0);
+                    assert!(cst.children.is_empty());
                     Filter::String(cst.value.to_string())
                 }
                 FilterKind::Array => Filter::Array(cst.children.iter().map(|c| c.into()).collect()),
@@ -123,7 +123,7 @@ impl From<&Cst<'_>> for Filter {
                     Filter::UnOp(*unop, Box::new((&cst.children[0]).into()))
                 }
                 FilterKind::Variable => {
-                    assert!(cst.children.len() == 0);
+                    assert!(cst.children.is_empty());
                     Filter::Variable(cst.value.to_string())
                 }
                 FilterKind::IfThenElse => {
@@ -142,11 +142,11 @@ impl From<&Cst<'_>> for Filter {
                     Filter::IfThenElse(Box::new(cond), Box::new(then), Box::new(else_branch))
                 }
                 FilterKind::Empty => {
-                    assert!(cst.children.len() == 0);
+                    assert!(cst.children.is_empty());
                     Filter::Empty
                 }
                 FilterKind::Error => {
-                    assert!(cst.children.len() == 0);
+                    assert!(cst.children.is_empty());
                     Filter::Error
                 }
                 FilterKind::BindingExpression => {
@@ -157,7 +157,7 @@ impl From<&Cst<'_>> for Filter {
                     )
                 }
                 FilterKind::Call => {
-                    assert!(cst.children.len() >= 1);
+                    assert!(!cst.children.is_empty());
                     let name = cst.children[0].value.to_string();
                     let args = if cst.children.len() > 1 {
                         Some(cst.children[1..].iter().map(|c| c.into()).collect())
@@ -357,7 +357,7 @@ impl<'a> Cst<'a> {
     ) -> Self {
         let name_cst = Cst::string(range, name);
         let children = if let Some(args) = args {
-            vec![name_cst].into_iter().chain(args.into_iter()).collect()
+            vec![name_cst].into_iter().chain(args).collect()
         } else {
             vec![name_cst]
         };
@@ -438,7 +438,7 @@ impl<'a> Cst<'a> {
             kind: NodeKind::FilterKind(FilterKind::IfThenElse),
             children: vec![cond, then]
                 .into_iter()
-                .chain(elifs.into_iter())
+                .chain(elifs)
                 .chain(std::iter::once(else_))
                 .collect(),
             range,
@@ -563,7 +563,7 @@ pub fn parse_defs(code: &str) -> HashMap<String, Filter> {
 
     assert_eq!(tree.root_node().kind(), "program");
 
-    let mut defs = HashMap::new();
+    let defs = HashMap::new();
 
     for i in 0..tree.root_node().child_count() {
         let child = tree.root_node().child(i).unwrap();
@@ -611,7 +611,7 @@ pub(crate) fn parse_filter<'a>(code: &'a str, root: Node<'_>) -> (Cst<'a>, Vec<(
         }
         "subscript_expression" => {
             //[1,2,3][0] .[0] -> todo @can
-            let (lhs,  vl) = parse_filter(code, root.child(0).expect("subscript should have a lhs"));
+            let (lhs, vl) = parse_filter(code, root.child(0).expect("subscript should have a lhs"));
             let value = &code[root.range().start_byte..root.range().end_byte];
             if root.child_count() == 3 {
                 // Array iterator
@@ -709,15 +709,16 @@ pub(crate) fn parse_filter<'a>(code: &'a str, root: Node<'_>) -> (Cst<'a>, Vec<(
             (Cst::number(root.range(), value), vec![])
         }
         "string" => {
-            //if it is quoted strip em 
-        let raw = &code[root.range().start_byte..root.range().end_byte];
-            let s = if (raw.starts_with('"') && raw.ends_with('"')) || (raw.starts_with('\'') && raw.ends_with('\''))
-                {
-                    &raw[1..raw.len() - 1]
-                } else {
-                    raw
-                };
-                (Cst::string(root.range(), s), vec![])
+            //if it is quoted strip em
+            let raw = &code[root.range().start_byte..root.range().end_byte];
+            let s = if (raw.starts_with('"') && raw.ends_with('"'))
+                || (raw.starts_with('\'') && raw.ends_with('\''))
+            {
+                &raw[1..raw.len() - 1]
+            } else {
+                raw
+            };
+            (Cst::string(root.range(), s), vec![])
         }
         "pipeline" => {
             let value = &code[root.range().start_byte..root.range().end_byte];
@@ -1046,7 +1047,7 @@ pub(crate) fn parse_filter<'a>(code: &'a str, root: Node<'_>) -> (Cst<'a>, Vec<(
             panic!(
                 "unknown filter {} {}",
                 root.kind(),
-                code[root.range().start_byte..root.range().end_byte].to_string()
+                &code[root.range().start_byte..root.range().end_byte]
             );
         }
     }
@@ -1367,7 +1368,7 @@ mod tests {
         let (_, cst) = parse(r#""hello" + " world""#);
         let filter: Filter = (&cst).into();
         // t: T -> T
-        
+
         println!("Filter: {:?}", filter);
         assert_eq!(
             filter,

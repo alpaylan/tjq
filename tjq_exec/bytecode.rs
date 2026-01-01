@@ -274,8 +274,8 @@ impl Compiler {
         // Implement the compilation logic here
         match f {
             Filter::Dot => {
-                        todo!()
-                    }
+                todo!()
+            }
             Filter::Pipe(filter, filter1) => todo!(),
             Filter::Comma(filter, filter1) => todo!(),
             Filter::ObjIndex(_) => todo!(),
@@ -297,8 +297,8 @@ impl Compiler {
             Filter::FunctionExpression(hash_map, filter) => todo!(),
             Filter::BindingExpression(filter, filter1) => todo!(),
             Filter::Variable(_) => todo!(),
-            Filter::ReduceExpression(var, generator,init,update, ) => todo!(),
-Filter::Hole => todo!(),
+            Filter::ReduceExpression(var, generator, init, update) => todo!(),
+            Filter::Hole => todo!(),
         }
     }
 }
@@ -311,7 +311,6 @@ impl Program {
 
 #[cfg(test)]
 mod tests {
-    
 
     // #[test]
     // fn example_compile_dot() {

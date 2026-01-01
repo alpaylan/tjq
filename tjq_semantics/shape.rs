@@ -2,7 +2,6 @@ use std::{
     cmp::Ordering,
     collections::HashMap,
     fmt::{self, Display, Formatter},
-    ops::{Deref, DerefMut},
 };
 
 use tjq_exec::{BinOp, Filter, Json, UnOp};
@@ -21,7 +20,7 @@ pub enum Shape {
     Object(Vec<(String, Shape)>),
     Mismatch(Box<Shape>, Box<Shape>),
     Union(Box<Shape>, Box<Shape>),
-    Cond(Box<Shape>, Box<Shape>),
+    Intersection(Box<Shape>, Box<Shape>),
     Neg(Box<Shape>),
 }
 
@@ -88,13 +87,61 @@ impl Shape {
     }
 }
 
-// . : |- A -> A
-// 3 : |- A -> number<3>
-// f1 | f2 : (f1 : A -> B), (f2 : A -> C) |- (A -> C)
+impl PartialOrd for Shape {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        match (self, other) {
+            (Shape::TVar(_), _) => None,
+            (_, Shape::TVar(_)) => None,
+            (Shape::Blob, _) => None,
+            (_, Shape::Blob) => None,
+            // Anything is greater than a NULL
+            (Shape::Null, Shape::Null) => Some(Ordering::Equal),
+            (Shape::Null, _) => Some(Ordering::Less),
+            (_, Shape::Null) => Some(Ordering::Greater),
+            // Anything !(NULL) is greater than Bool
+            (Shape::Bool(Some(b1)), Shape::Bool(Some(b2))) => Some(b1.cmp(b2)), // Concrete bool check
+            (Shape::Bool(None), Shape::Bool(Some(_)))
+            | (Shape::Bool(Some(_)), Shape::Bool(None)) => None, // Unknown bool check
+            (Shape::Bool(_), _) => Some(Ordering::Less),
+            (_, Shape::Bool(_)) => Some(Ordering::Greater),
+            // Anything !(NULL | Bool) is greater than Number
+            (Shape::Number(Some(n1)), Shape::Number(Some(n2))) => n1.partial_cmp(n2), // Concrete number check
+            (Shape::Number(None), Shape::Number(Some(_)))
+            | (Shape::Number(Some(_)), Shape::Number(None)) => None, // Unknown number check
+            (Shape::Number(_), _) => Some(Ordering::Less),
+            (_, Shape::Number(_)) => Some(Ordering::Greater),
+            // Anything !(NULL | Bool | Number) is greater than String
+            (Shape::String(Some(s1)), Shape::String(Some(s2))) => Some(s1.cmp(s2)),
+            (Shape::String(None), Shape::String(Some(_)))
+            | (Shape::String(Some(_)), Shape::String(None)) => None, // Unknown string check
+            (Shape::String(_), _) => Some(Ordering::Less),
+            (_, Shape::String(_)) => Some(Ordering::Greater),
+            // Anything !(NULL | Bool | Number | String) is greater than Array
+            (Shape::Array(_, _), Shape::Array(_, _)) => None, // Arrays are incomparable
+            (Shape::Tuple(shapes), Shape::Tuple(shapes2)) => {
+                // Compare tuple shapes lexicographically
+                shapes
+                    .iter()
+                    .zip(shapes2.iter())
+                    .find(|(s1, s2)| {
+                        s1.partial_cmp(s2)
+                            .map(|o| o != Ordering::Equal)
+                            .unwrap_or(false)
+                    })
+                    .map(|(s1, s2)| s1.partial_cmp(s2).unwrap())
+            }
+            (Shape::Array(_, _), Shape::Tuple(_)) | (Shape::Tuple(_), Shape::Array(_, _)) => None, // Arrays are incomparable with tuples
+            (Shape::Array(_, _), _) | (Shape::Tuple(_), _) => Some(Ordering::Less),
+            (_, Shape::Array(_, _)) | (_, Shape::Tuple(_)) => Some(Ordering::Greater),
+            // Objects are greater than all
+            (Shape::Object(_), Shape::Object(_)) => None, // Objects are incomparable
+            (_, Shape::Object(_)) => Some(Ordering::Less),
+            (Shape::Object(_), _) => Some(Ordering::Greater),
+            _ => None,
+        }
+    }
+}
 
-// 3 + .
-// 3 + . : number
-// 3 + . : (null -> number<3>) | (number -> number)
 #[derive(Debug, Clone, PartialEq)]
 pub enum Access {
     Field(String),
@@ -183,7 +230,7 @@ impl Display for Shape {
             Shape::Neg(shape) => {
                 write!(f, "(!{shape})")
             }
-            Shape::Cond(shape, shape1) => todo!(),
+            Shape::Intersection(shape, shape1) => todo!(),
         }
     }
 }
@@ -319,7 +366,7 @@ impl Shape {
                 .chain(s2.dependencies())
                 .collect(),
             Shape::Neg(shape) => shape.dependencies(),
-            Shape::Cond(shape, shape1) => todo!(),
+            Shape::Intersection(shape, shape1) => todo!(),
         }
     }
 
@@ -357,7 +404,7 @@ impl Shape {
                 Shape::Union(Box::new(s1.normalize(ctx)), Box::new(s2.normalize(ctx)))
             }
             Shape::Neg(shape) => Shape::Neg(Box::new(shape.normalize(ctx))),
-            Shape::Cond(shape, shape1) => todo!(),
+            Shape::Intersection(shape, shape1) => todo!(),
         }
     }
 
@@ -417,13 +464,9 @@ impl Shape {
                 // If `shape` is a subtype of all elements in `shapes`
                 // and `u` is greater than `shapes.len()`, then array is a subtype of the tuple
                 // because for any place that expects the tuple, we can use the array instead.
-                let inner_subtyping = shapes.iter().all(|s| {
-                    if let Subtyping::Subtype = shape.subtype(s) {
-                        true
-                    } else {
-                        false
-                    }
-                });
+                let inner_subtyping = shapes
+                    .iter()
+                    .all(|s| matches!(shape.subtype(s), Subtyping::Subtype));
 
                 if inner_subtyping && u.unwrap_or(0).max(0) as usize >= shapes.len() {
                     return Subtyping::Subtype;
@@ -432,13 +475,9 @@ impl Shape {
                 // If `shape` is a supertype of all elements in `shapes`
                 // and `u` is less than `shapes.len()`, then array is a supertype of the tuple
                 // because for any place that expects the array, we can use the tuple instead.
-                let inner_subtyping = shapes.iter().all(|s| {
-                    if let Subtyping::Supertype = shape.subtype(s) {
-                        true
-                    } else {
-                        false
-                    }
-                });
+                let inner_subtyping = shapes
+                    .iter()
+                    .all(|s| matches!(shape.subtype(s), Subtyping::Supertype));
 
                 if inner_subtyping && u.unwrap_or(0).max(0) as usize <= shapes.len() {
                     return Subtyping::Supertype;
@@ -580,9 +619,9 @@ impl Shape {
                     Box::new(Shape::neg(*shape.clone()).canonicalize()),
                     Box::new(Shape::neg(*shape1.clone()).canonicalize()),
                 ),
-                Shape::Cond(shape, shape1) => todo!(),
+                Shape::Intersection(shape, shape1) => todo!(),
             },
-            Shape::Cond(shape, shape1) => todo!(),
+            Shape::Intersection(shape, shape1) => todo!(),
         }
     }
 
@@ -676,7 +715,7 @@ impl Shape {
                 //         Shape::Mismatch(_, _) => todo!(),
                 //         Shape::Union(_, _) => todo!(),
                 //         Shape::Neg(shape) => todo!(),
-                //         Shape::Cond(shape, shape1) => todo!(),
+                //         Shape::Intersection(shape, shape1) => todo!(),
                 //     })
                 //     .collect()
                 todo!()
@@ -735,7 +774,7 @@ impl Shape {
                 //         Shape::Mismatch(_, _) => todo!(),
                 //         Shape::Union(_, _) => todo!(),
                 //         Shape::Neg(shape) => todo!(),
-                //         Shape::Cond(shape, shape1) => todo!(),
+                //         Shape::Intersection(shape, shape1) => todo!(),
                 //     })
                 //     .collect()
                 todo!()
@@ -783,7 +822,7 @@ impl Shape {
                     Shape::Mismatch(_, _) => todo!(),
                     Shape::Union(_, _) => todo!(),
                     Shape::Neg(shape) => todo!(),
-                    Shape::Cond(shape, shape1) => todo!(),
+                    Shape::Intersection(shape, shape1) => todo!(),
                 })
                 .collect(),
             Filter::Null => vec![Shape::Null],
@@ -1576,7 +1615,7 @@ impl Shape {
                     Some(_) => None,
                 }
             }
-            Shape::Cond(shape, shape1) => todo!(),
+            Shape::Intersection(shape, shape1) => todo!(),
         }
     }
 
@@ -1625,7 +1664,7 @@ impl Shape {
                     Some(_) => None,
                 }
             }
-            Shape::Cond(shape, shape1) => todo!(),
+            Shape::Intersection(shape, shape1) => todo!(),
         }
     }
 }
