@@ -3,9 +3,9 @@ use std::collections::HashMap;
 use clap::Parser;
 use clap_derive::Parser;
 use serde_json::Value;
-use tjq_exec::{parse, parse_defs};
+use tjq_exec::{filters, parse};
 use tjq_exec::{Filter, Json};
-use tjq_semantics::Shape;
+use tjq_semantics::{ConstraintInference, DirectInference, Shape, TypeInference};
 
 #[derive(Parser)]
 struct CLI {
@@ -19,12 +19,13 @@ struct CLI {
     input_path: Option<String>,
     #[clap(long)]
     verbose: bool,
+    /// Type inference algorithm: "direct" or "constraint"
+    #[clap(long, default_value = "direct")]
+    inference: String,
 }
 
 pub fn builtin_filters() -> HashMap<String, Filter> {
-    // read defs.jq
-
-    parse_defs(include_str!("defs.jq"))
+    filters(include_str!("defs.jq"))
 }
 
 fn main() {
@@ -91,7 +92,10 @@ fn main() {
     }
     println!("=======================================");
 
-    let (s, results) = Shape::new(&filter, &filters);
+    let (s, results) = match args.inference.as_str() {
+        "constraint" => ConstraintInference.infer(&filter, &filters),
+        _ => DirectInference.infer(&filter, &filters),
+    };
 
     println!("inferred input shape: {}", s);
     println!(

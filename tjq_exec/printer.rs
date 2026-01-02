@@ -14,7 +14,7 @@ pub fn print_ast(node: Node, source: &str, indent: usize) {
     } else {
         node.kind()
     };
-    tracing::debug!(
+    tracing::trace!(
         "{}{}[{}..{}]: {:?}",
         indent_str,
         kind,

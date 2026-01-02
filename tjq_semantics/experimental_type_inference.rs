@@ -7,7 +7,27 @@ use std::{
 
 use tjq_exec::{BinOp, Filter, Json, UnOp};
 
+use crate::inference::TypeInference;
 use crate::{Shape, Subtyping};
+
+/// Constraint-based type inference algorithm.
+/// Uses constraint generation and solving for type inference.
+pub struct ConstraintInference;
+
+impl TypeInference for ConstraintInference {
+    fn infer(&self, filter: &Filter, filters: &HashMap<String, Filter>) -> (Shape, Vec<Shape>) {
+        let mut context = Context::new();
+        let i = context.fresh();
+        let o = context.fresh();
+        let constraints = compute_shape(filter, &mut context, i, o, filters);
+
+        let result = solve(constraints, &context).unwrap_or_default();
+
+        let tin = result.get(i);
+        let tout = result.get(o);
+        (tin, vec![tout])
+    }
+}
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum Comparison {
@@ -1125,6 +1145,30 @@ fn extract_and_resolve_constraints(
                         }
                     }
                 }
+                Relation::Equality(Equality::NotEqual) => {
+                    // t1 != t2 - if one is TVar and other is concrete, set TVar to Neg(concrete)
+                    // First resolve TVars to get actual types
+                    let t1_resolved = t1
+                        .replace_tvars(substitutions)
+                        .replace_tvars(&result.resolved);
+                    let t2_resolved = t2
+                        .replace_tvars(substitutions)
+                        .replace_tvars(&result.resolved);
+
+                    match (&t1_resolved, &t2_resolved) {
+                        (Shape::TVar(var), t) | (t, Shape::TVar(var))
+                            if !matches!(t, Shape::TVar(_)) =>
+                        {
+                            let canonical_var = get_canonical_var(*var, substitutions);
+                            if let std::collections::hash_map::Entry::Vacant(e) = result.resolved.entry(canonical_var) {
+                                // T != value means T = Neg(value)
+                                e.insert(Shape::Neg(Box::new(t.clone())));
+                                result.unresolved.remove(&canonical_var);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 _ => {}
             }
         }
@@ -1423,7 +1467,6 @@ pub fn compute_shape(
     output_type: usize,
     filters: &HashMap<String, Filter>,
 ) -> Constraints {
-    println!("computing shape for filter: {}", f);
     if f.is_const_computable() {
         // The output type should be equal to the result of the computation
         let output = Filter::filter(

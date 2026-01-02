@@ -271,11 +271,7 @@ impl Filter {
                                     ));
                                 }
 
-                                let i = i as usize;
-
-                                let i = if i < 0 { arr.len() + i } else { i };
-
-                                Ok(arr.get(i).cloned().unwrap_or(Json::Null))
+                                Ok(arr.get(i as usize).cloned().unwrap_or(Json::Null))
                             } else {
                                 i
                             }
@@ -751,12 +747,12 @@ mod tests {
 
     use tracing_subscriber::EnvFilter;
 
-    use crate::{parse, parse_defs, BinOp, Filter, JQError, Json};
+    use crate::{filters, parse, Filter, Json};
 
     fn builtin_filters() -> HashMap<String, Filter> {
         // read defs.jq
         tracing::debug!("Parsing built-in filters");
-        parse_defs(include_str!("../tjq/defs.jq"))
+        filters(include_str!("../tjq/defs.jq"))
     }
 
     fn json(s: &str) -> Json {
@@ -781,10 +777,23 @@ mod tests {
     }
 
     fn filter(s: &str) -> Filter {
-        let (_, filter) = parse(s);
+        let (defs, filter) = parse(s);
         let filter = (&filter).into();
         tracing::debug!("Parsed filter: {}", filter);
-        filter
+
+        if defs.is_empty() {
+            tracing::debug!("No local definitions, returning filter directly");
+            return filter;
+        }
+
+        let defs: HashMap<String, Filter> = defs
+            .into_iter()
+            .map(|(name, f)| (name, (&f).into()))
+            .collect();
+
+        tracing::debug!("Local definitions: {:?}", defs.keys());
+
+        Filter::FunctionExpression(defs, Box::new(filter))
     }
 
     fn run(f: &Filter, input: Json) -> Vec<Json> {
@@ -898,7 +907,7 @@ mod tests {
     }
 
     #[test]
-    fn test_map() {
+    fn test_map1() {
         let input = json("[-1.0, 2.0]");
         let f = filter("map(abs)");
 
@@ -919,16 +928,6 @@ mod tests {
 
     #[test]
     fn test_map3() {
-        let _ = tracing_subscriber::fmt()
-            .with_target(false)
-            .with_thread_ids(false)
-            .with_thread_names(false)
-            .with_file(true)
-            .with_line_number(true)
-            .with_level(true)
-            .without_time()
-            .with_env_filter(EnvFilter::from_default_env())
-            .try_init();
         let input = json("[[-1.0, -2.0], [3.0, 4.0]]");
         let f = filter("map(map(abs))");
 
@@ -962,6 +961,16 @@ mod tests {
 
     #[test]
     fn test_fibonacci() {
+        let _ = tracing_subscriber::fmt()
+            .with_target(false)
+            .with_thread_ids(false)
+            .with_thread_names(false)
+            .with_file(true)
+            .with_line_number(true)
+            .with_level(true)
+            .without_time()
+            .with_env_filter(EnvFilter::from_default_env())
+            .try_init();
         let input = json("null");
         let f = filter(
             r#"

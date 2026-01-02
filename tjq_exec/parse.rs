@@ -1,6 +1,7 @@
 use std::fmt::{Display, Formatter};
 use std::{collections::HashMap, vec};
 
+use itertools::Itertools;
 use tree_sitter::{Node, Range};
 
 use crate::printer::print_ast;
@@ -139,7 +140,26 @@ impl From<&Cst<'_>> for Filter {
                         Filter::Dot
                     };
 
-                    Filter::IfThenElse(Box::new(cond), Box::new(then), Box::new(else_branch))
+                    let mut ite = else_branch;
+
+                    for elif in cst.children[2..n - 1].iter().rev() {
+                        // each elif must have exactly 3 children: cond, then, "."
+                        assert!(
+                            elif.children.len() == 3,
+                            "Elif must have exactly 2 children: cond and then, but has {}",
+                            elif.children.iter().map(|c| c.to_string()).join(", ")
+                        );
+                        let elif_cond: Filter = (&elif.children[0]).into();
+                        let elif_body: Filter = (&elif.children[1]).into();
+                        ite = Filter::IfThenElse(
+                            Box::new(elif_cond),
+                            Box::new(elif_body),
+                            Box::new(ite),
+                        );
+                    }
+
+                    ite = Filter::IfThenElse(Box::new(cond), Box::new(then), Box::new(ite));
+                    ite
                 }
                 FilterKind::Empty => {
                     assert!(cst.children.is_empty());
@@ -180,14 +200,26 @@ impl From<&Cst<'_>> for Filter {
                     )
                 }
                 FilterKind::FunctionExpression => {
+                    tracing::trace!(
+                        "Parsing FunctionExpression with {}",
+                        cst.children.iter().map(|c| c.to_string()).join("\n\n")
+                    );
                     let final_expr = if !cst.children.is_empty() {
                         (&cst.children[cst.children.len() - 1]).into()
                     } else {
                         Filter::Dot
                     };
-                    //todo @can : utilize hashmap from nodekind and fix up here
+                    let defs: HashMap<String, Filter> = cst.children[..cst.children.len() - 1]
+                        .chunks(2)
+                        .map(|chunk| {
+                            assert!(chunk.len() == 2);
+                            let name = chunk[0].value.to_string();
+                            let body: Filter = (&chunk[1]).into();
+                            (name, body)
+                        })
+                        .collect();
 
-                    Filter::FunctionExpression(HashMap::new(), Box::new(final_expr))
+                    Filter::FunctionExpression(defs, Box::new(final_expr))
                 }
                 FilterKind::Bound => {
                     if cst.children.is_empty() {
@@ -255,12 +287,18 @@ impl Display for FilterKind {
 
 impl Display for Cst<'_> {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        write!(f, "Cst({})", self.value)?;
+        write!(f, "'{}'", self.value)?;
         if !self.children.is_empty() {
             write!(f, " -> [")?;
-            for child in &self.children {
-                write!(f, "{}, ", child)?;
-            }
+            write!(
+                f,
+                "{}",
+                self.children
+                    .iter()
+                    .map(|c| format!("{}", c))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )?;
             write!(f, "]")?;
         }
         Ok(())
@@ -467,13 +505,14 @@ impl<'a> Cst<'a> {
     pub fn function_expression(
         range: Range,
         value: &'a str,
-        defs: HashMap<String, Cst<'a>>,
+        defs: HashMap<&'a str, Cst<'a>>,
         final_expr: Cst<'a>,
     ) -> Self {
         Self {
             kind: NodeKind::FilterKind(FilterKind::FunctionExpression),
             children: defs
-                .into_values()
+                .into_iter()
+                .flat_map(|(name, body)| vec![Cst::string(body.range, name), body])
                 .chain(std::iter::once(final_expr))
                 .collect(),
             range,
@@ -533,7 +572,7 @@ pub fn parse<'a>(code: &'a str) -> (HashMap<String, Cst<'a>>, Cst<'a>) {
             "function_definition" => {
                 let (f, defs_) = parse_filter(code, child);
                 defs_.into_iter().for_each(|(name, def)| {
-                    defs.insert(name, def);
+                    defs.insert(name.to_string(), def);
                 });
                 tracing::trace!("Parsed function definition: {}", f);
             }
@@ -554,39 +593,20 @@ pub fn parse<'a>(code: &'a str) -> (HashMap<String, Cst<'a>>, Cst<'a>) {
     (defs, f)
 }
 
-pub fn parse_defs(code: &str) -> HashMap<String, Filter> {
-    let mut parser = tree_sitter::Parser::new();
-    parser
-        .set_language(&tree_sitter_tjq::LANGUAGE.into())
-        .expect("Error loading jq grammar");
-    let tree = parser.parse(code, None).unwrap();
-
-    assert_eq!(tree.root_node().kind(), "program");
-
-    let defs = HashMap::new();
-
-    for i in 0..tree.root_node().child_count() {
-        let child = tree.root_node().child(i).unwrap();
-        match child.kind() {
-            "function_definition" => {
-                let _ = parse_filter(code, child);
-            }
-            "comment" => {
-                tracing::trace!(
-                    "Skipping comment: {}",
-                    &code[child.range().start_byte..child.range().end_byte]
-                );
-            }
-            _ => {
-                panic!("unexpected node in program: {}", child.kind());
-            }
-        }
+pub fn filters(code: &str) -> HashMap<String, Filter> {
+    let (cst_defs, cst) = parse(code);
+    let mut defs = HashMap::new();
+    for (name, cst) in cst_defs {
+        let filter = (&cst).into();
+        defs.insert(name, filter);
     }
-
     defs
 }
 
-pub(crate) fn parse_filter<'a>(code: &'a str, root: Node<'_>) -> (Cst<'a>, Vec<(String, Cst<'a>)>) {
+pub(crate) fn parse_filter<'a>(
+    code: &'a str,
+    root: Node<'_>,
+) -> (Cst<'a>, Vec<(&'a str, Cst<'a>)>) {
     tracing::trace!(
         "{}: {}",
         root.kind(),
@@ -795,6 +815,22 @@ pub(crate) fn parse_filter<'a>(code: &'a str, root: Node<'_>) -> (Cst<'a>, Vec<(
                 code,
                 root.child(3).expect("if expression should have a then"),
             );
+            // if <cond> then <then> end
+            if root.child_count() <= 5 {
+                tracing::trace!("Parsed simple if-then-end");
+                let v = vc.into_iter().chain(vt).collect();
+                return (
+                    Cst::if_then_else(
+                        root.range(),
+                        cond,
+                        then,
+                        vec![],
+                        Cst::dot(root.range()),
+                        value,
+                    ),
+                    v,
+                );
+            }
 
             let mut velif = vec![];
             let elifs: Vec<Cst<'a>> = (4..root.child_count() - 2)
@@ -812,6 +848,8 @@ pub(crate) fn parse_filter<'a>(code: &'a str, root: Node<'_>) -> (Cst<'a>, Vec<(
 
                     velif.extend(vec_elif_cond);
                     velif.extend(vec_elif_then);
+
+                    tracing::trace!("Parsed elif branch");
 
                     Cst::if_then_else(
                         elif.range(),
@@ -876,9 +914,8 @@ pub(crate) fn parse_filter<'a>(code: &'a str, root: Node<'_>) -> (Cst<'a>, Vec<(
         }
         "function_definition" => {
             let value = &code[root.range().start_byte..root.range().end_byte];
-            let name = code[root.child(1).unwrap().range().start_byte
-                ..root.child(1).unwrap().range().end_byte]
-                .to_string();
+            let name = &code[root.child(1).unwrap().range().start_byte
+                ..root.child(1).unwrap().range().end_byte];
 
             let args = root
                 .child(2)
@@ -924,6 +961,7 @@ pub(crate) fn parse_filter<'a>(code: &'a str, root: Node<'_>) -> (Cst<'a>, Vec<(
                     "function_definition" => {
                         let (_, vdef) = parse_filter(code, child);
                         for (name, def) in vdef {
+                            println!("Function expression inner def: {}", name);
                             inner_defs.insert(name, def);
                         }
                     }
@@ -1056,9 +1094,7 @@ pub(crate) fn parse_filter<'a>(code: &'a str, root: Node<'_>) -> (Cst<'a>, Vec<(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BinOp, Filter, UnOp};
-    use std::collections::HashMap;
-    use std::process::CommandEnvs;
+    use crate::{BinOp, Filter};
     use tracing_subscriber::EnvFilter;
     use tree_sitter::Range;
 
@@ -1274,7 +1310,7 @@ mod tests {
         let code = "\"hello\"";
         let (_, cst) = parse(code);
         let filter: Filter = (&cst).into();
-        assert_eq!(filter, Filter::String("\"hello\"".to_string()));
+        assert_eq!(filter, Filter::String("hello".to_string()));
     }
     #[test]
     fn test_parse_and_convert_binary_expression() {
@@ -1309,7 +1345,7 @@ mod tests {
             def double(x): x * 2;
             double(5)
         "#;
-        let (defs, main_filter) = parse(code);
+        let (defs, _) = parse(code);
 
         assert!(defs.contains_key("double"));
 
@@ -1378,5 +1414,40 @@ mod tests {
                 Box::new(Filter::String(" world".to_string()))
             )
         );
+    }
+
+    #[test]
+    fn test_parse_if_elif_chain() {
+        let code = r#"
+            if . > 10 then
+                "big"
+            elif . > 5 then
+                "medium"
+            else
+                "small"
+            end
+        "#;
+        let (_, cst) = parse(code);
+        let filter: Filter = (&cst).into();
+
+        let expected_filter = Filter::IfThenElse(
+            Box::new(Filter::BinOp(
+                Box::new(Filter::Dot),
+                BinOp::Gt,
+                Box::new(Filter::Number(10.0)),
+            )),
+            Box::new(Filter::String("big".to_string())),
+            Box::new(Filter::IfThenElse(
+                Box::new(Filter::BinOp(
+                    Box::new(Filter::Dot),
+                    BinOp::Gt,
+                    Box::new(Filter::Number(5.0)),
+                )),
+                Box::new(Filter::String("medium".to_string())),
+                Box::new(Filter::String("small".to_string())),
+            )),
+        );
+
+        assert_eq!(filter, expected_filter);
     }
 }
