@@ -1,0 +1,69 @@
+# TJQ Test File for LSP Testing
+if 
+# Basic operations
+[1, 2, 3, 4, 5] | map(. * 2) | select(. > 5)
+# Object manipulation
+{
+  "name": "John",
+  "age": 30,
+  "address": {
+    "city": "New York",
+    "zip": "10001"
+  }
+} | .address.city
+
+# Array operations
+[1, 2, 3] | length
+[1, 2, 3] | add
+[1, 2, 3] | reverse
+[1, 2, 3] | sort
+[1, 2, 3] | unique
+
+# Conditionals
+if .age > 18 then "adult" else "minor" end
+
+# Try-catch
+try .nonexistent catch "default"
+
+# Variable binding
+.items as $items | $items | map(. * 2)
+
+# Reduce
+[1, 2, 3, 4] | reduce .[] as $x (0; . + $x)
+
+# Complex pipeline
+[
+  {"name": "Alice", "score": 85},
+  {"name": "Bob", "score": 92},
+  {"name": "Charlie", "score": 78}
+] | map(select(.score > 80)) | sort_by(.score) | reverse | .[0].name
+
+# String operations
+"hello world" | split(" ") | map(ascii_upcase) | join("-")
+
+# Type checking
+. | type
+. | isnumber
+. | isstring
+. | isobject
+. | isarray
+
+# Field access patterns
+.[]
+.[0]
+.[-1]
+.[1:3]
+.foo?
+.["bar"]
+
+# Comments and formatting test
+# This is a comment
+def double(x): x * 2;  # Function definition
+
+# Nested structures
+{
+  users: [
+    {id: 1, name: "User1"},
+    {id: 2, name: "User2"}
+  ]
+} | .users | map({id, name: .name | ascii_upcase})

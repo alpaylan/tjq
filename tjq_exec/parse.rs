@@ -7,6 +7,7 @@ use tree_sitter::{Node, Range};
 use crate::printer::print_ast;
 use crate::{BinOp, Filter, UnOp};
 
+#[derive(Debug)]
 pub struct Cst<'a> {
     pub range: Range,
     pub value: &'a str,
@@ -14,11 +15,15 @@ pub struct Cst<'a> {
     pub children: Vec<Cst<'a>>,
 }
 
+#[derive(Debug)]
+
 pub enum NodeKind {
     FilterKind(FilterKind),
     StringKind,
     HashMap,
 }
+
+#[derive(Debug)]
 
 pub enum FilterKind {
     Dot,
@@ -562,7 +567,8 @@ pub fn parse<'a>(code: &'a str) -> (HashMap<String, Cst<'a>>, Cst<'a>) {
         .expect("Error loading jq grammar");
     let tree = parser.parse(code, None).unwrap();
 
-    print_ast(tree.root_node(), code, 0);
+    // Don't output debug info during LSP operation
+    // print_ast(tree.root_node(), code, 0);
 
     let mut defs: HashMap<String, Cst<'a>> = HashMap::new();
 
@@ -578,7 +584,7 @@ pub fn parse<'a>(code: &'a str) -> (HashMap<String, Cst<'a>>, Cst<'a>) {
             }
             "comment" => {}
             _ => {
-                println!("unexpected node in program: {}", child.kind());
+                // println!("unexpected node in program: {}", child.kind());
             }
         }
     }
@@ -1112,7 +1118,7 @@ mod tests {
         let code = ". | .";
         let (defs, filter) = parse(code);
         assert!(defs.is_empty());
-        println!("\nParsed filter: {}", filter);
+        // println!("\nParsed filter: {}", filter);
     }
 
     #[test]
@@ -1404,8 +1410,6 @@ mod tests {
         let (_, cst) = parse(r#""hello" + " world""#);
         let filter: Filter = (&cst).into();
         // t: T -> T
-
-        println!("Filter: {:?}", filter);
         assert_eq!(
             filter,
             Filter::BinOp(
