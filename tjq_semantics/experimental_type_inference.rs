@@ -1160,7 +1160,9 @@ fn extract_and_resolve_constraints(
                             if !matches!(t, Shape::TVar(_)) =>
                         {
                             let canonical_var = get_canonical_var(*var, substitutions);
-                            if let std::collections::hash_map::Entry::Vacant(e) = result.resolved.entry(canonical_var) {
+                            if let std::collections::hash_map::Entry::Vacant(e) =
+                                result.resolved.entry(canonical_var)
+                            {
                                 // T != value means T = Neg(value)
                                 e.insert(Shape::Neg(Box::new(t.clone())));
                                 result.unresolved.remove(&canonical_var);
@@ -1467,18 +1469,39 @@ pub fn compute_shape(
     output_type: usize,
     filters: &HashMap<String, Filter>,
 ) -> Constraints {
+    compute_shape_internal(
+        f,
+        ctx,
+        input_type,
+        output_type,
+        filters,
+        &mut HashSet::new(),
+        &mut HashMap::new(),
+    )
+}
+
+fn compute_shape_internal(
+    f: &Filter,
+    ctx: &mut Context,
+    input_type: usize,
+    output_type: usize,
+    filters: &HashMap<String, Filter>,
+    computing: &mut HashSet<String>,
+    function_outputs: &mut HashMap<String, usize>,
+) -> Constraints {
     if f.is_const_computable() {
         // The output type should be equal to the result of the computation
+        tracing::trace!("Computing shape for constant computation: {f:?}");
         let output = Filter::filter(
             &ctx.const_value,
             f,
             &Default::default(),
             &mut Default::default(),
         );
+        tracing::trace!("Output: {output:?}");
         // Assume a single output for now
-        let output = output.first().unwrap();
-        match output {
-            Ok(output) => {
+        match output.first() {
+            Some(Ok(output)) => {
                 let output_shape = Shape::from_json(output.clone());
                 return vec![Constraint::Rel {
                     t1: Shape::TVar(output_type),
@@ -1486,8 +1509,11 @@ pub fn compute_shape(
                     t2: output_shape,
                 }];
             }
-            Err(err) => {
+            Some(Err(err)) => {
                 return vec![Constraint::False];
+            }
+            None => {
+                return vec![];
             }
         }
     }
@@ -1504,8 +1530,24 @@ pub fn compute_shape(
             let mid_type = ctx.fresh();
             let mut cs = vec![];
 
-            cs.extend(compute_shape(f1, ctx, input_type, mid_type, filters));
-            cs.extend(compute_shape(f2, ctx, mid_type, output_type, filters));
+            cs.extend(compute_shape_internal(
+                f1,
+                ctx,
+                input_type,
+                mid_type,
+                filters,
+                computing,
+                function_outputs,
+            ));
+            cs.extend(compute_shape_internal(
+                f2,
+                ctx,
+                mid_type,
+                output_type,
+                filters,
+                computing,
+                function_outputs,
+            ));
 
             cs
         }
@@ -1514,19 +1556,23 @@ pub fn compute_shape(
             let right_output_type = ctx.fresh();
 
             let mut cs = vec![];
-            cs.extend(compute_shape(
+            cs.extend(compute_shape_internal(
                 f1,
                 ctx,
                 input_type,
                 left_output_type,
                 filters,
+                computing,
+                function_outputs,
             ));
-            cs.extend(compute_shape(
+            cs.extend(compute_shape_internal(
                 f2,
                 ctx,
                 input_type,
                 right_output_type,
                 filters,
+                computing,
+                function_outputs,
             ));
 
             // output_type = left_output_type, right_output_type
@@ -1654,7 +1700,15 @@ pub fn compute_shape(
                 .map(|f| {
                     let output_type = ctx.fresh();
                     (
-                        compute_shape(f, ctx, input_type, output_type, filters),
+                        compute_shape_internal(
+                            f,
+                            ctx,
+                            input_type,
+                            output_type,
+                            filters,
+                            computing,
+                            function_outputs,
+                        ),
                         Shape::TVar(output_type),
                     )
                 })
@@ -1677,7 +1731,15 @@ pub fn compute_shape(
                 .iter()
                 .map(|(k, f)| {
                     let output_type = ctx.fresh();
-                    let cs = compute_shape(f, ctx, input_type, output_type, filters);
+                    let cs = compute_shape_internal(
+                        f,
+                        ctx,
+                        input_type,
+                        output_type,
+                        filters,
+                        computing,
+                        function_outputs,
+                    );
                     if let Filter::String(s) = k {
                         (cs, (s.clone(), Shape::TVar(output_type)))
                     } else {
@@ -1700,7 +1762,15 @@ pub fn compute_shape(
         }
         Filter::UnOp(un_op, filter) => {
             // let output_type = ctx.fresh();
-            let mut cs = compute_shape(filter, ctx, input_type, output_type, filters);
+            let mut cs = compute_shape_internal(
+                filter,
+                ctx,
+                input_type,
+                output_type,
+                filters,
+                computing,
+                function_outputs,
+            );
             match un_op {
                 UnOp::Neg => {
                     // input type must be a number
@@ -1724,8 +1794,24 @@ pub fn compute_shape(
             let right_type = ctx.fresh();
 
             let mut cs = vec![];
-            cs.extend(compute_shape(lhs, ctx, input_type, left_type, filters));
-            cs.extend(compute_shape(rhs, ctx, input_type, right_type, filters));
+            cs.extend(compute_shape_internal(
+                lhs,
+                ctx,
+                input_type,
+                left_type,
+                filters,
+                computing,
+                function_outputs,
+            ));
+            cs.extend(compute_shape_internal(
+                rhs,
+                ctx,
+                input_type,
+                right_type,
+                filters,
+                computing,
+                function_outputs,
+            ));
 
             match bin_op {
                 BinOp::Add => {
@@ -1962,21 +2048,76 @@ pub fn compute_shape(
         Filter::Call(f, args) => {
             if let Some(filter) = filters.get(f) {
                 if let Filter::Bound(params, body) = filter {
+                    // Check if we're already computing this function (recursive call)
+                    if let Some(&recursive_output_type) = function_outputs.get(f) {
+                        // This is a recursive call - create a fixpoint constraint
+                        // The output type of this call equals the function's output type variable
+                        tracing::trace!(
+                            "Recursive call detected for function: {f}, using fixpoint output type: {}",
+                            recursive_output_type
+                        );
+                        return vec![Constraint::Rel {
+                            t1: Shape::TVar(output_type),
+                            rel: Relation::Equality(Equality::Equal),
+                            t2: Shape::TVar(recursive_output_type),
+                        }];
+                    }
+
+                    // Add this function to the set of functions being computed
+                    // and record its output type variable for fixpoint handling
+                    computing.insert(f.clone());
+                    function_outputs.insert(f.clone(), output_type);
+
                     // if params is empty, then we can compute the shape of the body directly
-                    if params.is_empty() {
-                        return compute_shape(body, ctx, input_type, output_type, filters);
-                    }
-                    // if params is not empty, then args should match the params
-                    let args = args.clone().expect("Expected args for bound filter");
-                    if args.len() != params.len() {
-                        panic!("Expected {} args, found {}", params.len(), args.len());
-                    }
-                    todo!()
+                    let result = if params.is_empty() {
+                        compute_shape_internal(
+                            body,
+                            ctx,
+                            input_type,
+                            output_type,
+                            filters,
+                            computing,
+                            function_outputs,
+                        )
+                    } else {
+                        // if params is not empty, then args should match the params
+                        let args = args.clone().expect("Expected args for bound filter");
+                        if args.len() != params.len() {
+                            panic!("Expected {} args, found {}", params.len(), args.len());
+                        }
+
+                        // Substitute each argument filter for its corresponding parameter in the body
+                        let mut substituted_body = body.as_ref().clone();
+                        for (param, arg) in params.iter().zip(args.iter()) {
+                            substituted_body = substituted_body.substitute(param, arg);
+                        }
+
+                        // Compute constraints on the substituted body
+                        tracing::trace!("Computing shape for call: {substituted_body:?}");
+                        compute_shape_internal(
+                            &substituted_body,
+                            ctx,
+                            input_type,
+                            output_type,
+                            filters,
+                            computing,
+                            function_outputs,
+                        )
+                    };
+
+                    // Remove this function from the set of functions being computed
+                    // but keep it in function_outputs in case there are other calls
+                    computing.remove(f);
+
+                    result
                 } else {
                     panic!("Expected a bound filter, found: {:?}", filter);
                 }
             } else {
-                todo!()
+                // Unknown function - could be a built-in or undefined
+                // For now, return empty constraints (permissive)
+                // A more complete implementation would have built-in type signatures
+                vec![]
             }
         }
         Filter::IfThenElse(if_, then, else_) => {
@@ -1984,7 +2125,15 @@ pub fn compute_shape(
 
             let if_type = ctx.fresh();
 
-            cs.extend(compute_shape(if_, ctx, input_type, if_type, filters));
+            cs.extend(compute_shape_internal(
+                if_,
+                ctx,
+                input_type,
+                if_type,
+                filters,
+                computing,
+                function_outputs,
+            ));
 
             // if expression must evaluate to a boolean
             cs.push(Constraint::Rel {
@@ -1994,7 +2143,15 @@ pub fn compute_shape(
             });
 
             let then_type = ctx.fresh();
-            let then_cs = compute_shape(then, ctx, input_type, then_type, filters);
+            let then_cs = compute_shape_internal(
+                then,
+                ctx,
+                input_type,
+                then_type,
+                filters,
+                computing,
+                function_outputs,
+            );
             // if the if expression is true, then the then expression must be of type then_type
             cs.push(Constraint::Conditional {
                 c1: Box::new(Constraint::Rel {
@@ -2033,7 +2190,15 @@ pub fn compute_shape(
                 }),
             });
             // if the if expression is false, then the else expression should constrain the types.
-            let else_cs = compute_shape(else_, ctx, input_type, else_type, filters);
+            let else_cs = compute_shape_internal(
+                else_,
+                ctx,
+                input_type,
+                else_type,
+                filters,
+                computing,
+                function_outputs,
+            );
             cs.push(Constraint::Conditional {
                 c1: Box::new(Constraint::Rel {
                     t1: Shape::TVar(if_type),
@@ -2047,10 +2212,114 @@ pub fn compute_shape(
         }
         Filter::Bound(items, filter) => todo!(),
         Filter::FunctionExpression(_, _) => todo!(),
-        Filter::BindingExpression(filter, filter1) => todo!(),
-        Filter::Variable(_) => todo!(),
+        Filter::BindingExpression(lhs, _pat) => {
+            // BindingExpression evaluates lhs, binds the result to variables via pattern,
+            // and returns the original input (not the bound value).
+            // So: output_type = input_type, but we need to ensure lhs can be evaluated.
+            let mut cs = vec![];
+
+            // Compute constraints for the left-hand side expression
+            // It should be evaluable on the input_type, but we don't care about its output type
+            let lhs_output_type = ctx.fresh();
+            cs.extend(compute_shape_internal(
+                lhs,
+                ctx,
+                input_type,
+                lhs_output_type,
+                filters,
+                computing,
+                function_outputs,
+            ));
+
+            // The pattern is used for runtime variable binding, but doesn't affect type inference
+            // (we don't track variable types in the Context)
+
+            // The output type equals the input type (binding expression passes through the input)
+            cs.push(Constraint::Rel {
+                t1: Shape::TVar(input_type),
+                rel: Relation::Equality(Equality::Equal),
+                t2: Shape::TVar(output_type),
+            });
+
+            cs
+        }
+        Filter::Variable(_name) => {
+            // Variables are runtime-bound and we don't track variable types in the Context.
+            // Without a variable type context, we can't statically determine the type.
+            // Return empty constraints (permissive) - the variable could be any type.
+            vec![]
+        }
         Filter::ReduceExpression(var_name, init, generator, update) => todo!(),
         Filter::Hole => todo!(),
+        Filter::SliceExpression(start, end) => {
+            // Slicing an array returns an array of the same element type
+            // Slicing a string returns a string
+            // For simplicity: output_type = input_type (slices preserve type)
+            let mut cs = vec![];
+
+            // If start is present, it should evaluate to a number
+            if let Some(start_filter) = start {
+                let start_input = ctx.fresh();
+                let start_output = ctx.fresh();
+                cs.extend(compute_shape_internal(
+                    start_filter,
+                    ctx,
+                    start_input,
+                    start_output,
+                    filters,
+                    computing,
+                    function_outputs,
+                ));
+                // start expression receives the same input
+                cs.push(Constraint::Rel {
+                    t1: Shape::TVar(start_input),
+                    rel: Relation::Subtyping(Subtyping::Supertype),
+                    t2: Shape::TVar(input_type),
+                });
+                // start must output a number
+                cs.push(Constraint::Rel {
+                    t1: Shape::TVar(start_output),
+                    rel: Relation::Subtyping(Subtyping::Subtype),
+                    t2: Shape::Number(None),
+                });
+            }
+
+            // If end is present, it should evaluate to a number
+            if let Some(end_filter) = end {
+                let end_input = ctx.fresh();
+                let end_output = ctx.fresh();
+                cs.extend(compute_shape_internal(
+                    end_filter,
+                    ctx,
+                    end_input,
+                    end_output,
+                    filters,
+                    computing,
+                    function_outputs,
+                ));
+                // end expression receives the same input
+                cs.push(Constraint::Rel {
+                    t1: Shape::TVar(end_input),
+                    rel: Relation::Subtyping(Subtyping::Supertype),
+                    t2: Shape::TVar(input_type),
+                });
+                // end must output a number
+                cs.push(Constraint::Rel {
+                    t1: Shape::TVar(end_output),
+                    rel: Relation::Subtyping(Subtyping::Subtype),
+                    t2: Shape::Number(None),
+                });
+            }
+
+            // Output type equals input type (slicing preserves the type)
+            cs.push(Constraint::Rel {
+                t1: Shape::TVar(output_type),
+                rel: Relation::Equality(Equality::Equal),
+                t2: Shape::TVar(input_type),
+            });
+
+            cs
+        }
     }
 }
 

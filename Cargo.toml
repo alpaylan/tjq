@@ -6,5 +6,6 @@ members = [
     "tjq_exec",
     "tjq",
     "tjq_lsp",
-    "tjq_grammar"
+    "tjq_grammar",
+    "tjq_test_harness"
 ]

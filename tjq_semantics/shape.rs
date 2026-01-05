@@ -1339,6 +1339,10 @@ impl Shape {
             Filter::Variable(_) => todo!(),
             Filter::ReduceExpression(_, _, _, _) => todo!(),
             Filter::Hole => todo!(),
+            Filter::SliceExpression(_, _) => {
+                // Slicing preserves the type: array -> array, string -> string
+                shapes
+            }
         }
     }
 

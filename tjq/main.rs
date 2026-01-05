@@ -1,16 +1,21 @@
 use std::collections::HashMap;
 
-use clap::Parser;
+use clap::Parser as _;
 use clap_derive::Parser;
 use serde_json::Value;
 use tjq_exec::{filters, parse};
 use tjq_exec::{Filter, Json};
 use tjq_semantics::{ConstraintInference, DirectInference, Shape, TypeInference};
+use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 struct CLI {
-    #[clap(long)]
+    /// Filter expression (jq program)
+    #[clap(short, long)]
     expression: Option<String>,
+    /// Read filter program from a file (like jq -f)
+    #[clap(short = 'f', long)]
+    file: Option<String>,
     #[clap(long)]
     path: Option<String>,
     #[clap(long)]
@@ -29,25 +34,34 @@ pub fn builtin_filters() -> HashMap<String, Filter> {
 }
 
 fn main() {
-    tracing_subscriber::fmt()
+    let _ = tracing_subscriber::fmt()
         .with_target(false)
-        .with_thread_ids(true)
-        .with_thread_names(true)
+        .with_thread_ids(false)
+        .with_thread_names(false)
         .with_file(true)
         .with_line_number(true)
+        .with_level(true)
+        .without_time()
+        .with_env_filter(EnvFilter::from_default_env())
         .init();
 
     let args = CLI::parse();
     let expression = args
         .expression
         .or_else(|| {
-            if let Some(path) = &args.path {
+            // -f takes precedence over --path for compatibility with jq
+            if let Some(file_path) = &args.file {
+                std::fs::read_to_string(file_path).ok().or_else(|| {
+                    eprintln!("Error: failed to read filter file: {}", file_path);
+                    None
+                })
+            } else if let Some(path) = &args.path {
                 std::fs::read_to_string(path).ok()
             } else {
                 None
             }
         })
-        .expect("no expression provided, either as an argument or a file path");
+        .expect("no expression provided, use --expression, -f, or --path");
 
     let (cst_defs, cst) = parse(expression.as_str());
     let mut defs = HashMap::new();
@@ -64,10 +78,19 @@ fn main() {
             if let Some(path) = &args.input_path {
                 std::fs::read_to_string(path).ok()
             } else {
-                None
+                // Read from stdin if no input provided (like jq)
+                use std::io::Read;
+                let mut stdin = std::io::stdin();
+                let mut buffer = String::new();
+                stdin.read_to_string(&mut buffer).ok()?;
+                if buffer.trim().is_empty() {
+                    None
+                } else {
+                    Some(buffer)
+                }
             }
         })
-        .expect("no input provided, either as an argument or a file path");
+        .expect("no input provided, either as an argument, file path, or stdin");
     let json =
         Json::from_serde_value(serde_json::from_str::<Value>(json.as_str()).expect("invalid JSON"));
 

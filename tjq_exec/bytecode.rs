@@ -299,6 +299,7 @@ impl Compiler {
             Filter::Variable(_) => todo!(),
             Filter::ReduceExpression(var, generator, init, update) => todo!(),
             Filter::Hole => todo!(),
+            Filter::SliceExpression(_, _) => todo!(),
         }
     }
 }

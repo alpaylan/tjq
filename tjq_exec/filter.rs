@@ -34,7 +34,7 @@ pub enum Filter {
     BindingExpression(Box<Filter>, Box<Filter>),       //
     Variable(String),                                  // $var
     ReduceExpression(String, Box<Filter>, Box<Filter>, Box<Filter>), // reduce <f> as $<s> (<init>, <update>)
-    // SliceExpression(i32,i32),                                     // .[<n1> : <n2>]
+    SliceExpression(Option<Box<Filter>>, Option<Box<Filter>>), // .[start:end], .[start:], .[:end]
     Hole, // Placeholder for a missing value in the AST
 }
 
@@ -134,8 +134,18 @@ impl Display for Filter {
             Filter::ReduceExpression(var, gen, init, upd) => {
                 write!(f, "reduce {} as ${} ({}; {})", gen, var, init, upd)
             }
+            Filter::SliceExpression(start, end) => {
+                write!(f, ".[")?;
+                if let Some(s) = start {
+                    write!(f, "{}", s)?;
+                }
+                write!(f, ":")?;
+                if let Some(e) = end {
+                    write!(f, "{}", e)?;
+                }
+                write!(f, "]")
+            }
             Filter::Hole => write!(f, "(_)"),
-            // Filter::SliceExpression(i32:, )
         }
     }
 }
@@ -189,6 +199,18 @@ fn destructure_pattern(val: &Json, pat: &Filter, variable_ctx: &mut HashMap<Stri
     }
 }
 
+/// Check if a pattern binds a variable with the given name
+fn pattern_binds_variable(pat: &Filter, var: &str) -> bool {
+    match pat {
+        Filter::Variable(name) => name == var,
+        Filter::Array(pats) => pats.iter().any(|p| pattern_binds_variable(p, var)),
+        Filter::Object(pairs) => pairs
+            .iter()
+            .any(|(_, value_pat)| pattern_binds_variable(value_pat, var)),
+        _ => false,
+    }
+}
+
 /// Constructor functions for easily constructing filters without boilerplate
 impl Filter {
     pub fn pipe(f1: Filter, f2: Filter) -> Filter {
@@ -217,6 +239,7 @@ impl Filter {
 }
 
 impl Filter {
+    #[tracing::instrument(skip_all, ret)]
     pub fn filter(
         json: &Json,
         filter: &Filter,
@@ -596,6 +619,73 @@ impl Filter {
                 vec![Ok(acc)]
             }
 
+            Filter::SliceExpression(start, end) => {
+                // Evaluate start and end expressions
+                let start_val = start.as_ref().map(|s| {
+                    Filter::filter(json, s, global_definitions, variable_ctx)
+                        .into_iter()
+                        .find_map(|r| r.ok())
+                        .and_then(|j| match j {
+                            Json::Number(n) => Some(n as isize),
+                            _ => None,
+                        })
+                });
+                let end_val = end.as_ref().map(|e| {
+                    Filter::filter(json, e, global_definitions, variable_ctx)
+                        .into_iter()
+                        .find_map(|r| r.ok())
+                        .and_then(|j| match j {
+                            Json::Number(n) => Some(n as isize),
+                            _ => None,
+                        })
+                });
+
+                match json {
+                    Json::Array(arr) => {
+                        let len = arr.len() as isize;
+                        // Normalize indices (handle negative indices)
+                        let normalize = |idx: isize| -> usize {
+                            if idx < 0 {
+                                (len + idx).max(0) as usize
+                            } else {
+                                idx.min(len) as usize
+                            }
+                        };
+
+                        let s = start_val.flatten().map(normalize).unwrap_or(0);
+                        let e = end_val.flatten().map(normalize).unwrap_or(len as usize);
+
+                        if s >= e || s >= arr.len() {
+                            vec![Ok(Json::Array(vec![]))]
+                        } else {
+                            vec![Ok(Json::Array(arr[s..e.min(arr.len())].to_vec()))]
+                        }
+                    }
+                    Json::String(str_val) => {
+                        let len = str_val.len() as isize;
+                        let normalize = |idx: isize| -> usize {
+                            if idx < 0 {
+                                (len + idx).max(0) as usize
+                            } else {
+                                idx.min(len) as usize
+                            }
+                        };
+
+                        let s = start_val.flatten().map(normalize).unwrap_or(0);
+                        let e = end_val.flatten().map(normalize).unwrap_or(len as usize);
+
+                        if s >= e || s >= str_val.len() {
+                            vec![Ok(Json::String(String::new()))]
+                        } else {
+                            vec![Ok(Json::String(
+                                str_val[s..e.min(str_val.len())].to_string(),
+                            ))]
+                        }
+                    }
+                    _ => vec![Err(JQError::ArrIndexForNonArray(json.clone()))],
+                }
+            }
+
             Filter::Hole => vec![Err(JQError::IncompleteProgram)],
         }
     }
@@ -680,13 +770,37 @@ impl Filter {
                     Filter::Bound(items.clone(), Box::new(filter.substitute(var, arg)))
                 }
             }
-            Filter::BindingExpression(_, _) => todo!(),
-            Filter::Variable(_) => todo!(),
+            Filter::BindingExpression(lhs, pat) => {
+                if pattern_binds_variable(pat, var) {
+                    // If the pattern binds a variable with the same name as `var`,
+                    // don't substitute to avoid shadowing
+                    self.clone()
+                } else {
+                    // Substitute in both the left-hand side and the pattern
+                    Filter::BindingExpression(
+                        Box::new(lhs.substitute(var, arg)),
+                        Box::new(pat.substitute(var, arg)),
+                    )
+                }
+            }
+            Filter::Variable(name) => {
+                if name == var {
+                    // If this variable matches the one being substituted, replace it with the argument
+                    arg.clone()
+                } else {
+                    // Otherwise, keep it unchanged (it's a different variable)
+                    self.clone()
+                }
+            }
             Filter::ReduceExpression(var, gen, init, upd) => Filter::ReduceExpression(
                 var.clone(),
                 Box::new(gen.substitute(var, arg)),
                 Box::new(init.substitute(var, arg)),
                 Box::new(upd.substitute(var, arg)),
+            ),
+            Filter::SliceExpression(start, end) => Filter::SliceExpression(
+                start.as_ref().map(|s| Box::new(s.substitute(var, arg))),
+                end.as_ref().map(|e| Box::new(e.substitute(var, arg))),
             ),
 
             Filter::Hole => todo!(),
@@ -961,16 +1075,6 @@ mod tests {
 
     #[test]
     fn test_fibonacci() {
-        let _ = tracing_subscriber::fmt()
-            .with_target(false)
-            .with_thread_ids(false)
-            .with_thread_names(false)
-            .with_file(true)
-            .with_line_number(true)
-            .with_level(true)
-            .without_time()
-            .with_env_filter(EnvFilter::from_default_env())
-            .try_init();
         let input = json("null");
         let f = filter(
             r#"

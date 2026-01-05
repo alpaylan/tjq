@@ -102,6 +102,12 @@ def unique: unique_by(.);
 # Arrays
 def first:  .[ 0];
 def last:   .[-1];
+def length: 
+  if isarray | not then error("length is only defined for arrays")
+  elif . == [] then 0
+  else 1 + (.[1:] | length)
+  end;
+
 # todo(array index expressions): def nth(n): .[ n];
 
 # todo(foreach_expression): def skip($n; g): foreach g as $x ($n; . - 1; if . < 0 then $x else empty end);

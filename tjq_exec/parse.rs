@@ -4,7 +4,6 @@ use std::{collections::HashMap, vec};
 use itertools::Itertools;
 use tree_sitter::{Node, Range};
 
-use crate::printer::print_ast;
 use crate::{BinOp, Filter, UnOp};
 
 #[derive(Debug)]
@@ -46,6 +45,7 @@ pub enum FilterKind {
     IfThenElse,
     Bound,
     ReduceExpression,
+    SliceExpression,
     Hole,
     Empty,
     Error,
@@ -238,6 +238,31 @@ impl From<&Cst<'_>> for Filter {
                         Filter::Bound(args, Box::new(body))
                     }
                 }
+                FilterKind::SliceExpression => {
+                    // children[0] = start (optional, may be Hole)
+                    // children[1] = end (optional, may be Hole)
+                    let start = if cst.children.len() > 0 {
+                        let s: Filter = (&cst.children[0]).into();
+                        if matches!(s, Filter::Hole) {
+                            None
+                        } else {
+                            Some(Box::new(s))
+                        }
+                    } else {
+                        None
+                    };
+                    let end = if cst.children.len() > 1 {
+                        let e: Filter = (&cst.children[1]).into();
+                        if matches!(e, Filter::Hole) {
+                            None
+                        } else {
+                            Some(Box::new(e))
+                        }
+                    } else {
+                        None
+                    };
+                    Filter::SliceExpression(start, end)
+                }
             },
             NodeKind::HashMap => {
                 todo!("")
@@ -286,6 +311,7 @@ impl Display for FilterKind {
             FilterKind::Empty => write!(f, "empty"),
             FilterKind::Error => write!(f, "error"),
             FilterKind::BindingExpression => write!(f, "binding_expression"),
+            FilterKind::SliceExpression => write!(f, ".[:]"),
         }
     }
 }
@@ -558,6 +584,24 @@ impl<'a> Cst<'a> {
             value,
         }
     }
+
+    pub fn slice_expression(
+        range: Range,
+        value: &'a str,
+        start: Option<Cst<'a>>,
+        end: Option<Cst<'a>>,
+    ) -> Self {
+        let children = vec![
+            start.unwrap_or_else(|| Cst::hole(range)),
+            end.unwrap_or_else(|| Cst::hole(range)),
+        ];
+        Self {
+            kind: NodeKind::FilterKind(FilterKind::SliceExpression),
+            children,
+            range,
+            value,
+        }
+    }
 }
 
 pub fn parse<'a>(code: &'a str) -> (HashMap<String, Cst<'a>>, Cst<'a>) {
@@ -643,13 +687,20 @@ pub(crate) fn parse_filter<'a>(
                 // Array iterator
                 (Cst::array_iterator(root.range(), value, lhs), vl)
             } else {
-                //array index -> parse the rhs
-                let (rhs, vr) =
-                    parse_filter(code, root.child(2).expect("subscript should have a rhs"));
-
-                let v = vl.into_iter().chain(vr).collect();
-
-                (Cst::array_index(root.range(), value, lhs, rhs), v)
+                // Check if child(2) is a slice_expression
+                let child2 = root.child(2).expect("subscript should have a rhs");
+                if child2.kind() == "slice_expression" {
+                    // Slice expression: .[start:end]
+                    let (slice_cst, vs) = parse_filter(code, child2);
+                    let v = vl.into_iter().chain(vs).collect();
+                    // Wrap as pipe: lhs | slice
+                    (Cst::pipe(lhs, slice_cst, value, root.range()), v)
+                } else {
+                    //array index -> parse the rhs
+                    let (rhs, vr) = parse_filter(code, child2);
+                    let v = vl.into_iter().chain(vr).collect();
+                    (Cst::array_index(root.range(), value, lhs, rhs), v)
+                }
             }
         }
         "field" => {
@@ -693,18 +744,19 @@ pub(crate) fn parse_filter<'a>(
         "array" => {
             let val = &code[root.range().start_byte..root.range().end_byte];
 
-            if root.child_count() == 2 {
-                return (Cst::array(root.range(), vec![], val), vec![]);
-            }
-
             let mut all_defs = vec![];
-            let children: Vec<Cst> = (1..root.child_count())
-                .step_by(2)
-                .map(|i| {
-                    let (child, child_defs) =
-                        parse_filter(code, root.child(i).expect("array should have a value"));
-                    all_defs.extend(child_defs);
-                    child
+            let children: Vec<Cst> = (0..root.child_count())
+                .filter_map(|i| {
+                    let child = root.child(i)?;
+                    // Skip punctuation (brackets, commas) and comments
+                    match child.kind() {
+                        "[" | "]" | "," | "comment" => None,
+                        _ => {
+                            let (cst, child_defs) = parse_filter(code, child);
+                            all_defs.extend(child_defs);
+                            Some(cst)
+                        }
+                    }
                 })
                 .collect();
 
@@ -714,16 +766,25 @@ pub(crate) fn parse_filter<'a>(
             let mut pairs: Vec<(Cst<'a>, Cst<'a>)> = vec![];
             let mut all_defs = vec![];
 
-            for i in (1..root.child_count() - 1).step_by(2) {
-                let pair = root.child(i).unwrap();
-                let (key, key_defs) =
-                    parse_filter(code, pair.child(0).expect("pairs should have a key"));
-                let (value, value_defs) =
-                    parse_filter(code, pair.child(2).expect("pairs should have a value"));
+            for i in 0..root.child_count() {
+                let child = root.child(i).unwrap();
+                // Skip punctuation (braces, commas) and comments, only process pairs
+                match child.kind() {
+                    "{" | "}" | "," | "comment" => continue,
+                    "pair" => {
+                        let (key, key_defs) =
+                            parse_filter(code, child.child(0).expect("pairs should have a key"));
+                        let (value, value_defs) =
+                            parse_filter(code, child.child(2).expect("pairs should have a value"));
 
-                all_defs.extend(key_defs);
-                all_defs.extend(value_defs);
-                pairs.push((key, value));
+                        all_defs.extend(key_defs);
+                        all_defs.extend(value_defs);
+                        pairs.push((key, value));
+                    }
+                    _ => {
+                        // Handle other cases if needed
+                    }
+                }
             }
 
             let value = &code[root.range().start_byte..root.range().end_byte];
@@ -897,16 +958,18 @@ pub(crate) fn parse_filter<'a>(
             let args = root.child(1);
             if let Some(args) = args {
                 let mut vargs = vec![];
-                let parsed_args: Vec<Cst> = (1..args.child_count())
-                    .step_by(2)
-                    .map(|i| {
-                        let (arg, varg) = parse_filter(
-                            code,
-                            args.child(i)
-                                .expect("call expression should have arguments"),
-                        );
-                        vargs.extend(varg);
-                        arg
+                let parsed_args: Vec<Cst> = (0..args.child_count())
+                    .filter_map(|i| {
+                        let child = args.child(i)?;
+                        // Skip punctuation (parentheses, semicolons) and comments
+                        match child.kind() {
+                            "(" | ")" | ";" | "comment" => None,
+                            _ => {
+                                let (arg, varg) = parse_filter(code, child);
+                                vargs.extend(varg);
+                                Some(arg)
+                            }
+                        }
                     })
                     .collect();
 
@@ -928,16 +991,18 @@ pub(crate) fn parse_filter<'a>(
                 .expect("function definition should have arguments");
 
             let mut vargs = vec![];
-            let parsed_args: Vec<Cst> = (1..args.child_count())
-                .step_by(2)
-                .map(|i| {
-                    let (arg, varg) = parse_filter(
-                        code,
-                        args.child(i)
-                            .expect("function definition should have an argument"),
-                    );
-                    vargs.extend(varg);
-                    arg
+            let parsed_args: Vec<Cst> = (0..args.child_count())
+                .filter_map(|i| {
+                    let child = args.child(i)?;
+                    // Skip punctuation (parentheses, semicolons) and comments
+                    match child.kind() {
+                        "(" | ")" | ";" | "comment" => None,
+                        _ => {
+                            let (arg, varg) = parse_filter(code, child);
+                            vargs.extend(varg);
+                            Some(arg)
+                        }
+                    }
                 })
                 .collect();
 
@@ -967,7 +1032,6 @@ pub(crate) fn parse_filter<'a>(
                     "function_definition" => {
                         let (_, vdef) = parse_filter(code, child);
                         for (name, def) in vdef {
-                            println!("Function expression inner def: {}", name);
                             inner_defs.insert(name, def);
                         }
                     }
@@ -1078,10 +1142,60 @@ pub(crate) fn parse_filter<'a>(
         "assignment_expression" => todo!(),
         "foreach_expression" => todo!(),
         "field_expression" => {
-            // PExp '.' [<str>|<field>]
-            todo!()
+            // primary_expression '.' field
+            // This is like `expr.field` which should be `expr | .field`
+            let object_node = root
+                .child(0)
+                .expect("field_expression should have object as first child");
+            let field_node = root
+                .child(1)
+                .expect("field_expression should have field as second child");
+
+            let (object_cst, v_obj) = parse_filter(code, object_node);
+            let (field_cst, v_field) = parse_filter(code, field_node);
+
+            let v = v_obj.into_iter().chain(v_field).collect();
+
+            (
+                Cst::pipe(
+                    object_cst,
+                    field_cst,
+                    &code[root.range().start_byte..root.range().end_byte],
+                    root.range(),
+                ),
+                v,
+            )
         }
-        "slice_expression" => todo!(),
+        "slice_expression" => {
+            // slice_expression contains: optional start, ':', optional end
+            // Use named fields to extract start and end
+            let start = root
+                .child_by_field_name("start")
+                .map(|n| parse_filter(code, n));
+            let end = root
+                .child_by_field_name("end")
+                .map(|n| parse_filter(code, n));
+
+            let mut v = vec![];
+            let start_cst = start.map(|(cst, defs)| {
+                v.extend(defs);
+                cst
+            });
+            let end_cst = end.map(|(cst, defs)| {
+                v.extend(defs);
+                cst
+            });
+
+            let value = &code[root.range().start_byte..root.range().end_byte];
+            (
+                Cst::slice_expression(root.range(), value, start_cst, end_cst),
+                v,
+            )
+        }
+        "comment" => {
+            // Ignore comments
+            (Cst::dot(root.range()), vec![])
+        }
         _ => {
             tracing::warn!(
                 "unknown filter {} {}",
@@ -1453,5 +1567,59 @@ mod tests {
         );
 
         assert_eq!(filter, expected_filter);
+    }
+
+    #[test]
+    fn test_parse_slice_both() {
+        // .[2:5] - slice with both start and end
+        let code = ".[2:5]";
+        let (_, cst) = parse(code);
+        let filter: Filter = (&cst).into();
+        assert_eq!(
+            filter,
+            Filter::Pipe(
+                Box::new(Filter::Dot),
+                Box::new(Filter::SliceExpression(
+                    Some(Box::new(Filter::Number(2.0))),
+                    Some(Box::new(Filter::Number(5.0)))
+                ))
+            )
+        );
+    }
+
+    #[test]
+    fn test_parse_slice_start_only() {
+        // .[2:] - slice with start only
+        let code = ".[2:]";
+        let (_, cst) = parse(code);
+        let filter: Filter = (&cst).into();
+        assert_eq!(
+            filter,
+            Filter::Pipe(
+                Box::new(Filter::Dot),
+                Box::new(Filter::SliceExpression(
+                    Some(Box::new(Filter::Number(2.0))),
+                    None
+                ))
+            )
+        );
+    }
+
+    #[test]
+    fn test_parse_slice_end_only() {
+        // .[:5] - slice with end only
+        let code = ".[:5]";
+        let (_, cst) = parse(code);
+        let filter: Filter = (&cst).into();
+        assert_eq!(
+            filter,
+            Filter::Pipe(
+                Box::new(Filter::Dot),
+                Box::new(Filter::SliceExpression(
+                    None,
+                    Some(Box::new(Filter::Number(5.0)))
+                ))
+            )
+        );
     }
 }
