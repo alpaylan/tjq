@@ -108,6 +108,8 @@ def length:
   else 1 + (.[1:] | length)
   end;
 
+def error(msg): msg | error;
+
 # todo(array index expressions): def nth(n): .[ n];
 
 # todo(foreach_expression): def skip($n; g): foreach g as $x ($n; . - 1; if . < 0 then $x else empty end);

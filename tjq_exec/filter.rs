@@ -6,8 +6,8 @@ use std::{
 
 use itertools::Itertools;
 
-use crate::error::JQError;
 use crate::json::Json;
+use crate::{error::JQError, filters};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Filter {
@@ -36,6 +36,10 @@ pub enum Filter {
     ReduceExpression(String, Box<Filter>, Box<Filter>, Box<Filter>), // reduce <f> as $<s> (<init>, <update>)
     SliceExpression(Option<Box<Filter>>, Option<Box<Filter>>), // .[start:end], .[start:], .[:end]
     Hole, // Placeholder for a missing value in the AST
+}
+
+pub fn builtin_filters() -> HashMap<String, Filter> {
+    filters(include_str!("../tjq/defs.jq"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

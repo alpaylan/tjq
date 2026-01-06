@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use clap::Parser as _;
 use clap_derive::Parser;
 use serde_json::Value;
-use tjq_exec::{filters, parse};
+use tjq_exec::{builtin_filters, filters, parse};
 use tjq_exec::{Filter, Json};
 use tjq_semantics::{ConstraintInference, DirectInference, Shape, TypeInference};
 use tracing_subscriber::EnvFilter;
@@ -27,10 +27,6 @@ struct CLI {
     /// Type inference algorithm: "direct" or "constraint"
     #[clap(long, default_value = "direct")]
     inference: String,
-}
-
-pub fn builtin_filters() -> HashMap<String, Filter> {
-    filters(include_str!("defs.jq"))
 }
 
 fn main() {

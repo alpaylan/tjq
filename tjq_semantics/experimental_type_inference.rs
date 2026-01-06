@@ -718,7 +718,13 @@ fn solve(mut constraints: Vec<Constraint>, ctx: &Context) -> Result<SolverResult
             } = condition
             {
                 // var must be true (since it's a boolean and can't be false)
-                if !result.resolved.contains_key(var) {
+                // Allow overwriting Bool(None) with Bool(Some(true)) for more precise typing
+                let should_update = match result.resolved.get(var) {
+                    None => true,
+                    Some(Shape::Bool(None)) => true, // Refine generic bool to specific true
+                    _ => false,
+                };
+                if should_update {
                     result.resolved.insert(*var, Shape::Bool(Some(true)));
                     result.unresolved.remove(var);
                 }
@@ -729,8 +735,45 @@ fn solve(mut constraints: Vec<Constraint>, ctx: &Context) -> Result<SolverResult
                     t2: Shape::Bool(Some(true)),
                 });
             }
+
+            // If condition is `TVar(x) == true`, then x must be false (for booleans)
+            // This handles cases like: if isarray | not then error else ... end
+            // where error is in the then-branch
+            if let Constraint::Rel {
+                t1: Shape::TVar(var),
+                rel: Relation::Equality(Equality::Equal),
+                t2: Shape::Bool(Some(true)),
+            } = condition
+            {
+                // var must be false (since it's a boolean and can't be true)
+                let should_update = match result.resolved.get(var) {
+                    None => true,
+                    Some(Shape::Bool(None)) => true, // Refine generic bool to specific false
+                    _ => false,
+                };
+                if should_update {
+                    result.resolved.insert(*var, Shape::Bool(Some(false)));
+                    result.unresolved.remove(var);
+                }
+                // Mark the negation as forced true
+                forced_true.push(Constraint::Rel {
+                    t1: Shape::TVar(*var),
+                    rel: Relation::Equality(Equality::Equal),
+                    t2: Shape::Bool(Some(false)),
+                });
+            }
         }
     }
+
+    // Phase 5b: Backward propagation through conditional constraints
+    // When we force a variable to a value, trace back through conditionals to find
+    // what input values would produce that output
+    backward_propagate_constraints(
+        &mut result,
+        &mut forced_true,
+        &env.implications,
+        &substitutions,
+    );
 
     // Process implications where the condition matches a forced_true constraint
     // For disjunctions, trace through each branch and collect possible values
@@ -777,36 +820,155 @@ fn solve(mut constraints: Vec<Constraint>, ctx: &Context) -> Result<SolverResult
         }
     }
 
-    // First, process direct forced_true implications
-    for (condition, consequence) in &env.implications {
-        let condition_satisfied = forced_true.iter().any(|f| constraints_match(condition, f))
-            || condition_is_satisfied(condition, &result.resolved);
+    // Track comparison bounds for type variables
+    // Lower bounds: types that must be <= the variable (variable >= lower_bound)
+    // Upper bounds: types that must be > the variable (variable < upper_bound)
+    let mut lower_bounds: HashMap<usize, Vec<Shape>> = HashMap::new();
+    let mut upper_bounds: HashMap<usize, Vec<Shape>> = HashMap::new();
 
-        if condition_satisfied {
-            // If consequence is a disjunction, trace each branch
-            if let Constraint::Or(options) = consequence {
-                for opt in options {
-                    if let Constraint::Rel {
-                        t1: Shape::TVar(_),
-                        rel: Relation::Equality(Equality::Equal),
-                        t2: _,
-                    } = opt
-                    {
-                        // This is an assumption we can make - trace its implications
-                        trace_implications(
-                            opt,
-                            &env.implications,
-                            &mut var_possibilities,
-                            &substitutions,
-                        );
+    // Iteratively process implications until no new constraints are derived
+    let mut iteration = 0;
+    let max_iterations = 100; // Prevent infinite loops
+    loop {
+        iteration += 1;
+        if iteration > max_iterations {
+            break;
+        }
+
+        let prev_resolved_count = result.resolved.len();
+        let prev_bounds_count = lower_bounds.values().map(|v| v.len()).sum::<usize>()
+            + upper_bounds.values().map(|v| v.len()).sum::<usize>();
+
+        // Collect nested implications from activated consequences
+        let mut nested_implications: Vec<(Constraint, Constraint)> = Vec::new();
+
+        // Process implications
+        for (condition, consequence) in &env.implications {
+            let condition_satisfied = forced_true.iter().any(|f| constraints_match(condition, f))
+                || condition_is_satisfied(condition, &result.resolved);
+
+            if condition_satisfied {
+                // If consequence is a disjunction, trace each branch
+                if let Constraint::Or(options) = consequence {
+                    for opt in options {
+                        if let Constraint::Rel {
+                            t1: Shape::TVar(_),
+                            rel: Relation::Equality(Equality::Equal),
+                            t2: _,
+                        } = opt
+                        {
+                            // This is an assumption we can make - trace its implications
+                            trace_implications(
+                                opt,
+                                &env.implications,
+                                &mut var_possibilities,
+                                &substitutions,
+                            );
+                        }
                     }
+                    // Also extract comparison bounds from Or options
+                    extract_comparison_bounds_from_or(
+                        options,
+                        &mut lower_bounds,
+                        &mut upper_bounds,
+                        &substitutions,
+                        &result.resolved,
+                    );
+                } else {
+                    // Direct constraint - extract and resolve
+                    extract_and_resolve_constraints(consequence, &mut result, &substitutions);
+                    // Also extract comparison bounds
+                    extract_comparison_bounds(
+                        consequence,
+                        &mut lower_bounds,
+                        &mut upper_bounds,
+                        &substitutions,
+                        &result.resolved,
+                    );
+                    // Extract nested implications from the consequence
+                    extract_nested_implications(consequence, &mut nested_implications);
                 }
-            } else {
-                // Direct constraint
-                extract_and_resolve_constraints(consequence, &mut result, &substitutions);
             }
         }
+
+        // Also process nested implications
+        // Group implications by their condition variable to handle both branches
+        let mut implications_by_var: HashMap<usize, Vec<(bool, &Constraint)>> = HashMap::new();
+        for (condition, consequence) in &nested_implications {
+            if let Constraint::Rel {
+                t1: Shape::TVar(var),
+                rel: Relation::Equality(Equality::Equal),
+                t2: Shape::Bool(Some(value)),
+            } = condition
+            {
+                let canonical = get_canonical_var(*var, &substitutions);
+                implications_by_var
+                    .entry(canonical)
+                    .or_default()
+                    .push((*value, consequence));
+            }
+        }
+
+        for (condition, consequence) in &nested_implications {
+            let condition_satisfied = forced_true.iter().any(|f| constraints_match(condition, f))
+                || condition_is_satisfied(condition, &result.resolved);
+
+            if condition_satisfied {
+                extract_and_resolve_constraints(consequence, &mut result, &substitutions);
+                extract_comparison_bounds(
+                    consequence,
+                    &mut lower_bounds,
+                    &mut upper_bounds,
+                    &substitutions,
+                    &result.resolved,
+                );
+            }
+        }
+
+        // For undetermined boolean conditions, process both branches as possibilities
+        // This allows output type to be union of both branches
+        for (var, branches) in &implications_by_var {
+            // Check if this variable is undetermined (Bool(None) or unresolved)
+            let is_undetermined = match result.resolved.get(var) {
+                None => true,
+                Some(Shape::Bool(None)) => true,
+                _ => false,
+            };
+
+            if is_undetermined && branches.len() >= 2 {
+                // Both true and false branches exist - extract types from both
+                for (_, consequence) in branches {
+                    // Extract types as possibilities (using var_possibilities instead of direct resolution)
+                    extract_types_as_possibilities(
+                        consequence,
+                        &mut var_possibilities,
+                        &substitutions,
+                    );
+                }
+            }
+        }
+
+        // Check if we derived any new constraints
+        let new_resolved_count = result.resolved.len();
+        let new_bounds_count = lower_bounds.values().map(|v| v.len()).sum::<usize>()
+            + upper_bounds.values().map(|v| v.len()).sum::<usize>();
+
+        if new_resolved_count == prev_resolved_count && new_bounds_count == prev_bounds_count {
+            break; // Fixed point reached
+        }
     }
+
+    // Now resolve type variables from their comparison bounds
+    resolve_from_comparison_bounds(&mut result, &lower_bounds, &upper_bounds, &substitutions);
+
+    // Propagate possibilities through subtype constraints
+    // If we have T15 <: T2 and T15 has possibilities, propagate to T2
+    propagate_possibilities_through_subtypes(
+        &mut var_possibilities,
+        &env.implications,
+        &result.resolved,
+        &substitutions,
+    );
 
     // Add collected possibilities to result
     for (var, types) in var_possibilities {
@@ -942,6 +1104,419 @@ fn solve(mut constraints: Vec<Constraint>, ctx: &Context) -> Result<SolverResult
     Ok(result)
 }
 
+/// Backward propagation through conditional constraints
+/// When a variable is forced to a specific value, trace back through conditionals
+/// to determine what input values would produce that output.
+///
+/// For example, if we have:
+///   - T3 is forced to false
+///   - T11 == true ==> T12 <: T3 with T12 == false
+///   - T11 == false ==> T13 <: T3 with T13 == true
+/// Then for T3 = false, we need T11 = true.
+fn backward_propagate_constraints(
+    result: &mut SolverResult,
+    forced_true: &mut Vec<Constraint>,
+    implications: &[(Constraint, Constraint)],
+    substitutions: &HashMap<usize, Shape>,
+) {
+    let max_iterations = 20;
+    let mut iteration = 0;
+
+    loop {
+        iteration += 1;
+        if iteration > max_iterations {
+            break;
+        }
+
+        let prev_resolved_count = result.resolved.len();
+
+        // For each resolved boolean variable, try to propagate backward
+        let resolved_bools: Vec<(usize, bool)> = result
+            .resolved
+            .iter()
+            .filter_map(|(var, shape)| match shape {
+                Shape::Bool(Some(b)) => Some((*var, *b)),
+                _ => None,
+            })
+            .collect();
+
+        for (target_var, target_value) in resolved_bools {
+            // Find implications where target_var appears in the consequence as a subtype target
+            // Pattern: X == some_value ==> Y <: target_var  with  Y == some_output
+            // If target_var = target_value, find which X value produces that Y value
+
+            // Collect all implications that contribute to target_var
+            let mut contributors: Vec<(usize, bool, bool)> = vec![]; // (condition_var, condition_value, output_value)
+
+            for (condition, consequence) in implications {
+                // Check if consequence is a subtyping constraint to target_var
+                if let Constraint::Rel {
+                    t1: Shape::TVar(output_var),
+                    rel: Relation::Subtyping(Subtyping::Subtype),
+                    t2: Shape::TVar(target),
+                } = consequence
+                {
+                    let canonical_target = get_canonical_var(*target, substitutions);
+                    if canonical_target != target_var {
+                        continue;
+                    }
+
+                    // Found: condition ==> output_var <: target_var
+                    // Now find what value output_var has under this condition
+                    if let Constraint::Rel {
+                        t1: Shape::TVar(cond_var),
+                        rel: Relation::Equality(Equality::Equal),
+                        t2: Shape::Bool(Some(cond_value)),
+                    } = condition
+                    {
+                        let canonical_cond = get_canonical_var(*cond_var, substitutions);
+                        let canonical_output = get_canonical_var(*output_var, substitutions);
+
+                        // Find if there's an implication: cond_var == cond_value ==> output_var == some_bool
+                        for (cond2, conseq2) in implications {
+                            if constraints_match(cond2, condition) {
+                                // Extract equality constraints from the consequence
+                                // It might be a direct Rel or wrapped in And
+                                let equalities = extract_equalities_from_constraint(conseq2);
+                                for (out_var, out_value) in equalities {
+                                    let canonical_out2 = get_canonical_var(out_var, substitutions);
+                                    if canonical_out2 == canonical_output {
+                                        contributors.push((canonical_cond, *cond_value, out_value));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Now analyze contributors to determine what condition value produces target_value
+            // For the `not` pattern:
+            // - (cond_var, true, false) means: when cond_var=true, output is false
+            // - (cond_var, false, true) means: when cond_var=false, output is true
+            // If target_value is false, we need cond_var=true (to get output=false)
+            // If target_value is true, we need cond_var=false (to get output=true)
+
+            for (cond_var, cond_value, out_value) in &contributors {
+                if *out_value == target_value {
+                    // This branch produces the target value
+                    // Force the condition variable to cond_value
+                    let should_update = match result.resolved.get(cond_var) {
+                        None => true,
+                        Some(Shape::Bool(None)) => true,
+                        _ => false,
+                    };
+                    if should_update {
+                        result
+                            .resolved
+                            .insert(*cond_var, Shape::Bool(Some(*cond_value)));
+                        result.unresolved.remove(cond_var);
+
+                        // Also add to forced_true for forward propagation
+                        forced_true.push(Constraint::Rel {
+                            t1: Shape::TVar(*cond_var),
+                            rel: Relation::Equality(Equality::Equal),
+                            t2: Shape::Bool(Some(*cond_value)),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Check if we made progress
+        if result.resolved.len() == prev_resolved_count {
+            break;
+        }
+    }
+}
+
+/// Extract boolean equality constraints from a constraint (handles And wrapping)
+fn extract_equalities_from_constraint(c: &Constraint) -> Vec<(usize, bool)> {
+    let mut result = vec![];
+    match c {
+        Constraint::Rel {
+            t1: Shape::TVar(var),
+            rel: Relation::Equality(Equality::Equal),
+            t2: Shape::Bool(Some(value)),
+        } => {
+            result.push((*var, *value));
+        }
+        Constraint::And(cs) => {
+            for c in cs {
+                result.extend(extract_equalities_from_constraint(c));
+            }
+        }
+        _ => {}
+    }
+    result
+}
+
+/// Extract nested implications from a constraint (Constraint::Conditional within And/Or)
+fn extract_nested_implications(c: &Constraint, implications: &mut Vec<(Constraint, Constraint)>) {
+    match c {
+        Constraint::Conditional { c1, c2 } => {
+            // This is an implication: c1 ==> c2
+            implications.push((*c1.clone(), *c2.clone()));
+            // Also extract from nested parts
+            extract_nested_implications(c2, implications);
+        }
+        Constraint::And(cs) => {
+            for inner in cs {
+                extract_nested_implications(inner, implications);
+            }
+        }
+        Constraint::Or(cs) => {
+            for inner in cs {
+                extract_nested_implications(inner, implications);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Propagate possibilities through subtype constraints
+/// If T15 <: T2 and T15 has possibilities, propagate to T2
+fn propagate_possibilities_through_subtypes(
+    var_possibilities: &mut HashMap<usize, Vec<Shape>>,
+    implications: &[(Constraint, Constraint)],
+    resolved: &HashMap<usize, Shape>,
+    substitutions: &HashMap<usize, Shape>,
+) {
+    let max_iterations = 10;
+    for _ in 0..max_iterations {
+        let mut changed = false;
+
+        // Collect subtype constraints from implications
+        for (condition, consequence) in implications {
+            // Check if condition is satisfied
+            let condition_satisfied = match condition {
+                Constraint::Rel {
+                    t1: Shape::TVar(var),
+                    rel: Relation::Equality(Equality::Equal),
+                    t2: value,
+                } => {
+                    let canonical = get_canonical_var(*var, substitutions);
+                    resolved
+                        .get(&canonical)
+                        .map(|v| v == value)
+                        .unwrap_or(false)
+                }
+                _ => false,
+            };
+
+            if condition_satisfied {
+                // Look for subtype constraints in the consequence
+                propagate_subtype_possibilities(
+                    consequence,
+                    var_possibilities,
+                    substitutions,
+                    &mut changed,
+                );
+            }
+        }
+
+        if !changed {
+            break;
+        }
+    }
+}
+
+fn propagate_subtype_possibilities(
+    c: &Constraint,
+    var_possibilities: &mut HashMap<usize, Vec<Shape>>,
+    substitutions: &HashMap<usize, Shape>,
+    changed: &mut bool,
+) {
+    match c {
+        Constraint::And(cs) => {
+            for inner in cs {
+                propagate_subtype_possibilities(inner, var_possibilities, substitutions, changed);
+            }
+        }
+        Constraint::Rel {
+            t1: Shape::TVar(source),
+            rel: Relation::Subtyping(Subtyping::Subtype),
+            t2: Shape::TVar(target),
+        } => {
+            let canonical_source = get_canonical_var(*source, substitutions);
+            let canonical_target = get_canonical_var(*target, substitutions);
+
+            // If source has possibilities, propagate to target
+            if let Some(source_types) = var_possibilities.get(&canonical_source).cloned() {
+                let target_types = var_possibilities.entry(canonical_target).or_default();
+                for t in source_types {
+                    if !target_types.contains(&t) {
+                        target_types.push(t);
+                        *changed = true;
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Extract types from a constraint as possibilities for variables
+fn extract_types_as_possibilities(
+    c: &Constraint,
+    var_possibilities: &mut HashMap<usize, Vec<Shape>>,
+    substitutions: &HashMap<usize, Shape>,
+) {
+    extract_types_as_possibilities_with_resolved(
+        c,
+        var_possibilities,
+        substitutions,
+        &HashMap::new(),
+    );
+}
+
+/// Extract types with access to resolved variables to filter Or branches
+fn extract_types_as_possibilities_with_resolved(
+    c: &Constraint,
+    var_possibilities: &mut HashMap<usize, Vec<Shape>>,
+    substitutions: &HashMap<usize, Shape>,
+    resolved: &HashMap<usize, Shape>,
+) {
+    match c {
+        Constraint::And(cs) => {
+            for inner in cs {
+                extract_types_as_possibilities_with_resolved(
+                    inner,
+                    var_possibilities,
+                    substitutions,
+                    resolved,
+                );
+            }
+        }
+        Constraint::Or(cs) => {
+            // For Or constraints, only extract from branches that are satisfiable
+            // given what we know about resolved variables
+            for inner in cs {
+                if or_branch_is_satisfiable(inner, var_possibilities, substitutions) {
+                    extract_types_as_possibilities_with_resolved(
+                        inner,
+                        var_possibilities,
+                        substitutions,
+                        resolved,
+                    );
+                }
+            }
+        }
+        Constraint::Rel {
+            t1: Shape::TVar(var),
+            rel: Relation::Equality(Equality::Equal),
+            t2,
+        } if !matches!(t2, Shape::TVar(_)) => {
+            let canonical = get_canonical_var(*var, substitutions);
+            let resolved_t = t2.replace_tvars(substitutions);
+            var_possibilities
+                .entry(canonical)
+                .or_default()
+                .push(resolved_t);
+        }
+        Constraint::Rel {
+            t1,
+            rel: Relation::Equality(Equality::Equal),
+            t2: Shape::TVar(var),
+        } if !matches!(t1, Shape::TVar(_)) => {
+            let canonical = get_canonical_var(*var, substitutions);
+            let resolved_t = t1.replace_tvars(substitutions);
+            var_possibilities
+                .entry(canonical)
+                .or_default()
+                .push(resolved_t);
+        }
+        Constraint::Rel {
+            t1: Shape::TVar(var),
+            rel: Relation::Subtyping(Subtyping::Subtype),
+            t2,
+        } => {
+            let canonical_source = get_canonical_var(*var, substitutions);
+            match t2 {
+                // X <: TVar(Y) - X flows into Y
+                // If we know X's possible types, Y gets those too
+                Shape::TVar(target) => {
+                    let canonical_target = get_canonical_var(*target, substitutions);
+                    // If source has known possibilities, propagate to target
+                    if let Some(source_types) = var_possibilities.get(&canonical_source).cloned() {
+                        var_possibilities
+                            .entry(canonical_target)
+                            .or_default()
+                            .extend(source_types);
+                    }
+                }
+                // X <: concrete_type - X is constrained to be a subtype of that type
+                // Add the generic form of that type as a possibility for X
+                Shape::Number(_) => {
+                    var_possibilities
+                        .entry(canonical_source)
+                        .or_default()
+                        .push(Shape::Number(None));
+                }
+                Shape::String(_) => {
+                    var_possibilities
+                        .entry(canonical_source)
+                        .or_default()
+                        .push(Shape::String(None));
+                }
+                Shape::Bool(_) => {
+                    var_possibilities
+                        .entry(canonical_source)
+                        .or_default()
+                        .push(Shape::Bool(None));
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Check if an Or branch is satisfiable given known possibilities
+/// A branch is satisfiable if its constraints don't conflict with known types
+fn or_branch_is_satisfiable(
+    c: &Constraint,
+    var_possibilities: &HashMap<usize, Vec<Shape>>,
+    substitutions: &HashMap<usize, Shape>,
+) -> bool {
+    match c {
+        Constraint::And(cs) => cs
+            .iter()
+            .all(|inner| or_branch_is_satisfiable(inner, var_possibilities, substitutions)),
+        Constraint::Rel {
+            t1: Shape::TVar(var),
+            rel: Relation::Subtyping(Subtyping::Subtype),
+            t2,
+        } => {
+            let canonical = get_canonical_var(*var, substitutions);
+            // Check if we have possibilities for this variable
+            if let Some(possibilities) = var_possibilities.get(&canonical) {
+                // Check if any possibility is compatible with the constraint
+                possibilities.iter().any(|p| is_type_compatible(p, t2))
+            } else {
+                // No possibilities known - assume satisfiable
+                true
+            }
+        }
+        _ => true, // Other constraints assumed satisfiable
+    }
+}
+
+/// Check if a type is compatible with a target type for subtyping
+fn is_type_compatible(source: &Shape, target: &Shape) -> bool {
+    match (source, target) {
+        (Shape::Number(_), Shape::Number(_)) => true,
+        (Shape::String(_), Shape::String(_)) => true,
+        (Shape::Bool(_), Shape::Bool(_)) => true,
+        (Shape::Null, Shape::Null) => true,
+        (Shape::Array(_, _), Shape::Array(_, _)) => true,
+        (Shape::Object(_), Shape::Object(_)) => true,
+        // TVar compatibility - conservatively assume compatible
+        (Shape::TVar(_), _) | (_, Shape::TVar(_)) => true,
+        _ => false,
+    }
+}
+
 /// Canonicalize a shape (e.g., Union(true, false) -> Bool(None))
 fn canonicalize_shape(shape: &Shape) -> Shape {
     match shape {
@@ -953,14 +1528,22 @@ fn canonicalize_shape(shape: &Shape) -> Shape {
             match (&a_canon, &b_canon) {
                 (Shape::Bool(Some(true)), Shape::Bool(Some(false)))
                 | (Shape::Bool(Some(false)), Shape::Bool(Some(true))) => Shape::Bool(None),
+                // Union of any bools -> Bool(None)
+                (Shape::Bool(_), Shape::Bool(_)) => Shape::Bool(None),
                 // Union(Number(x), Number(y)) where x != y -> Number(None)
                 (Shape::Number(Some(_)), Shape::Number(Some(_))) if a_canon != b_canon => {
                     Shape::Number(None)
                 }
+                // Union(Number(_), Number(None)) or vice versa -> Number(None)
+                (Shape::Number(_), Shape::Number(None))
+                | (Shape::Number(None), Shape::Number(_)) => Shape::Number(None),
                 // Union(String(x), String(y)) where x != y -> String(None)
                 (Shape::String(Some(_)), Shape::String(Some(_))) if a_canon != b_canon => {
                     Shape::String(None)
                 }
+                // Union(String(_), String(None)) or vice versa -> String(None)
+                (Shape::String(_), Shape::String(None))
+                | (Shape::String(None), Shape::String(_)) => Shape::String(None),
                 // If both sides are the same, just use one
                 (a, b) if a == b => a.clone(),
                 _ => Shape::Union(Box::new(a_canon), Box::new(b_canon)),
@@ -1078,11 +1661,32 @@ fn extract_and_resolve_constraints(
                             if !matches!(t, Shape::TVar(_)) =>
                         {
                             let canonical_var = get_canonical_var(*var, substitutions);
-                            if let std::collections::hash_map::Entry::Vacant(e) =
-                                result.resolved.entry(canonical_var)
-                            {
-                                let resolved_t = t.replace_tvars(substitutions);
-                                e.insert(resolved_t);
+                            let resolved_t = t.replace_tvars(substitutions);
+                            // Allow insertion or refinement of generic types to specific types
+                            let should_insert = match result.resolved.get(&canonical_var) {
+                                None => true,
+                                // Refine Bool(None) to Bool(Some(_))
+                                Some(Shape::Bool(None))
+                                    if matches!(resolved_t, Shape::Bool(Some(_))) =>
+                                {
+                                    true
+                                }
+                                // Refine Number(None) to Number(Some(_))
+                                Some(Shape::Number(None))
+                                    if matches!(resolved_t, Shape::Number(Some(_))) =>
+                                {
+                                    true
+                                }
+                                // Refine String(None) to String(Some(_))
+                                Some(Shape::String(None))
+                                    if matches!(resolved_t, Shape::String(Some(_))) =>
+                                {
+                                    true
+                                }
+                                _ => false,
+                            };
+                            if should_insert {
+                                result.resolved.insert(canonical_var, resolved_t);
                                 result.unresolved.remove(&canonical_var);
                             }
                         }
@@ -1175,6 +1779,262 @@ fn extract_and_resolve_constraints(
             }
         }
         _ => {}
+    }
+}
+
+/// Extract comparison bounds from a constraint
+/// Lower bounds: T >= bound (T is greater than or equal to bound)
+/// Upper bounds: T < bound (T is strictly less than bound)
+fn extract_comparison_bounds(
+    c: &Constraint,
+    lower_bounds: &mut HashMap<usize, Vec<Shape>>,
+    upper_bounds: &mut HashMap<usize, Vec<Shape>>,
+    substitutions: &HashMap<usize, Shape>,
+    resolved: &HashMap<usize, Shape>,
+) {
+    match c {
+        Constraint::And(cs) => {
+            for c in cs {
+                extract_comparison_bounds(c, lower_bounds, upper_bounds, substitutions, resolved);
+            }
+        }
+        Constraint::Or(cs) => {
+            extract_comparison_bounds_from_or(
+                cs,
+                lower_bounds,
+                upper_bounds,
+                substitutions,
+                resolved,
+            );
+        }
+        Constraint::Rel { t1, rel, t2 } => {
+            let t1_resolved = t1.replace_tvars(substitutions).replace_tvars(resolved);
+            let t2_resolved = t2.replace_tvars(substitutions).replace_tvars(resolved);
+
+            match rel {
+                Relation::Comparison(Comparison::GreaterThan) => {
+                    // t1 > t2
+                    // If t1 is TVar and t2 is concrete: t1 > t2 means lower_bound for t1 is strictly greater than t2
+                    // We'll track this as t1 >= t2 (lower bound) for simplicity,
+                    // but mark it as strict if needed
+                    if let Shape::TVar(var) = &t1_resolved {
+                        if !matches!(t2_resolved, Shape::TVar(_)) {
+                            let canonical = get_canonical_var(*var, substitutions);
+                            let bounds = lower_bounds.entry(canonical).or_default();
+                            if !bounds.contains(&t2_resolved) {
+                                bounds.push(t2_resolved.clone());
+                            }
+                        }
+                    }
+                    // If t2 is TVar and t1 is concrete: t2 < t1 means upper_bound for t2 is t1
+                    if let Shape::TVar(var) = &t2_resolved {
+                        if !matches!(t1_resolved, Shape::TVar(_)) {
+                            let canonical = get_canonical_var(*var, substitutions);
+                            let bounds = upper_bounds.entry(canonical).or_default();
+                            if !bounds.contains(&t1_resolved) {
+                                bounds.push(t1_resolved.clone());
+                            }
+                        }
+                    }
+                }
+                Relation::Comparison(Comparison::LessThan) => {
+                    // t1 < t2
+                    // If t1 is TVar and t2 is concrete: t1 < t2 means upper_bound for t1 is t2
+                    if let Shape::TVar(var) = &t1_resolved {
+                        if !matches!(t2_resolved, Shape::TVar(_)) {
+                            let canonical = get_canonical_var(*var, substitutions);
+                            let bounds = upper_bounds.entry(canonical).or_default();
+                            if !bounds.contains(&t2_resolved) {
+                                bounds.push(t2_resolved.clone());
+                            }
+                        }
+                    }
+                    // If t2 is TVar and t1 is concrete: t2 > t1 means lower_bound for t2 is t1
+                    if let Shape::TVar(var) = &t2_resolved {
+                        if !matches!(t1_resolved, Shape::TVar(_)) {
+                            let canonical = get_canonical_var(*var, substitutions);
+                            let bounds = lower_bounds.entry(canonical).or_default();
+                            if !bounds.contains(&t1_resolved) {
+                                bounds.push(t1_resolved.clone());
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Extract comparison bounds from an Or constraint
+/// For `t1 > t2 | t1 == t2` (i.e., t1 >= t2), extract as a lower bound
+fn extract_comparison_bounds_from_or(
+    options: &[Constraint],
+    lower_bounds: &mut HashMap<usize, Vec<Shape>>,
+    upper_bounds: &mut HashMap<usize, Vec<Shape>>,
+    substitutions: &HashMap<usize, Shape>,
+    resolved: &HashMap<usize, Shape>,
+) {
+    // Check if this is a >= pattern: (t1 > t2 | t1 == t2)
+    if options.len() == 2 {
+        let (gt_opt, eq_opt) = match (&options[0], &options[1]) {
+            (
+                Constraint::Rel {
+                    t1: t1a,
+                    rel: Relation::Comparison(Comparison::GreaterThan),
+                    t2: t2a,
+                },
+                Constraint::Rel {
+                    t1: t1b,
+                    rel: Relation::Equality(Equality::Equal),
+                    t2: t2b,
+                },
+            ) if t1a == t1b && t2a == t2b => (Some((t1a, t2a)), Some((t1b, t2b))),
+            (
+                Constraint::Rel {
+                    t1: t1a,
+                    rel: Relation::Equality(Equality::Equal),
+                    t2: t2a,
+                },
+                Constraint::Rel {
+                    t1: t1b,
+                    rel: Relation::Comparison(Comparison::GreaterThan),
+                    t2: t2b,
+                },
+            ) if t1a == t1b && t2a == t2b => (Some((t1b, t2b)), Some((t1a, t2a))),
+            _ => (None, None),
+        };
+
+        if let (Some((t1, t2)), Some(_)) = (gt_opt, eq_opt) {
+            let t1_resolved = t1.replace_tvars(substitutions).replace_tvars(resolved);
+            let t2_resolved = t2.replace_tvars(substitutions).replace_tvars(resolved);
+
+            // t1 >= t2: if t1 is TVar and t2 is concrete, t2 is a lower bound for t1
+            if let Shape::TVar(var) = &t1_resolved {
+                if !matches!(t2_resolved, Shape::TVar(_)) {
+                    let canonical = get_canonical_var(*var, substitutions);
+                    let bounds = lower_bounds.entry(canonical).or_default();
+                    if !bounds.contains(&t2_resolved) {
+                        bounds.push(t2_resolved.clone());
+                    }
+                }
+            }
+            // t1 >= t2: if t2 is TVar and t1 is concrete, t1 is an upper bound for t2 (t2 <= t1)
+            // But since it's >=, t2 could equal t1, so we don't add strict upper bound
+        }
+    }
+
+    // Also process each option individually for other comparison patterns
+    for opt in options {
+        extract_comparison_bounds(opt, lower_bounds, upper_bounds, substitutions, resolved);
+    }
+}
+
+/// Resolve type variables from their comparison bounds
+/// Uses the type ordering: null < false < true < number < string < array < object
+fn resolve_from_comparison_bounds(
+    result: &mut SolverResult,
+    lower_bounds: &HashMap<usize, Vec<Shape>>,
+    upper_bounds: &HashMap<usize, Vec<Shape>>,
+    substitutions: &HashMap<usize, Shape>,
+) {
+    for var in lower_bounds
+        .keys()
+        .chain(upper_bounds.keys())
+        .collect::<HashSet<_>>()
+    {
+        if result.resolved.contains_key(var) {
+            continue;
+        }
+
+        let lower = lower_bounds.get(var).cloned().unwrap_or_default();
+        let upper = upper_bounds.get(var).cloned().unwrap_or_default();
+
+        if lower.is_empty() && upper.is_empty() {
+            continue;
+        }
+
+        // Find the tightest bounds
+        // Lower bound: variable >= max(all lower bounds) in type ordering
+        // Upper bound: variable < min(all upper bounds) in type ordering
+        let narrowed = narrow_from_bounds(&lower, &upper);
+
+        if let Some(shape) = narrowed {
+            result.resolved.insert(*var, shape);
+            result.unresolved.remove(var);
+        }
+    }
+}
+
+/// Given lower bounds (>= these) and upper bounds (< these), compute the narrowed type
+fn narrow_from_bounds(lower: &[Shape], upper: &[Shape]) -> Option<Shape> {
+    // Type ordering for narrowing: null < bool < number < string < array < object
+    // We represent the type hierarchy as levels
+    fn type_level(shape: &Shape) -> Option<u8> {
+        match shape {
+            Shape::Null => Some(0),
+            Shape::Bool(_) => Some(1),
+            Shape::Number(_) => Some(2),
+            Shape::String(_) => Some(3),
+            Shape::Array(_, _) | Shape::Tuple(_) => Some(4),
+            Shape::Object(_) => Some(5),
+            _ => None, // TVar, Blob, etc. don't have a level
+        }
+    }
+
+    // Find the maximum lower bound level
+    let max_lower_level = lower.iter().filter_map(|s| type_level(s)).max();
+
+    // Find the minimum upper bound level
+    let min_upper_level = upper.iter().filter_map(|s| type_level(s)).min();
+
+    // The variable must be >= max_lower and < min_upper
+    match (max_lower_level, min_upper_level) {
+        (Some(low), Some(high)) if low < high => {
+            // Valid range: [low, high)
+            // If the range contains exactly one type level, we can narrow to that type
+            if low + 1 == high {
+                // Exactly one type satisfies the bounds
+                level_to_shape(low)
+            } else {
+                // Multiple types possible - could return union, but for now return the lower bound type
+                level_to_shape(low)
+            }
+        }
+        (Some(low), Some(high)) if low >= high => {
+            // Empty or invalid range - constraints may be inconsistent
+            // But if low == high, the variable must be exactly at that level
+            // (this happens when we have T >= X and T < Y where X and Y are at the same level)
+            None
+        }
+        (Some(low), None) => {
+            // Only lower bound - variable is at least this type
+            // If the lower bound is Array and there's no upper bound,
+            // the variable could be Array or Object
+            // For now, return the lower bound type as the most specific
+            level_to_shape(low)
+        }
+        (None, Some(_high)) => {
+            // Only upper bound - variable is less than this type
+            // Could be any type from null up to (not including) upper bound
+            None // Too many possibilities
+        }
+        (None, None) => None,
+        (Some(_), Some(_)) => None, // Catch-all for any remaining cases
+    }
+}
+
+/// Convert a type level back to a Shape
+fn level_to_shape(level: u8) -> Option<Shape> {
+    match level {
+        0 => Some(Shape::Null),
+        1 => Some(Shape::Bool(None)),
+        2 => Some(Shape::Number(None)),
+        3 => Some(Shape::String(None)),
+        4 => Some(Shape::Array(Box::new(Shape::TVar(0)), None)), // Generic array
+        5 => Some(Shape::Object(vec![])),
+        _ => None,
     }
 }
 
@@ -1969,11 +2829,206 @@ fn compute_shape_internal(
 
                     cs
                 }
-                BinOp::Gt => todo!(),
-                BinOp::Ge => todo!(),
-                BinOp::Lt => todo!(),
+                BinOp::Gt => {
+                    // If the output is true, then left > right
+                    cs.push(Constraint::Conditional {
+                        c1: Box::new(Constraint::Rel {
+                            t1: Shape::TVar(output_type),
+                            rel: Relation::Equality(Equality::Equal),
+                            t2: Shape::Bool(Some(true)),
+                        }),
+                        c2: Box::new(Constraint::Rel {
+                            t1: Shape::TVar(left_type),
+                            rel: Relation::Comparison(Comparison::GreaterThan),
+                            t2: Shape::TVar(right_type),
+                        }),
+                    });
+
+                    // If the output is false, then left <= right
+                    cs.push(Constraint::Conditional {
+                        c1: Box::new(Constraint::Rel {
+                            t1: Shape::TVar(output_type),
+                            rel: Relation::Equality(Equality::Equal),
+                            t2: Shape::Bool(Some(false)),
+                        }),
+                        c2: Box::new(Constraint::Or(vec![
+                            Constraint::Rel {
+                                t1: Shape::TVar(left_type),
+                                rel: Relation::Comparison(Comparison::LessThan),
+                                t2: Shape::TVar(right_type),
+                            },
+                            Constraint::Rel {
+                                t1: Shape::TVar(left_type),
+                                rel: Relation::Equality(Equality::Equal),
+                                t2: Shape::TVar(right_type),
+                            },
+                        ])),
+                    });
+
+                    // In any case, the output must be a bool
+                    cs.push(Constraint::Rel {
+                        t1: Shape::TVar(output_type),
+                        rel: Relation::Subtyping(Subtyping::Subtype),
+                        t2: Shape::Bool(None),
+                    });
+
+                    cs
+                }
+                BinOp::Ge => {
+                    // If the output is true, then left >= right
+                    cs.push(Constraint::Conditional {
+                        c1: Box::new(Constraint::Rel {
+                            t1: Shape::TVar(output_type),
+                            rel: Relation::Equality(Equality::Equal),
+                            t2: Shape::Bool(Some(true)),
+                        }),
+                        c2: Box::new(Constraint::Or(vec![
+                            Constraint::Rel {
+                                t1: Shape::TVar(left_type),
+                                rel: Relation::Comparison(Comparison::GreaterThan),
+                                t2: Shape::TVar(right_type),
+                            },
+                            Constraint::Rel {
+                                t1: Shape::TVar(left_type),
+                                rel: Relation::Equality(Equality::Equal),
+                                t2: Shape::TVar(right_type),
+                            },
+                        ])),
+                    });
+
+                    // If the output is false, then left < right
+                    cs.push(Constraint::Conditional {
+                        c1: Box::new(Constraint::Rel {
+                            t1: Shape::TVar(output_type),
+                            rel: Relation::Equality(Equality::Equal),
+                            t2: Shape::Bool(Some(false)),
+                        }),
+                        c2: Box::new(Constraint::Rel {
+                            t1: Shape::TVar(left_type),
+                            rel: Relation::Comparison(Comparison::LessThan),
+                            t2: Shape::TVar(right_type),
+                        }),
+                    });
+
+                    // In any case, the output must be a bool
+                    cs.push(Constraint::Rel {
+                        t1: Shape::TVar(output_type),
+                        rel: Relation::Subtyping(Subtyping::Subtype),
+                        t2: Shape::Bool(None),
+                    });
+
+                    cs
+                }
+                BinOp::Lt => {
+                    // if the output is true, then left < right
+                    cs.push(Constraint::Conditional {
+                        c1: Box::new(Constraint::Rel {
+                            t1: Shape::TVar(output_type),
+                            rel: Relation::Equality(Equality::Equal),
+                            t2: Shape::Bool(Some(true)),
+                        }),
+                        c2: Box::new(Constraint::Rel {
+                            t1: Shape::TVar(left_type),
+                            rel: Relation::Comparison(Comparison::LessThan),
+                            t2: Shape::TVar(right_type),
+                        }),
+                    });
+
+                    // if the output is false, then left >= right
+                    cs.push(Constraint::Conditional {
+                        c1: Box::new(Constraint::Rel {
+                            t1: Shape::TVar(output_type),
+                            rel: Relation::Equality(Equality::Equal),
+                            t2: Shape::Bool(Some(false)),
+                        }),
+                        c2: Box::new(Constraint::Or(vec![
+                            Constraint::Rel {
+                                t1: Shape::TVar(left_type),
+                                rel: Relation::Comparison(Comparison::GreaterThan),
+                                t2: Shape::TVar(right_type),
+                            },
+                            Constraint::Rel {
+                                t1: Shape::TVar(left_type),
+                                rel: Relation::Equality(Equality::Equal),
+                                t2: Shape::TVar(right_type),
+                            },
+                        ])),
+                    });
+
+                    // Output must be of type bool
+                    cs.push(Constraint::Rel {
+                        t1: Shape::TVar(output_type),
+                        rel: Relation::Subtyping(Subtyping::Subtype),
+                        t2: Shape::Bool(None),
+                    });
+
+                    cs
+                }
                 BinOp::Le => todo!(),
-                BinOp::And => todo!(),
+                BinOp::And => {
+                    // if the output is true, then both left and right must be true
+                    cs.push(Constraint::Conditional {
+                        c1: Box::new(Constraint::Rel {
+                            t1: Shape::TVar(output_type),
+                            rel: Relation::Equality(Equality::Equal),
+                            t2: Shape::Bool(Some(true)),
+                        }),
+                        c2: Box::new(Constraint::And(vec![
+                            Constraint::Rel {
+                                t1: Shape::TVar(left_type),
+                                rel: Relation::Equality(Equality::Equal),
+                                t2: Shape::Bool(Some(true)),
+                            },
+                            Constraint::Rel {
+                                t1: Shape::TVar(right_type),
+                                rel: Relation::Equality(Equality::Equal),
+                                t2: Shape::Bool(Some(true)),
+                            },
+                        ])),
+                    });
+
+                    // if the output is false, then either left or right must be false
+                    cs.push(Constraint::Conditional {
+                        c1: Box::new(Constraint::Rel {
+                            t1: Shape::TVar(output_type),
+                            rel: Relation::Equality(Equality::Equal),
+                            t2: Shape::Bool(Some(false)),
+                        }),
+                        c2: Box::new(Constraint::Or(vec![
+                            Constraint::Rel {
+                                t1: Shape::TVar(left_type),
+                                rel: Relation::Equality(Equality::Equal),
+                                t2: Shape::Bool(Some(false)),
+                            },
+                            Constraint::Rel {
+                                t1: Shape::TVar(right_type),
+                                rel: Relation::Equality(Equality::Equal),
+                                t2: Shape::Bool(Some(false)),
+                            },
+                        ])),
+                    });
+
+                    // left and right and output must be of type bool
+                    cs.push(Constraint::Rel {
+                        t1: Shape::TVar(output_type),
+                        rel: Relation::Subtyping(Subtyping::Subtype),
+                        t2: Shape::Bool(None),
+                    });
+
+                    cs.push(Constraint::Rel {
+                        t1: Shape::TVar(left_type),
+                        rel: Relation::Subtyping(Subtyping::Subtype),
+                        t2: Shape::Bool(None),
+                    });
+
+                    cs.push(Constraint::Rel {
+                        t1: Shape::TVar(right_type),
+                        rel: Relation::Subtyping(Subtyping::Subtype),
+                        t2: Shape::Bool(None),
+                    });
+
+                    cs
+                }
                 BinOp::Or => {
                     // if the output is true, then either left or right must be true
                     cs.push(Constraint::Conditional {
@@ -2426,122 +3481,12 @@ mod constraint_tests {
 #[cfg(test)]
 mod solver_tests {
     use std::collections::HashMap;
-    use tjq_exec::parse;
+    use tjq_exec::{builtin_filters, parse};
     use tjq_exec::{BinOp, Filter, UnOp};
 
     use super::{solve, Constraint, Context};
 
     use crate::experimental_type_inference::{compute_shape, Shape};
-
-    fn builtin_filters() -> HashMap<String, Filter> {
-        let map = Filter::Bound(
-            vec!["f".into()],
-            Box::new(Filter::Array(vec![Filter::Pipe(
-                Box::new(Filter::ArrayIterator),
-                Box::new(Filter::Call("f".to_string(), None)),
-            )])),
-        );
-
-        let abs = Filter::Bound(
-            vec![],
-            Box::new(Filter::IfThenElse(
-                Box::new(Filter::BinOp(
-                    Box::new(Filter::Dot),
-                    BinOp::Lt,
-                    Box::new(Filter::Number(0.0)),
-                )),
-                Box::new(Filter::UnOp(UnOp::Neg, Box::new(Filter::Dot))),
-                Box::new(Filter::Dot),
-            )),
-        );
-
-        let isboolean = Filter::Bound(
-            vec![],
-            Box::new(Filter::BinOp(
-                Box::new(Filter::BinOp(
-                    Box::new(Filter::Dot),
-                    BinOp::Eq,
-                    Box::new(Filter::Boolean(true)),
-                )),
-                BinOp::Or,
-                Box::new(Filter::BinOp(
-                    Box::new(Filter::Dot),
-                    BinOp::Eq,
-                    Box::new(Filter::Boolean(false)),
-                )),
-            )),
-        );
-
-        // def type:
-        //     if . == null then "null"
-        //     elif isboolean then "boolean"
-        //     elif . < "" then "number"
-        //     elif . < [] then "string"
-        //     elif . < {} then "array"
-        //     else             "object" end;
-        let type_ = Filter::Bound(
-            vec![],
-            Box::new(Filter::IfThenElse(
-                Box::new(Filter::BinOp(
-                    Box::new(Filter::Dot),
-                    BinOp::Eq,
-                    Box::new(Filter::Null),
-                )),
-                Box::new(Filter::String("null".to_string())),
-                Box::new(Filter::IfThenElse(
-                    Box::new(Filter::Call("isboolean".to_string(), None)),
-                    Box::new(Filter::String("boolean".to_string())),
-                    Box::new(Filter::IfThenElse(
-                        Box::new(Filter::BinOp(
-                            Box::new(Filter::Dot),
-                            BinOp::Lt,
-                            Box::new(Filter::String("".to_string())),
-                        )),
-                        Box::new(Filter::String("number".to_string())),
-                        Box::new(Filter::IfThenElse(
-                            Box::new(Filter::BinOp(
-                                Box::new(Filter::Dot),
-                                BinOp::Lt,
-                                Box::new(Filter::Array(vec![])),
-                            )),
-                            Box::new(Filter::String("string".to_string())),
-                            Box::new(Filter::IfThenElse(
-                                Box::new(Filter::BinOp(
-                                    Box::new(Filter::Dot),
-                                    BinOp::Lt,
-                                    Box::new(Filter::Object(vec![])),
-                                )),
-                                Box::new(Filter::String("array".to_string())),
-                                Box::new(Filter::String("object".to_string())),
-                            )),
-                        )),
-                    )),
-                )),
-            )),
-        );
-
-        // if . == null or . == false then true else false
-        let not = Filter::Bound(
-            vec![],
-            Box::new(Filter::if_then_else(
-                Filter::or(
-                    Filter::eq(Filter::Dot, Filter::Null),
-                    Filter::eq(Filter::Dot, Filter::Boolean(false)),
-                ),
-                Filter::Boolean(true),
-                Filter::Boolean(false),
-            )),
-        );
-
-        let mut filters = HashMap::new();
-        filters.insert("map".to_string(), map);
-        filters.insert("abs".to_string(), abs);
-        filters.insert("isboolean".to_string(), isboolean);
-        filters.insert("type".to_string(), type_);
-        filters.insert("not".to_string(), not);
-
-        filters
-    }
 
     fn print_constraints(constraints: &[Constraint]) {
         println!(
@@ -2567,6 +3512,16 @@ mod solver_tests {
     }
 
     fn solve_constraints(expression: &str) -> (Shape, Shape) {
+        let _ = tracing_subscriber::fmt()
+            .with_target(false)
+            .with_thread_ids(false)
+            .with_thread_names(false)
+            .with_file(true)
+            .with_line_number(true)
+            .with_level(true)
+            .without_time()
+            .with_max_level(tracing::Level::TRACE)
+            .try_init();
         let (_, filter) = parse(expression);
         let filter = (&filter).into();
         let mut context = Context::new();
@@ -2780,5 +3735,45 @@ mod solver_tests {
         tracing::debug!("tin: {tin}, tout: {tout}");
         assert_eq!(tin, Shape::neg(Shape::number(5)));
         assert_eq!(tout, Shape::number(1));
+    }
+
+    #[test]
+    fn test_length() {
+        // The length function narrows input to array via backward propagation:
+        // 1. length uses: if isarray | not then error else ... end
+        // 2. isarray | not produces true when input is not an array
+        // 3. The then-branch errors, so `not`'s output must be false
+        // 4. Backward propagation: not(x)=false implies x=true
+        // 5. isarray(.)=true implies . is an array
+        //
+        // Output type resolution:
+        // 6. When T3=false (error branch not taken), T15 <: T2 is activated
+        // 7. T16 (is array empty?) has both true/false branches
+        // 8. T16=true branch: T19=0 flows through T19 <: T15 <: T2
+        // 9. T16=false branch: recursive call (not fully analyzed yet)
+        let (tin, tout) = solve_constraints(r#"length"#);
+        tracing::debug!("tin: {tin}, tout: {tout}");
+        assert_eq!(tin, Shape::Array(Box::new(Shape::TVar(0)), None));
+        // Output is Number(0) from the base case - recursive case would add more
+        assert!(
+            matches!(tout, Shape::Number(None)),
+            "tout should be Number, got: {tout}"
+        );
+    }
+
+    #[test]
+    fn test_is_array() {
+        // isarray is defined as `. >= [] and . < {}` in jq
+        // This narrows the input type to array because:
+        // - `. >= []` is true for arrays and objects (>= array type)
+        // - `. < {}` is true for null, bool, number, string, arrays (< object type)
+        // The intersection is exactly: arrays
+        // Since the else branch is `error`, the condition must be true, so:
+        // - The input type is narrowed to array
+        // - The output is exactly `1` (Number(Some(1.0)))
+        let (tin, tout) = solve_constraints(r#"if . >= [] and . < {} then 1 else error end"#);
+        tracing::debug!("tin: {tin}, tout: {tout}");
+        assert_eq!(tin, Shape::Array(Box::new(Shape::TVar(0)), None));
+        assert_eq!(tout, Shape::number(1.0));
     }
 }
