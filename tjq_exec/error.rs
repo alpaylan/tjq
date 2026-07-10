@@ -15,6 +15,9 @@ pub enum JQError {
     FilterNotDefined(String, usize),
     InvalidArrayIndex(Json, Json),
     IncompleteProgram,
+    /// A data-driven allocation (e.g. string repetition with an extreme
+    /// count) would exceed the interpreter's memory guard.
+    AllocationTooLarge,
     Unknown,
 }
 
@@ -60,6 +63,9 @@ impl Display for JQError {
                     json.debug(),
                     json1.debug()
                 )
+            }
+            JQError::AllocationTooLarge => {
+                write!(f, "allocation exceeds the interpreter's memory guard")
             }
             JQError::Unknown => write!(f, "Unknown error"),
             JQError::FilterNotDefined(name, args) => {

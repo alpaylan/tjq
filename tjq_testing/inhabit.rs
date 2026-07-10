@@ -51,7 +51,9 @@ fn inhabit_raw(shape: &Shape, rng: &mut Rng, depth: usize, profile: SizeProfile)
         Shape::String(Some(s)) => Some(Json::String(s.clone())),
         Shape::Array(elem, len) => {
             let n = match len {
-                Some(n) => (*n).max(0) as usize,
+                // Cap: a shape carrying an extreme length annotation must not
+                // drive an unbounded Vec allocation.
+                Some(n) => (*n).max(0).min(4096) as usize,
                 None => match profile {
                     SizeProfile::Large => 8 + rng.below(57),
                     _ => rng.below(3),

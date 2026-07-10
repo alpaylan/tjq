@@ -30,10 +30,13 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # Small smoke on push/PR; large run on schedule / manual dispatch.
-  ITERS: ${{ (github.event_name == 'pull_request' || github.event_name == 'push') && '3000' || (github.event.inputs.iters || '40000') }}
+  # Small smoke on PRs; larger run on push to experimental and on
+  # schedule / manual dispatch.
+  ITERS: ${{ github.event_name == 'pull_request' && '3000' || (github.event.inputs.iters || '25000') }}
   # Fresh seed range each run so the campaign keeps exploring; overridable.
   SEED_BASE: ${{ github.event.inputs.seed_base || github.run_id }}
+  # Leave the culprit program on disk if a shard hits an uncatchable abort.
+  DIFFTEST_TRACE: "1"
 
 jobs:
   fuzz:
@@ -41,9 +44,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Eight parallel shards with disjoint seed ranges. Shards 6 and 7
-        # run deeper programs (depth 4 and 5) to exercise nesting.
-        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+        # Ten parallel shards with disjoint seed ranges; depth spreads from
+        # 3 to 7 across shards to exercise progressively deeper programs.
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
     steps:
       - uses: actions/checkout@v4
 
@@ -65,21 +68,28 @@ jobs:
         run: |
           SHARD=${{ matrix.shard }}
           SEED=$(( SEED_BASE % 1000000 * 100000000 + SHARD * 10000000 ))
-          # Deeper programs on the last two shards.
+          # Depth spreads 3..7 across shards; deeper shards use fewer
+          # inputs per program to keep wall-clock bounded.
           case "$SHARD" in
-            6) DEPTH=4; INPUTS=4 ;;
-            7) DEPTH=5; INPUTS=6 ;;
-            *) DEPTH=3; INPUTS=4 ;;
+            0|1|2|3) DEPTH=3; INPUTS=4 ;;
+            4|5)     DEPTH=4; INPUTS=4 ;;
+            6|7)     DEPTH=5; INPUTS=4 ;;
+            8)       DEPTH=6; INPUTS=3 ;;
+            9)       DEPTH=7; INPUTS=3 ;;
           esac
           echo "shard=$SHARD seed=$SEED iters=$ITERS depth=$DEPTH inputs=$INPUTS"
           ./target/release/difftest \
             --iters "$ITERS" --seed "$SEED" --depth "$DEPTH" --inputs "$INPUTS" \
             --findings "target/findings-shard-$SHARD.jsonl"
 
-      - name: Upload findings
+      - name: Upload findings and abort trace
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: findings-shard-${{ matrix.shard }}
-          path: target/findings-shard-*.jsonl
+          # The .trace file only survives if the shard aborted mid-run; it
+          # holds the culprit program.
+          path: |
+            target/findings-shard-*.jsonl
+            target/findings-shard-*.jsonl.trace
           if-no-files-found: ignore

@@ -434,6 +434,8 @@ fn main() {
     let depth: usize = get_arg("--depth", "3").parse().expect("--depth");
     let inputs_per_program: usize = get_arg("--inputs", "4").parse().expect("--inputs");
     let findings_path = get_arg("--findings", "target/difftest-findings.jsonl");
+    let trace = std::env::var("DIFFTEST_TRACE").is_ok();
+    let trace_path = format!("{findings_path}.trace");
 
     let builtins = builtin_filters();
     let mut findings = std::fs::File::create(&findings_path).expect("findings file");
@@ -455,6 +457,15 @@ fn main() {
         let case_seed = seed.wrapping_add(i as u64);
         let mut rng = Rng::new(case_seed);
         let filter = gen_filter(&mut rng, depth);
+        // Record the current program so an *uncatchable* abort (e.g. a huge
+        // allocation that catch_unwind can't intercept) leaves the culprit
+        // on disk next to the findings file. Enable with DIFFTEST_TRACE.
+        if trace {
+            let _ = std::fs::write(
+                &trace_path,
+                format!("seed={case_seed}\nprogram={}\n", to_jq_source(&filter)),
+            );
+        }
         let program = to_jq_source(&filter);
         c.programs += 1;
 
@@ -781,6 +792,11 @@ fn main() {
         }
     }
     println!("findings written to {findings_path}");
+    // Clean completion: remove the trace so a surviving .trace file marks a
+    // shard that aborted mid-run (with the culprit program inside).
+    if trace {
+        let _ = std::fs::remove_file(&trace_path);
+    }
 
     // Hard findings are genuine bugs (in the type system, the interpreter, or
     // jq): any of these fails CI. Timeouts (the string-repetition

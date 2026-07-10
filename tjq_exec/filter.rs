@@ -42,6 +42,12 @@ pub fn builtin_filters() -> HashMap<String, Filter> {
     filters(include_str!("../tjq/defs.jq"))
 }
 
+/// Ceiling on a single data-driven allocation in the interpreter (string
+/// repetition, and any future count-sized builder). 256 MiB is far beyond
+/// anything jq produces within the differential harness's timeout, and far
+/// below the astronomical sizes an extreme numeric count would demand.
+pub const MAX_ALLOC_BYTES: usize = 256 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinOp {
     Add, // +
@@ -561,7 +567,22 @@ impl Filter {
                                     if n < 0.0 {
                                         Ok(Json::Null)
                                     } else {
-                                        Ok(Json::String(s.repeat(n.trunc() as usize)))
+                                        let count = n.trunc() as usize;
+                                        // Guard against astronomical repetition
+                                        // (an extreme count from data would
+                                        // otherwise attempt a petabyte
+                                        // allocation and abort the process,
+                                        // uncatchable by catch_unwind). jq
+                                        // effectively hangs on such inputs and
+                                        // is killed by the harness timeout, so
+                                        // it never produces one to compare
+                                        // against.
+                                        match count.checked_mul(s.len()) {
+                                            Some(bytes) if bytes <= MAX_ALLOC_BYTES => {
+                                                Ok(Json::String(s.repeat(count)))
+                                            }
+                                            _ => Err(JQError::AllocationTooLarge),
+                                        }
                                     }
                                 }
                                 // Object multiplication is recursive merge
