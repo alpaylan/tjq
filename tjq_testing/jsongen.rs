@@ -7,21 +7,62 @@ use tjq_exec::Json;
 
 /// Shared pools: `shapegen` draws singleton types from the same pools, which
 /// is what makes `Number(Some(1.0))` meet `Json::Number(1.0)` in practice.
-pub const NUMBER_POOL: [f64; 7] = [0.0, 1.0, -1.0, 2.0, 0.5, 3.0, 100.0];
-pub const STRING_POOL: [&str; 5] = ["", "a", "b", "one", "k"];
-pub const KEY_POOL: [&str; 4] = ["a", "b", "k", "x"];
+/// Kept small and collision-friendly (common integers and simple fractions)
+/// so a random literal and a random input value coincide often; the weird
+/// magnitudes live in `EXTREME_NUMBER_POOL`.
+pub const NUMBER_POOL: [f64; 13] = [
+    0.0, 1.0, -1.0, 2.0, -2.0, 0.5, -0.5, 0.25, 3.0, 4.0, 5.0, 10.0, 100.0,
+];
+/// Strings mix collision-friendly short tokens with Hypothesis-style "nasty"
+/// values: keyword/number look-alikes, whitespace, quotes/backslash, and
+/// multi-byte Unicode (to exercise codepoint-vs-byte length, `explode`, etc.).
+pub const STRING_POOL: [&str; 18] = [
+    "", "a", "b", "k", "one", "a b", " ", "0", "1", "null", "true", "false",
+    "\"", "\\", "é", "λ", "😀", "日本",
+];
+/// Object keys overlap with `.key` accesses, so this stays modest to keep the
+/// access hit-rate meaningful; a couple of extras plus a Unicode key.
+pub const KEY_POOL: [&str; 7] = ["a", "b", "c", "k", "x", "y", "é"];
 
-/// IEEE-double edge cases: overflow-adjacent, subnormal, integer-precision
-/// boundary (2^53 ± 1), and negative zero. All finite (valid JSON).
-pub const EXTREME_NUMBER_POOL: [f64; 8] = [
+/// IEEE-double edge cases, following Hypothesis's "nasty floats": overflow-
+/// adjacent magnitudes, `f64`/`f32` limits, subnormals, machine epsilons,
+/// integer-precision boundary (2^53 ± 1), power-of-two int boundaries, awkward
+/// fractions, and negative zero. All finite, so all valid JSON.
+pub const EXTREME_NUMBER_POOL: [f64; 27] = [
+    // Overflow-adjacent and type limits.
     1e308,
     -1e308,
-    5e-324,
-    9007199254740992.0, // 2^53
-    9007199254740993.0, // 2^53 + 1 (not representable; rounds to 2^53)
-    -0.0,
+    1.7976931348623157e308,  // f64::MAX
+    -1.7976931348623157e308, // -f64::MAX
+    3.402823466e38,          // f32::MAX
     1e15,
+    1e17, // jq integer/exponent formatting boundary
+    // Subnormals / smallest magnitudes.
+    5e-324,                  // smallest positive subnormal
+    2.2250738585072014e-308, // smallest positive normal
+    1e-308,
+    // Machine epsilons.
+    2.220446049250313e-16,   // f64 epsilon
+    1.1920928955078125e-7,   // f32 epsilon
+    // Integer-precision boundary.
+    9007199254740992.0,  // 2^53
+    9007199254740993.0,  // 2^53 + 1 (not representable; rounds to 2^53)
+    -9007199254740992.0, // -2^53
+    // Power-of-two / integer-type boundaries.
+    2147483647.0,  // 2^31 - 1
+    2147483648.0,  // 2^31
+    -2147483648.0, // -2^31
+    4294967296.0,  // 2^32
+    65536.0,       // 2^16
+    // Awkward fractions near integers.
     0.1,
+    0.3333333333333333, // 1/3
+    1.1,
+    1.5,
+    0.999999,
+    2.000001,
+    // Signed zero.
+    -0.0,
 ];
 
 /// How big generated values should be. `Small` is the collision-friendly

@@ -34,12 +34,13 @@ on:
 
 env:
   # ITERS = programs per shard, INPUTS = inputs per program (batched into few
-  # jq processes). Each program costs ~24s at 20k inputs, so a shard of ~200
-  # programs runs ~80 min. PRs use a fast smoke; push/schedule/dispatch run
-  # deep (many inputs) over fewer programs.
+  # jq processes). At 2k inputs a program costs ~2.4s, so a shard of 2000
+  # programs runs ~80 min. Balancing programs and inputs (2000 x 2000) widens
+  # generator coverage while still hammering each program with many inputs.
+  # PRs use a fast smoke; push/schedule/dispatch run the full balanced sweep.
   CARGO_TERM_COLOR: always
-  ITERS: ${{ github.event_name == 'pull_request' && '100' || (github.event.inputs.iters || '200') }}
-  INPUTS: ${{ github.event_name == 'pull_request' && '1000' || (github.event.inputs.inputs || '20000') }}
+  ITERS: ${{ github.event_name == 'pull_request' && '200' || (github.event.inputs.iters || '2000') }}
+  INPUTS: ${{ github.event_name == 'pull_request' && '1000' || (github.event.inputs.inputs || '2000') }}
   # Fresh seed range each run so the campaign keeps exploring; overridable.
   SEED_BASE: ${{ github.event.inputs.seed_base || github.run_id }}
   # Leave the culprit program on disk if a shard hits an uncatchable abort.

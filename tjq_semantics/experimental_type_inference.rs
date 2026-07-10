@@ -3912,6 +3912,31 @@ fn compute_shape_internal(
                             t2: Shape::String(None),
                         }];
                     }
+                    // Array-consuming builtins. `sort`/`reverse`/`flatten`
+                    // return an array; `add`/`min`/`max` return one of the
+                    // element/aggregate types (left unconstrained). All expect
+                    // an array input (jq errors otherwise).
+                    "sort" | "reverse" | "flatten" => {
+                        return vec![
+                            Constraint::Rel {
+                                t1: Shape::TVar(input_type),
+                                rel: Relation::Subtyping(Subtyping::Subtype),
+                                t2: Shape::Array(Box::new(Shape::Blob), None),
+                            },
+                            Constraint::Rel {
+                                t1: Shape::TVar(output_type),
+                                rel: Relation::Subtyping(Subtyping::Subtype),
+                                t2: Shape::Array(Box::new(Shape::Blob), None),
+                            },
+                        ];
+                    }
+                    "add" | "min" | "max" => {
+                        return vec![Constraint::Rel {
+                            t1: Shape::TVar(input_type),
+                            rel: Relation::Subtyping(Subtyping::Subtype),
+                            t2: Shape::Array(Box::new(Shape::Blob), None),
+                        }];
+                    }
                     _ => {}
                 }
             }

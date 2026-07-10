@@ -262,6 +262,31 @@ fn clamp_number(n: f64) -> f64 {
     }
 }
 
+/// jq's `+` on two values: null is the identity, numbers add, strings and
+/// arrays concatenate, objects merge (right-biased). Shared by `BinOp::Add`
+/// and the `add` builtin.
+fn add_json(l: Json, r: Json) -> Result<Json, JQError> {
+    match (l, r) {
+        (Json::Null, r) => Ok(r),
+        (l, Json::Null) => Ok(l),
+        (Json::Number(l), Json::Number(r)) => Ok(Json::Number(clamp_number(l + r))),
+        (Json::String(l), Json::String(r)) => Ok(Json::String(format!("{l}{r}"))),
+        (Json::Array(l), Json::Array(r)) => Ok(Json::Array([l, r].concat())),
+        (Json::Object(l), Json::Object(r)) => {
+            let mut merged = l;
+            for (k, v) in r {
+                if let Some(slot) = merged.iter_mut().find(|(mk, _)| mk == &k) {
+                    slot.1 = v;
+                } else {
+                    merged.push((k, v));
+                }
+            }
+            Ok(Json::Object(merged))
+        }
+        (l, r) => Err(JQError::BinOpTypeError(l, BinOp::Add, r)),
+    }
+}
+
 /// Recursive object merge for jq's `*` on objects: right wins, except two
 /// objects merge recursively.
 fn deep_merge(l: Vec<(String, Json)>, r: Vec<(String, Json)>) -> Vec<(String, Json)> {
@@ -516,36 +541,7 @@ impl Filter {
                     .map(|(r, l)| match (l, r) {
                         (Err(err), _) | (_, Err(err)) => Err(err),
                         (Ok(l), Ok(r)) => match bin_op {
-                            BinOp::Add => match (l, r) {
-                                // null is the identity of + in jq
-                                (Json::Null, r) => Ok(r),
-                                (l, Json::Null) => Ok(l),
-                                (Json::Number(l), Json::Number(r)) => {
-                                    Ok(Json::Number(clamp_number(l + r)))
-                                }
-                                (Json::String(l), Json::String(r)) => {
-                                    Ok(Json::String(format!("{}{}", l, r)))
-                                }
-                                (Json::Array(l), Json::Array(r)) => {
-                                    Ok(Json::Array([l, r].concat()))
-                                }
-                                (Json::Object(l), Json::Object(r)) => {
-                                    // Right-biased merge: duplicate keys take
-                                    // the right operand's value
-                                    let mut merged = l.clone();
-                                    for (k, v) in r {
-                                        if let Some(slot) =
-                                            merged.iter_mut().find(|(mk, _)| mk == &k)
-                                        {
-                                            slot.1 = v;
-                                        } else {
-                                            merged.push((k, v));
-                                        }
-                                    }
-                                    Ok(Json::Object(merged))
-                                }
-                                (l, r) => Err(JQError::BinOpTypeError(l, *bin_op, r)),
-                            },
+                            BinOp::Add => add_json(l, r),
                             BinOp::Sub => match (l, r) {
                                 (Json::Number(l), Json::Number(r)) => {
                                     Ok(Json::Number(clamp_number(l - r)))
@@ -728,6 +724,93 @@ impl Filter {
                             },
                             other => Err(JQError::UnOpTypeError(other.clone(), UnOp::Neg)),
                         }];
+                    }
+                    if name == "reverse" {
+                        // jq 1.7 `reverse` is `[.[length-1-range(0;length)]]`:
+                        // arrays reverse; null and the empty object yield []
+                        // (range is empty, so no numeric index is taken); a
+                        // non-empty object errors (object indexed by number);
+                        // strings are not reversible in jq 1.7.
+                        return vec![match json {
+                            Json::Array(arr) => {
+                                Ok(Json::Array(arr.iter().rev().cloned().collect()))
+                            }
+                            Json::Null => Ok(Json::Array(vec![])),
+                            Json::Object(obj) if obj.is_empty() => Ok(Json::Array(vec![])),
+                            Json::String(s) if s.is_empty() => Ok(Json::Array(vec![])),
+                            other => Err(JQError::ArrIndexForNonArray(other.clone())),
+                        }];
+                    }
+                    if name == "sort" {
+                        return vec![match json {
+                            Json::Array(arr) => {
+                                let mut sorted = arr.clone();
+                                sorted.sort();
+                                Ok(Json::Array(sorted))
+                            }
+                            other => Err(JQError::ArrIndexForNonArray(other.clone())),
+                        }];
+                    }
+                    if name == "min" || name == "max" {
+                        return vec![match json {
+                            Json::Array(arr) if arr.is_empty() => Ok(Json::Null),
+                            Json::Array(arr) => {
+                                let v = if name == "min" {
+                                    arr.iter().min()
+                                } else {
+                                    arr.iter().max()
+                                };
+                                Ok(v.cloned().unwrap())
+                            }
+                            other => Err(JQError::ArrIndexForNonArray(other.clone())),
+                        }];
+                    }
+                    if name == "add" {
+                        // jq: `reduce .[] as $x (null; . + $x)`. `.[]` iterates
+                        // array elements or object values, so numbers sum,
+                        // strings/arrays concat, objects merge; empty yields
+                        // null. Non-iterable inputs error.
+                        let values: Vec<&Json> = match json {
+                            Json::Array(arr) => arr.iter().collect(),
+                            Json::Object(obj) => obj.iter().map(|(_, v)| v).collect(),
+                            other => {
+                                return vec![Err(JQError::ArrIndexForNonArray(other.clone()))]
+                            }
+                        };
+                        let mut acc = Json::Null;
+                        for item in values {
+                            acc = match add_json(acc, item.clone()) {
+                                Ok(v) => v,
+                                Err(e) => return vec![Err(e)],
+                            };
+                        }
+                        return vec![Ok(acc)];
+                    }
+                    if name == "flatten" {
+                        // jq: `reduce .[] as $x ([]; if $x|type=="array" ...)`.
+                        // `.[]` iterates array elements or object values; only
+                        // nested *arrays* are recursed into (object values are
+                        // kept as-is), to full depth. Non-iterable inputs error.
+                        fn flat(arr: &[Json], out: &mut Vec<Json>) {
+                            for v in arr {
+                                match v {
+                                    Json::Array(inner) => flat(inner, out),
+                                    other => out.push(other.clone()),
+                                }
+                            }
+                        }
+                        let values: Vec<Json> = match json {
+                            Json::Array(arr) => arr.clone(),
+                            Json::Object(obj) => {
+                                obj.iter().map(|(_, v)| v.clone()).collect()
+                            }
+                            other => {
+                                return vec![Err(JQError::ArrIndexForNonArray(other.clone()))]
+                            }
+                        };
+                        let mut out = vec![];
+                        flat(&values, &mut out);
+                        return vec![Ok(Json::Array(out))];
                     }
                     let filter = global_definitions.get(name).ok_or_else(|| {
                         JQError::FilterNotDefined(

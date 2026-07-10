@@ -6,6 +6,90 @@ use tree_sitter::{Node, Range};
 
 use crate::{BinOp, Filter, UnOp};
 
+/// Decode the JSON/jq escape sequences in the (already quote-stripped) body of
+/// a double-quoted string literal, so the stored value holds the real
+/// characters (`"\\"` → a single backslash, `"\n"` → a newline). Mirrors jq's
+/// lexer; `\uXXXX` is decoded, honoring UTF-16 surrogate pairs. Unrecognized
+/// escapes are preserved verbatim (backslash included) rather than dropped.
+pub(crate) fn unescape_jq_string(s: &str) -> String {
+    if !s.contains('\\') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some('/') => out.push('/'),
+            Some('b') => out.push('\u{0008}'),
+            Some('f') => out.push('\u{000C}'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('u') => {
+                let hi = take_hex4(&mut chars);
+                match hi {
+                    Some(hi) if (0xD800..=0xDBFF).contains(&hi) => {
+                        // High surrogate: expect a following `\uXXXX` low surrogate.
+                        let low = if chars.peek() == Some(&'\\') {
+                            chars.next();
+                            if chars.peek() == Some(&'u') {
+                                chars.next();
+                                take_hex4(&mut chars)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        match low {
+                            Some(low) if (0xDC00..=0xDFFF).contains(&low) => {
+                                let cp = 0x10000
+                                    + (((hi - 0xD800) as u32) << 10)
+                                    + (low - 0xDC00) as u32;
+                                if let Some(ch) = char::from_u32(cp) {
+                                    out.push(ch);
+                                } else {
+                                    out.push('\u{FFFD}');
+                                }
+                            }
+                            _ => out.push('\u{FFFD}'),
+                        }
+                    }
+                    Some(hi) => {
+                        out.push(char::from_u32(hi as u32).unwrap_or('\u{FFFD}'));
+                    }
+                    None => out.push_str("\\u"),
+                }
+            }
+            Some(other) => {
+                // Unrecognized escape: keep it literally.
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// Read exactly four hex digits as a `u16` code unit, or `None` if fewer
+/// than four hex digits follow.
+fn take_hex4(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<u16> {
+    let mut v: u16 = 0;
+    for _ in 0..4 {
+        let d = chars.peek()?.to_digit(16)?;
+        chars.next();
+        v = v * 16 + d as u16;
+    }
+    Some(v)
+}
+
 #[derive(Debug)]
 pub struct Cst<'a> {
     pub range: Range,
@@ -104,7 +188,7 @@ impl From<&Cst<'_>> for Filter {
                 }
                 FilterKind::String => {
                     assert!(cst.children.is_empty());
-                    Filter::String(cst.value.to_string())
+                    Filter::String(unescape_jq_string(cst.value))
                 }
                 FilterKind::Array => Filter::Array(cst.children.iter().map(|c| c.into()).collect()),
                 FilterKind::Object => Filter::Object(
@@ -1256,6 +1340,30 @@ mod tests {
         let cst = Cst::hole(test_range());
         let filter: Filter = (&cst).into();
         assert_eq!(filter, Filter::Hole);
+    }
+
+    #[test]
+    fn test_unescape_jq_string() {
+        // Body is the already-quote-stripped literal content.
+        assert_eq!(unescape_jq_string("plain"), "plain");
+        assert_eq!(unescape_jq_string("\\\\"), "\\"); // \\  -> one backslash
+        assert_eq!(unescape_jq_string("\\n"), "\n"); // \n  -> newline
+        assert_eq!(unescape_jq_string("\\t"), "\t"); // \t  -> tab
+        assert_eq!(unescape_jq_string("a\\\"b"), "a\"b"); // a\"b -> a"b
+        assert_eq!(unescape_jq_string("\\/"), "/");
+        assert_eq!(unescape_jq_string("\\u0041"), "A"); // BMP escape
+        assert_eq!(unescape_jq_string("\\uD83D\\uDE00"), "😀"); // surrogate pair
+        // Unrecognized escapes are preserved verbatim.
+        assert_eq!(unescape_jq_string("\\x"), "\\x");
+    }
+
+    #[test]
+    fn test_string_literal_length_matches_jq() {
+        // Regression: the literal `"\\"` decodes to a single backslash
+        // (so `"\\" | length` is 1, not 2).
+        let (_defs, cst) = parse("\"\\\\\"");
+        let filter: Filter = (&cst).into();
+        assert_eq!(filter, Filter::String("\\".to_string()));
     }
     #[test]
     fn test_null_conversion() {

@@ -9,7 +9,7 @@
 //! are excluded until the failure effect lands in the arrow types
 //! (docs/type-system-scope.md §2).
 
-use crate::jsongen::{KEY_POOL, NUMBER_POOL, STRING_POOL};
+use crate::jsongen::{EXTREME_NUMBER_POOL, KEY_POOL, NUMBER_POOL, STRING_POOL};
 use crate::rng::Rng;
 use tjq_exec::{BinOp, Filter, UnOp};
 
@@ -17,7 +17,7 @@ pub fn gen_filter(rng: &mut Rng, depth: usize) -> Filter {
     if depth == 0 {
         return gen_leaf(rng);
     }
-    match rng.below(24) {
+    match rng.below(25) {
         // Leaves stay likely at every depth so programs end
         0..=5 => gen_leaf(rng),
         6..=9 => Filter::Pipe(
@@ -75,6 +75,15 @@ pub fn gen_filter(rng: &mut Rng, depth: usize) -> Filter {
                 Box::new(gen_filter(rng, depth - 1)),
             )
         }
+        23 => {
+            // Higher-order builtins taking a filter argument (defs.jq),
+            // exercising jq's Call machinery.
+            let name = *rng.pick(&["map", "select"]);
+            Filter::Call(
+                name.to_string(),
+                Some(vec![gen_filter(rng, depth - 1)]),
+            )
+        }
         _ => {
             // Object construction with 1-2 literal keys
             let len = 1 + rng.below(2);
@@ -110,12 +119,19 @@ fn gen_access(rng: &mut Rng) -> Filter {
 }
 
 fn gen_leaf(rng: &mut Rng) -> Filter {
-    match rng.below(14) {
+    match rng.below(15) {
         0 | 1 => Filter::Dot,
         2 | 3 => Filter::ObjIndex(Box::new(Filter::String(rng.pick(&KEY_POOL).to_string()))),
         4 => Filter::Null,
         5 => Filter::Boolean(rng.chance(1, 2)),
-        6 | 7 => Filter::Number(*rng.pick(&NUMBER_POOL)),
+        6 => Filter::Number(*rng.pick(&NUMBER_POOL)),
+        // Occasionally emit an IEEE edge-case literal so arithmetic and
+        // comparison paths meet overflow/subnormal/precision-boundary values.
+        7 => Filter::Number(if rng.chance(1, 3) {
+            *rng.pick(&EXTREME_NUMBER_POOL)
+        } else {
+            *rng.pick(&NUMBER_POOL)
+        }),
         8 => Filter::String(rng.pick(&STRING_POOL).to_string()),
         9 => Filter::ArrayIterator,
         10 => Filter::ArrayIndex(Box::new(Filter::Number(rng.below(3) as f64))),
@@ -124,8 +140,13 @@ fn gen_leaf(rng: &mut Rng) -> Filter {
             let name = *rng.pick(&["type", "not", "tostring"]);
             Filter::Call(name.to_string(), None)
         }
-        _ => {
+        13 => {
             let name = *rng.pick(&["keys", "floor", "tonumber"]);
+            Filter::Call(name.to_string(), None)
+        }
+        _ => {
+            // Array-consuming builtins.
+            let name = *rng.pick(&["add", "sort", "reverse", "min", "max", "flatten"]);
             Filter::Call(name.to_string(), None)
         }
     }
@@ -139,7 +160,10 @@ pub fn to_jq_source(f: &Filter) -> String {
         Filter::Pipe(f1, f2) => format!("{} | {}", atom(f1), atom(f2)),
         Filter::Comma(f1, f2) => format!("{}, {}", atom(f1), atom(f2)),
         Filter::ObjIndex(inner) => match inner.as_ref() {
-            Filter::String(s) => format!(".{}", s),
+            // `.foo` shorthand is only valid for identifier keys; other keys
+            // (Unicode, whitespace, empty) need the bracket form `.["…"]`.
+            Filter::String(s) if is_jq_ident(s) => format!(".{}", s),
+            Filter::String(s) => format!(".[{}]", crate::escape_json_string(s)),
             other => format!(".[{}]", atom(other)),
         },
         Filter::ArrayIndex(inner) => format!(".[{}]", to_jq_source(inner)),
@@ -149,7 +173,9 @@ pub fn to_jq_source(f: &Filter) -> String {
         // Negative literals are not atomic (see `atomic`); `atom` adds the
         // parentheses when they appear as operands.
         Filter::Number(n) => n.to_string(),
-        Filter::String(s) => format!("\"{}\"", s.escape_default()),
+        // Rust's `escape_default` emits `\u{XXXX}` for non-ASCII, which jq
+        // cannot parse; `escape_json_string` emits JSON-valid escapes.
+        Filter::String(s) => crate::escape_json_string(s),
         Filter::Array(items) => {
             // Inside brackets, `,` and `|` bind across elements
             // (`[a, b | c]` is `[(a, b) | c]`), so elements are atomized.
@@ -161,7 +187,10 @@ pub fn to_jq_source(f: &Filter) -> String {
                 .iter()
                 .map(|(k, v)| {
                     let key = match k {
-                        Filter::String(s) => s.clone(),
+                        // Bare identifier keys print unquoted; all others must
+                        // be quoted (jq accepts `{"é": …}` but not `{é: …}`).
+                        Filter::String(s) if is_jq_ident(s) => s.clone(),
+                        Filter::String(s) => crate::escape_json_string(s),
                         other => format!("({})", to_jq_source(other)),
                     };
                     format!("{}: {}", key, atom(v))
@@ -187,6 +216,17 @@ pub fn to_jq_source(f: &Filter) -> String {
         // Not generated; fall back to Display for completeness
         other => other.to_string(),
     }
+}
+
+/// Whether `s` is a bare jq identifier: `[A-Za-z_][A-Za-z0-9_]*`. Only such
+/// keys may use the `.foo` / `{foo: …}` shorthands; everything else is quoted.
+fn is_jq_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 fn atomic(f: &Filter) -> bool {

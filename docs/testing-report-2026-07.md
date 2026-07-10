@@ -211,3 +211,52 @@ finding, so a genuine bug fails the job; timeouts and the precision metrics
 do not. Findings JSONL is uploaded as a per-shard artifact, and each shard
 prints `RESULT hard_findings=N … seed=S` for one-line triage — the seed
 reproduces the run locally with `--seed S`.
+
+## Round 6: array/object builtins, richer pools, and jq-source coverage
+
+Expanded the generator's builtin surface and value pools, and started
+measuring line/branch coverage of the *actual* jq C sources.
+
+- **New builtins wired end-to-end** (interpreter + inference axioms +
+  generator): `add`, `sort`, `reverse`, `min`, `max`, `flatten` (nullary)
+  plus the higher-order `map(f)` / `select(f)`. Inference: `sort`/`reverse`/
+  `flatten` are `array -> array`; `add`/`min`/`max` constrain input to an
+  array.
+- **Three real tjq parity bugs the expansion surfaced and fixed:**
+  1. *String escapes were never decoded.* The parser stripped the quotes but
+     stored the body verbatim, so `"\n" | length` was 2 (backslash + `n`)
+     instead of 1, `"\\"` was two characters, `"a\"b"` was four. Added a
+     JSON/jq unescaper (`\n \t \" \\ \/ \b \f \uXXXX` with UTF-16 surrogate
+     pairs). This is the highest-impact fix — every escaped string literal
+     was wrong.
+  2. *`add`/`flatten`/`reverse` rejected objects.* jq defines them via
+     `reduce .[]`, which iterates array elements **or object values**, so
+     `add {"a":1,"b":2}` is `3`, `flatten {"a":{"b":1}}` is `[{"b":1}]`.
+     tjq errored on objects; now it iterates values.
+  3. *`reverse` on length-0 non-arrays.* jq's `[.[length-1-range(0;length)]]`
+     yields `[]` for `null`, `""`, `[]`, and `{}` alike (the range is empty),
+     while non-empty strings/objects error. tjq only handled arrays and null.
+- **Hypothesis-style value pools.** `EXTREME_NUMBER_POOL` grew from 8 to 27
+  IEEE edge cases (f64/f32 limits, smallest subnormal/normal, machine
+  epsilons, 2^53 ± 1, power-of-two integer boundaries, awkward near-integer
+  fractions, signed zero); program numeric literals now draw these too.
+  `STRING_POOL` grew from 5 to 18 (keyword/number look-alikes, whitespace,
+  quote/backslash, multi-byte Unicode); `KEY_POOL` from 4 to 7. Supporting
+  the Unicode keys required teaching the source-printer to quote/bracket
+  non-identifier keys (`.["é"]`, `{"é": …}`) and emit JSON-valid escapes.
+- **Coverage over real jq.** Built jq 1.7.1 with
+  `-fprofile-instr-generate -fcoverage-mapping` and pointed `difftest --jq`
+  at it. Across 2,000 generated programs the expanded generator lifts core
+  `src/*.c` (excl. decNumber) line coverage from 48.9% to 50.8% and branch
+  from 45.3% to 46.8% — with *fewer* programs than the 3,000-program
+  baseline. Per-file: `builtin.c` 23.6% → 26.9% lines, `jv_aux.c` 24.6% →
+  29.3%, `execute.c` 60.7% → 64.6% (the `map`/`select` backtracking paths).
+  The regex engine (oniguruma) stays at 0% — no regex builtins are
+  generated yet — so it is excluded from the "core" figure.
+
+Post-expansion differential runs stay clean: 2,000 programs × 40 inputs and
+600 × 300, **0 divergences / 0 soundness / arrow / effect violations**. The
+only timeouts are `string * huge_number` (e.g. `. * "a"` on a `1e308`
+input), where jq itself tries to build an astronomically large string; the
+oracle skips jq-timeout and tjq's allocation-guard error, so these are not
+findings.

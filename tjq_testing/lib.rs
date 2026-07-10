@@ -61,7 +61,11 @@ pub fn to_json_string(j: &Json) -> String {
     }
 }
 
-fn escape_json_string(s: &str) -> String {
+/// Serialize a string as a valid JSON/jq string literal: escapes quotes,
+/// backslash, and control characters (`\uXXXX`), passing printable Unicode
+/// through raw (both jq and tjq accept raw UTF-8 in literals). The program
+/// printer relies on this so generated string literals re-parse in jq.
+pub fn escape_json_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {
