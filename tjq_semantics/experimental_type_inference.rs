@@ -8,10 +8,33 @@ use std::{
 use tjq_exec::{BinOp, Filter, Json, UnOp};
 
 use crate::inference::TypeInference;
-use crate::{Shape, Subtyping};
+use crate::{Field, Row, Shape, Subtyping};
 
 /// Constraint-based type inference algorithm.
 /// Uses constraint generation and solving for type inference.
+
+/// Budget for per-variable possibility lists. Beyond it the variable is
+/// widened to ⊤ (Blob) — a sound over-approximation that stops the
+/// exponential list growth deeply nested conditionals otherwise cause.
+const MAX_POSSIBILITIES_PER_VAR: usize = 64;
+
+fn push_possibility(map: &mut HashMap<usize, Vec<Shape>>, var: usize, shape: Shape) {
+    let entry = map.entry(var).or_default();
+    if entry.len() >= MAX_POSSIBILITIES_PER_VAR {
+        if entry.as_slice() != [Shape::Blob] {
+            *entry = vec![Shape::Blob];
+        }
+        return;
+    }
+    if !entry.contains(&shape) {
+        entry.push(shape);
+    }
+}
+
+/// Hard ceiling on substituted shape size; beyond this the variable is
+/// left unresolved rather than allowed to grow without bound.
+const MAX_SHAPE_SIZE: usize = 4096;
+
 pub struct ConstraintInference;
 
 impl TypeInference for ConstraintInference {
@@ -251,12 +274,17 @@ impl Shape {
     pub fn replace_tvars(&self, equalities: &HashMap<usize, Shape>) -> Shape {
         match self {
             Shape::TVar(var) => equalities.get(var).cloned().unwrap_or(Shape::TVar(*var)),
-            Shape::Object(fields) => Shape::Object(
-                fields
+            Shape::Object(fields) => Shape::Object(Row {
+                fields: fields
                     .iter()
-                    .map(|(k, v)| (k.clone(), v.replace_tvars(equalities)))
+                    .map(|f| Field {
+                        key: f.key.clone(),
+                        value: f.value.replace_tvars(equalities),
+                        optional: f.optional,
+                    })
                     .collect(),
-            ),
+                open: fields.open,
+            }),
             Shape::Array(elem, size) => {
                 Shape::Array(Box::new(elem.replace_tvars(equalities)), *size)
             }
@@ -409,6 +437,17 @@ pub struct SolverResult {
     pub unresolved: HashSet<usize>,
     /// Any type errors encountered
     pub errors: Vec<TypeError>,
+    /// Lint findings (docs/type-system-scope.md §5); the program is still
+    /// well-typed, but something is provably suspicious.
+    pub warnings: Vec<TypeWarning>,
+}
+
+/// A lint-level diagnostic: the `dead-condition-branch` rule fires when a
+/// conditional's condition type is provably always-truthy (dead else) or
+/// always-falsy (dead then).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeWarning {
+    pub message: String,
 }
 
 impl Default for SolverResult {
@@ -423,6 +462,7 @@ impl SolverResult {
             resolved: HashMap::new(),
             unresolved: HashSet::new(),
             errors: vec![],
+            warnings: vec![],
         }
     }
 
@@ -432,9 +472,10 @@ impl SolverResult {
     }
 }
 
-fn solve(mut constraints: Vec<Constraint>, ctx: &Context) -> Result<SolverResult, TypeError> {
+pub fn solve(mut constraints: Vec<Constraint>, ctx: &Context) -> Result<SolverResult, TypeError> {
     let mut env = TypeEnv::new();
     let mut result = SolverResult::new();
+    result.warnings.extend(ctx.warnings.iter().cloned());
 
     let mut facts = vec![];
     for i in 0..=ctx.vars {
@@ -580,33 +621,80 @@ fn solve(mut constraints: Vec<Constraint>, ctx: &Context) -> Result<SolverResult
     // Use union-find style approach: map each variable to its canonical representative
     let mut substitutions: HashMap<usize, Shape> = HashMap::new();
 
-    // First, find all equality chains and pick the smallest variable as representative
+    // Pass 1: variable-to-variable aliases only — map each variable to a
+    // smaller one in its equality class.
     for (var, fact) in env.facts.iter() {
         for eq in &fact.equalities {
-            match eq {
-                Shape::TVar(other_var) if *other_var < *var => {
-                    // Map this variable to the smaller one
+            if let Shape::TVar(other_var) = eq {
+                if *other_var < *var {
                     substitutions.insert(*var, Shape::TVar(*other_var));
                 }
-                shape if !matches!(shape, Shape::TVar(_)) => {
-                    // Map to concrete type (prefer concrete over tvar)
-                    substitutions.insert(*var, shape.clone());
+            }
+        }
+    }
+    // Close the aliases so every variable maps to its class representative
+    // (the smallest member) before concretes are attached.
+    {
+        let mut changed = true;
+        let mut rounds = 0;
+        while changed && rounds < 50 {
+            rounds += 1;
+            changed = false;
+            let keys: Vec<usize> = substitutions.keys().copied().collect();
+            for var in keys {
+                let cur = substitutions.get(&var).unwrap().clone();
+                let new = cur.replace_tvars(&substitutions);
+                if new != cur {
+                    substitutions.insert(var, new);
+                    changed = true;
                 }
-                _ => {}
+            }
+        }
+    }
+    // Pass 2: attach each concrete equality to its class representative, not
+    // just the variable that carried it. Previously a competing smaller-var
+    // alias could overwrite the concrete (so `left == null` was lost when
+    // `left == input` followed it, leaving the whole class unresolved).
+    for (var, fact) in env.facts.iter() {
+        for eq in &fact.equalities {
+            if !matches!(eq, Shape::TVar(_)) {
+                let root = match substitutions.get(var) {
+                    Some(Shape::TVar(r)) => *r,
+                    _ => *var,
+                };
+                substitutions.insert(root, eq.clone());
             }
         }
     }
 
     // Transitively close the substitutions
+    // Bounded: cyclic equalities (T == Union(T, x)) would otherwise grow
+    // the substituted shape forever and overflow the stack.
     let mut changed = true;
-    while changed {
+    let mut closure_rounds = 0;
+    while changed && closure_rounds < 50 {
+        closure_rounds += 1;
         changed = false;
         let keys: Vec<usize> = substitutions.keys().copied().collect();
         for var in keys {
             let current = substitutions.get(&var).unwrap().clone();
+            if current.dependencies().contains(&var) {
+                // Self-referential substitution: drop it, the variable
+                // cannot be eliminated.
+                substitutions.remove(&var);
+                changed = true;
+                continue;
+            }
             let new_val = current.replace_tvars(&substitutions);
             if new_val != current {
-                substitutions.insert(var, new_val);
+                if new_val.size() > MAX_SHAPE_SIZE {
+                    // Substitution is blowing up (cyclic aliasing with
+                    // multiple occurrences); the variable cannot be
+                    // eliminated within budget.
+                    substitutions.remove(&var);
+                } else {
+                    substitutions.insert(var, new_val);
+                }
                 changed = true;
             }
         }
@@ -639,6 +727,21 @@ fn solve(mut constraints: Vec<Constraint>, ctx: &Context) -> Result<SolverResult
             .iter()
             .map(|t| t.replace_tvars(&substitutions))
             .collect();
+    }
+
+    // Merge the facts of variables substituted by another variable into their
+    // canonical representative, so bounds recorded on the substituted variable
+    // (e.g. `T3 <: number` when T3 == T1) are not lost when Phase 4 skips it.
+    let substituted_vars: Vec<usize> = substitutions.keys().copied().collect();
+    for var in substituted_vars {
+        if let Some(Shape::TVar(canonical)) = substitutions.get(&var) {
+            let canonical = *canonical;
+            if let Some(fact) = env.facts.get(&var).cloned() {
+                if let Some(canonical_fact) = env.facts.get_mut(&canonical) {
+                    canonical_fact.extend(fact);
+                }
+            }
+        }
     }
 
     // Phase 4: Resolve each variable's type from its facts
@@ -684,14 +787,29 @@ fn solve(mut constraints: Vec<Constraint>, ctx: &Context) -> Result<SolverResult
     // Phase 4b: Transitively close resolved types
     // Some resolved types may contain TVars that were resolved later
     let mut changed = true;
-    while changed {
+    let mut closure_rounds = 0;
+    while changed && closure_rounds < 50 {
+        closure_rounds += 1;
         changed = false;
         let vars: Vec<usize> = result.resolved.keys().copied().collect();
         for var in vars {
             let current = result.resolved.get(&var).unwrap().clone();
+            if current.dependencies().contains(&var) {
+                // Self-referential resolution: the variable stays unresolved
+                // rather than growing without bound.
+                result.resolved.remove(&var);
+                result.unresolved.insert(var);
+                changed = true;
+                continue;
+            }
             let new_val = current.replace_tvars(&result.resolved);
             if new_val != current {
-                result.resolved.insert(var, new_val);
+                if new_val.size() > MAX_SHAPE_SIZE {
+                    result.resolved.remove(&var);
+                    result.unresolved.insert(var);
+                } else {
+                    result.resolved.insert(var, new_val);
+                }
                 changed = true;
             }
         }
@@ -797,10 +915,7 @@ fn solve(mut constraints: Vec<Constraint>, ctx: &Context) -> Result<SolverResult
                     } => {
                         let canonical = get_canonical_var(*var, substitutions);
                         let resolved_val = value.replace_tvars(substitutions);
-                        var_possibilities
-                            .entry(canonical)
-                            .or_default()
-                            .push(resolved_val);
+                        push_possibility(var_possibilities, canonical, resolved_val);
                     }
                     Constraint::Rel {
                         t1: value,
@@ -809,10 +924,7 @@ fn solve(mut constraints: Vec<Constraint>, ctx: &Context) -> Result<SolverResult
                     } if !matches!(value, Shape::TVar(_)) => {
                         let canonical = get_canonical_var(*var, substitutions);
                         let resolved_val = value.replace_tvars(substitutions);
-                        var_possibilities
-                            .entry(canonical)
-                            .or_default()
-                            .push(resolved_val);
+                        push_possibility(var_possibilities, canonical, resolved_val);
                     }
                     _ => {}
                 }
@@ -838,6 +950,7 @@ fn solve(mut constraints: Vec<Constraint>, ctx: &Context) -> Result<SolverResult
         let prev_resolved_count = result.resolved.len();
         let prev_bounds_count = lower_bounds.values().map(|v| v.len()).sum::<usize>()
             + upper_bounds.values().map(|v| v.len()).sum::<usize>();
+        let prev_possibilities_count = var_possibilities.values().map(|v| v.len()).sum::<usize>();
 
         // Collect nested implications from activated consequences
         let mut nested_implications: Vec<(Constraint, Constraint)> = Vec::new();
@@ -891,10 +1004,12 @@ fn solve(mut constraints: Vec<Constraint>, ctx: &Context) -> Result<SolverResult
             }
         }
 
-        // Also process nested implications
-        // Group implications by their condition variable to handle both branches
+        // Group implications by their condition variable to handle both branches.
+        // Top-level implications (e.g. from if-then-else) and nested ones are
+        // treated uniformly: an undetermined boolean condition means both
+        // branches are possible.
         let mut implications_by_var: HashMap<usize, Vec<(bool, &Constraint)>> = HashMap::new();
-        for (condition, consequence) in &nested_implications {
+        for (condition, consequence) in env.implications.iter().chain(nested_implications.iter()) {
             if let Constraint::Rel {
                 t1: Shape::TVar(var),
                 rel: Relation::Equality(Equality::Equal),
@@ -925,14 +1040,15 @@ fn solve(mut constraints: Vec<Constraint>, ctx: &Context) -> Result<SolverResult
             }
         }
 
-        // For undetermined boolean conditions, process both branches as possibilities
+        // For undetermined conditions, process both branches as possibilities
         // This allows output type to be union of both branches
         for (var, branches) in &implications_by_var {
-            // Check if this variable is undetermined (Bool(None) or unresolved)
+            // Undetermined: neither provably truthy nor provably falsy
             let is_undetermined = match result.resolved.get(var) {
                 None => true,
-                Some(Shape::Bool(None)) => true,
-                _ => false,
+                Some(shape) => {
+                    !shape.disjoint_with(&falsy_shape()) && !shape.included_in(&falsy_shape())
+                }
             };
 
             if is_undetermined && branches.len() >= 2 {
@@ -952,8 +1068,12 @@ fn solve(mut constraints: Vec<Constraint>, ctx: &Context) -> Result<SolverResult
         let new_resolved_count = result.resolved.len();
         let new_bounds_count = lower_bounds.values().map(|v| v.len()).sum::<usize>()
             + upper_bounds.values().map(|v| v.len()).sum::<usize>();
+        let new_possibilities_count = var_possibilities.values().map(|v| v.len()).sum::<usize>();
 
-        if new_resolved_count == prev_resolved_count && new_bounds_count == prev_bounds_count {
+        if new_resolved_count == prev_resolved_count
+            && new_bounds_count == prev_bounds_count
+            && new_possibilities_count == prev_possibilities_count
+        {
             break; // Fixed point reached
         }
     }
@@ -990,6 +1110,7 @@ fn solve(mut constraints: Vec<Constraint>, ctx: &Context) -> Result<SolverResult
                 .insert(var, unique_types.into_iter().next().unwrap());
             result.unresolved.remove(&var);
         } else if unique_types.len() > 1 {
+            // Alternative branches: the variable may be any of them, so union
             let union_type = unique_types
                 .into_iter()
                 .reduce(|a, b| Shape::Union(Box::new(a), Box::new(b)))
@@ -999,21 +1120,36 @@ fn solve(mut constraints: Vec<Constraint>, ctx: &Context) -> Result<SolverResult
         }
     }
 
-    // Canonicalize union types (e.g., Union(true, false) -> Bool(None))
+    // Canonicalize types (e.g., Union(true, false) -> Bool(None))
     for (var, shape) in result.resolved.iter_mut() {
         *shape = canonicalize_shape(shape);
     }
 
     // Re-run transitive closure after new resolutions
     let mut changed = true;
-    while changed {
+    let mut closure_rounds = 0;
+    while changed && closure_rounds < 50 {
+        closure_rounds += 1;
         changed = false;
         let vars: Vec<usize> = result.resolved.keys().copied().collect();
         for var in vars {
             let current = result.resolved.get(&var).unwrap().clone();
+            if current.dependencies().contains(&var) {
+                // Self-referential resolution: the variable stays unresolved
+                // rather than growing without bound.
+                result.resolved.remove(&var);
+                result.unresolved.insert(var);
+                changed = true;
+                continue;
+            }
             let new_val = current.replace_tvars(&result.resolved);
             if new_val != current {
-                result.resolved.insert(var, new_val);
+                if new_val.size() > MAX_SHAPE_SIZE {
+                    result.resolved.remove(&var);
+                    result.unresolved.insert(var);
+                } else {
+                    result.resolved.insert(var, new_val);
+                }
                 changed = true;
             }
         }
@@ -1046,6 +1182,11 @@ fn solve(mut constraints: Vec<Constraint>, ctx: &Context) -> Result<SolverResult
     // Phase 6: Handle disjunctions - infer types from satisfiable branches
     // For each unresolved variable, collect possible types from all valid branches
     let mut var_possibilities: HashMap<usize, Vec<Shape>> = HashMap::new();
+    // Variables that some satisfiable branch ties to an *unresolved* value
+    // (e.g. `T2 == T4` with T4 unknown, from `+`'s null overload). Resolving
+    // such a variable from the other branches alone would drop this branch
+    // and under-approximate the type, so they stay unresolved instead.
+    let mut poisoned_vars: HashSet<usize> = HashSet::new();
 
     for possibilities in &env.possibilities {
         // Check which branches are satisfiable given current knowledge
@@ -1064,7 +1205,8 @@ fn solve(mut constraints: Vec<Constraint>, ctx: &Context) -> Result<SolverResult
 
         // Extract type constraints from each satisfiable branch
         for branch in &satisfiable_branches {
-            let branch_types = extract_types_from_branch(branch, &substitutions);
+            let branch_types =
+                extract_types_from_branch(branch, &substitutions, &mut poisoned_vars);
             for (var, shape) in branch_types {
                 var_possibilities.entry(var).or_default().push(shape);
             }
@@ -1075,6 +1217,9 @@ fn solve(mut constraints: Vec<Constraint>, ctx: &Context) -> Result<SolverResult
     for (var, possible_types) in var_possibilities {
         if result.resolved.contains_key(&var) || substitutions.contains_key(&var) {
             continue; // Already resolved
+        }
+        if poisoned_vars.contains(&var) {
+            continue; // Some branch leaves this variable unknown
         }
 
         // Remove duplicates (manual approach since Shape doesn't implement Hash)
@@ -1101,7 +1246,164 @@ fn solve(mut constraints: Vec<Constraint>, ctx: &Context) -> Result<SolverResult
         }
     }
 
+    // Final canonicalization: unions assembled after the mid-solve
+    // canonicalization pass (e.g. in the disjunction phase above) still
+    // need absorption applied.
+    for (_, shape) in result.resolved.iter_mut() {
+        *shape = shape.canonicalize();
+    }
+
+    // dead-condition-branch lint (docs/type-system-scope.md §5): a
+    // conditional whose condition type is provably always-truthy or
+    // always-falsy has an unreachable branch. Conditions with both
+    // polarities in the implications came from real conditionals;
+    // conditions forced by backward propagation (`... else error end`)
+    // are the narrowing idiom and stay silent.
+    let mut condition_polarity: HashMap<usize, (bool, bool)> = HashMap::new();
+    for (condition, _) in &env.implications {
+        if let Constraint::Rel {
+            t1: Shape::TVar(var),
+            rel: Relation::Equality(Equality::Equal),
+            t2: Shape::Bool(Some(polarity)),
+        } = condition
+        {
+            let canonical = get_canonical_var(*var, &substitutions);
+            let entry = condition_polarity
+                .entry(canonical)
+                .or_insert((false, false));
+            if *polarity {
+                entry.0 = true;
+            } else {
+                entry.1 = true;
+            }
+        }
+    }
+    for (var, (has_true, has_false)) in condition_polarity {
+        if !(has_true && has_false) {
+            continue;
+        }
+        let forced = forced_true.iter().any(|f| {
+            matches!(f, Constraint::Rel { t1: Shape::TVar(v), rel: Relation::Equality(Equality::Equal), t2: Shape::Bool(Some(_)) } if get_canonical_var(*v, &substitutions) == var)
+        });
+        if forced {
+            continue;
+        }
+        let Some(shape) = result.resolved.get(&var) else {
+            continue;
+        };
+        if shape.disjoint_with(&falsy_shape()) {
+            result.warnings.push(TypeWarning {
+                message: format!(
+                    "condition is always truthy (type {shape}); the else branch is unreachable"
+                ),
+            });
+        } else if shape.included_in(&falsy_shape()) {
+            result.warnings.push(TypeWarning {
+                message: format!(
+                    "condition is always falsy (type {shape}); the then branch is unreachable"
+                ),
+            });
+        }
+    }
+
     Ok(result)
+}
+
+/// Infer a filter's type as an intersection of arrows (input -> output).
+///
+/// Overloaded builtins like `+` produce disjunctive constraints, one branch
+/// per overload. Solving the full system merges each variable's branch
+/// alternatives into a union, which loses the correlation between input and
+/// output: `. + .` becomes `(null | number | string) -> (null | number | string)`,
+/// even though a string input can only produce a string output. Solving one
+/// branch combination at a time keeps that correlation, and the filter's type
+/// is the intersection of the per-branch arrows:
+///   `. + .` : (number -> number) & (string -> string) & (null -> null)
+pub fn solve_arrows(
+    constraints: Vec<Constraint>,
+    ctx: &Context,
+    i: usize,
+    o: usize,
+) -> Result<Shape, TypeError> {
+    // Each top-level disjunction is an overloaded operation; its branches are
+    // the overloads.
+    let or_positions: Vec<usize> = constraints
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, c)| matches!(c, Constraint::Or(_)).then_some(idx))
+        .collect();
+
+    let solve_plain = |constraints: Vec<Constraint>| -> Result<Shape, TypeError> {
+        let result = solve(constraints, ctx)?;
+        Ok(Shape::arrow(result.get(i), result.get(o)).canonicalize())
+    };
+
+    if or_positions.is_empty() {
+        return solve_plain(constraints);
+    }
+
+    let branch_counts: Vec<usize> = or_positions
+        .iter()
+        .map(|&p| match &constraints[p] {
+            Constraint::Or(branches) => branches.len(),
+            _ => unreachable!(),
+        })
+        .collect();
+
+    // Cap the branch combinations to keep the analysis cheap; beyond the cap,
+    // fall back to the union-based whole-system solution.
+    const MAX_COMBINATIONS: usize = 64;
+    let total: usize = branch_counts.iter().product();
+    if total > MAX_COMBINATIONS {
+        return solve_plain(constraints);
+    }
+
+    let no_substitutions = HashMap::new();
+    let mut arrows: Vec<Shape> = vec![];
+    for combo in 0..total {
+        // Decode the combination index into one branch choice per disjunction
+        let mut branch_constraints = constraints.clone();
+        let mut selected: Vec<&Constraint> = vec![];
+        let mut rem = combo;
+        for (&p, &n) in or_positions.iter().zip(&branch_counts) {
+            let choice = rem % n;
+            rem /= n;
+            let Constraint::Or(branches) = &constraints[p] else {
+                unreachable!()
+            };
+            branch_constraints[p] = branches[choice].clone();
+            selected.push(&branches[choice]);
+        }
+
+        let Ok(result) = solve(branch_constraints, ctx) else {
+            continue;
+        };
+        if !result.errors.is_empty() {
+            continue;
+        }
+        // The solver does not check every fact for consistency; reject
+        // combinations whose chosen branches contradict the resolved types
+        // (e.g. the string overload of `+` when the input is a number).
+        if !selected
+            .iter()
+            .all(|b| branch_is_satisfiable(b, &result.resolved, &no_substitutions))
+        {
+            continue;
+        }
+
+        let arrow = Shape::arrow(result.get(i), result.get(o)).canonicalize();
+        if !arrows.contains(&arrow) {
+            arrows.push(arrow);
+        }
+    }
+
+    if arrows.is_empty() {
+        // No branch combination is satisfiable on its own; report whatever the
+        // whole-system solution says (including its errors).
+        return solve_plain(constraints);
+    }
+
+    Ok(Shape::intersection_(arrows).canonicalize())
 }
 
 /// Backward propagation through conditional constraints
@@ -1379,26 +1681,59 @@ fn extract_types_as_possibilities_with_resolved(
 ) {
     match c {
         Constraint::And(cs) => {
+            // Collect this conjunction's own concrete equalities first, so
+            // nested disjunctions are judged against branch-local facts
+            // (e.g. `T21 == 1 & (T21 <: number | T21 <: string)` rules the
+            // string overload out).
+            let mut local_facts = resolved.clone();
+            for inner in cs.iter() {
+                if let Constraint::Rel {
+                    t1,
+                    rel: Relation::Equality(Equality::Equal),
+                    t2,
+                } = inner
+                {
+                    if let (Shape::TVar(v), t) | (t, Shape::TVar(v)) = (t1, t2) {
+                        if !matches!(t, Shape::TVar(_)) {
+                            let concrete = t.replace_tvars(substitutions);
+                            local_facts.insert(*v, concrete.clone());
+                            local_facts.insert(get_canonical_var(*v, substitutions), concrete);
+                        }
+                    }
+                }
+            }
             for inner in cs {
                 extract_types_as_possibilities_with_resolved(
                     inner,
                     var_possibilities,
                     substitutions,
-                    resolved,
+                    &local_facts,
                 );
             }
         }
         Constraint::Or(cs) => {
-            // For Or constraints, only extract from branches that are satisfiable
-            // given what we know about resolved variables
+            // Every branch not contradicted by *hard facts* contributes to
+            // the union of possibilities. Pruning against previously
+            // collected possibilities would be unsound: possibilities are
+            // alternatives, not established facts (it dropped `-`'s array
+            // overload because the number overload was seen first).
+            //
+            // Branches are processed with the branch-local machinery so a
+            // variable a branch mentions but does not pin down (e.g. the
+            // field type in the object branch of a lenient `.x`) keeps an
+            // unknown in its union instead of being resolved from the other
+            // branches alone.
             for inner in cs {
-                if or_branch_is_satisfiable(inner, var_possibilities, substitutions) {
-                    extract_types_as_possibilities_with_resolved(
-                        inner,
-                        var_possibilities,
-                        substitutions,
-                        resolved,
-                    );
+                if !or_branch_contradicted(inner, resolved, substitutions) {
+                    let mut branch_poisoned: HashSet<usize> = HashSet::new();
+                    let assignments =
+                        extract_types_from_branch(inner, substitutions, &mut branch_poisoned);
+                    for (var, shape) in assignments {
+                        push_possibility(var_possibilities, var, shape);
+                    }
+                    for var in branch_poisoned {
+                        push_possibility(var_possibilities, var, Shape::TVar(var));
+                    }
                 }
             }
         }
@@ -1409,10 +1744,7 @@ fn extract_types_as_possibilities_with_resolved(
         } if !matches!(t2, Shape::TVar(_)) => {
             let canonical = get_canonical_var(*var, substitutions);
             let resolved_t = t2.replace_tvars(substitutions);
-            var_possibilities
-                .entry(canonical)
-                .or_default()
-                .push(resolved_t);
+            push_possibility(var_possibilities, canonical, resolved_t);
         }
         Constraint::Rel {
             t1,
@@ -1421,10 +1753,7 @@ fn extract_types_as_possibilities_with_resolved(
         } if !matches!(t1, Shape::TVar(_)) => {
             let canonical = get_canonical_var(*var, substitutions);
             let resolved_t = t1.replace_tvars(substitutions);
-            var_possibilities
-                .entry(canonical)
-                .or_default()
-                .push(resolved_t);
+            push_possibility(var_possibilities, canonical, resolved_t);
         }
         Constraint::Rel {
             t1: Shape::TVar(var),
@@ -1439,33 +1768,39 @@ fn extract_types_as_possibilities_with_resolved(
                     let canonical_target = get_canonical_var(*target, substitutions);
                     // If source has known possibilities, propagate to target
                     if let Some(source_types) = var_possibilities.get(&canonical_source).cloned() {
-                        var_possibilities
-                            .entry(canonical_target)
-                            .or_default()
-                            .extend(source_types);
+                        for t in source_types {
+                            push_possibility(var_possibilities, canonical_target, t);
+                        }
+                    } else {
+                        // Unresolved branch: the target may be whatever the
+                        // source turns out to be. Keep the unknown in the
+                        // union instead of silently dropping the branch
+                        // (dropping it under-approximates the output type).
+                        push_possibility(
+                            var_possibilities,
+                            canonical_target,
+                            Shape::TVar(canonical_source),
+                        );
                     }
                 }
                 // X <: concrete_type - X is constrained to be a subtype of that type
                 // Add the generic form of that type as a possibility for X
                 Shape::Number(_) => {
-                    var_possibilities
-                        .entry(canonical_source)
-                        .or_default()
-                        .push(Shape::Number(None));
+                    push_possibility(var_possibilities, canonical_source, Shape::Number(None));
                 }
                 Shape::String(_) => {
-                    var_possibilities
-                        .entry(canonical_source)
-                        .or_default()
-                        .push(Shape::String(None));
+                    push_possibility(var_possibilities, canonical_source, Shape::String(None));
                 }
                 Shape::Bool(_) => {
-                    var_possibilities
-                        .entry(canonical_source)
-                        .or_default()
-                        .push(Shape::Bool(None));
+                    push_possibility(var_possibilities, canonical_source, Shape::Bool(None));
                 }
-                _ => {}
+                // Structured bounds (arrays, tuples, objects, unions):
+                // push the bound itself. Dropping the possibility would
+                // under-approximate the union this variable resolves to.
+                other => {
+                    let resolved = other.replace_tvars(substitutions);
+                    push_possibility(var_possibilities, canonical_source, resolved);
+                }
             }
         }
         _ => {}
@@ -1474,6 +1809,42 @@ fn extract_types_as_possibilities_with_resolved(
 
 /// Check if an Or branch is satisfiable given known possibilities
 /// A branch is satisfiable if its constraints don't conflict with known types
+/// A disjunction branch is *contradicted* when it contains a relation whose
+/// sides are fully known (through substitutions and resolved facts) and
+/// provably incompatible — e.g. the string overload of `+` when one operand
+/// is the literal `1`. Unknown or partially known sides never contradict:
+/// possibilities must not be used as facts.
+fn or_branch_contradicted(
+    c: &Constraint,
+    resolved: &HashMap<usize, Shape>,
+    substitutions: &HashMap<usize, Shape>,
+) -> bool {
+    match c {
+        Constraint::And(cs) => cs
+            .iter()
+            .any(|i| or_branch_contradicted(i, resolved, substitutions)),
+        Constraint::Or(cs) => cs
+            .iter()
+            .all(|i| or_branch_contradicted(i, resolved, substitutions)),
+        Constraint::False => true,
+        Constraint::Rel { t1, rel, t2 } => {
+            let a = t1.replace_tvars(substitutions).replace_tvars(resolved);
+            let b = t2.replace_tvars(substitutions).replace_tvars(resolved);
+            // Judge only fully concrete sides
+            if !a.dependencies().is_empty() || !b.dependencies().is_empty() {
+                return false;
+            }
+            match rel {
+                Relation::Equality(Equality::Equal) => a.disjoint_with(&b),
+                Relation::Subtyping(Subtyping::Subtype) => a.disjoint_with(&b),
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+#[allow(dead_code)]
 fn or_branch_is_satisfiable(
     c: &Constraint,
     var_possibilities: &HashMap<usize, Vec<Shape>>,
@@ -1517,48 +1888,11 @@ fn is_type_compatible(source: &Shape, target: &Shape) -> bool {
     }
 }
 
-/// Canonicalize a shape (e.g., Union(true, false) -> Bool(None))
+/// Canonicalize a shape (e.g., Union(true, false) -> Bool(None), Intersection(Number, Number) -> Number)
 fn canonicalize_shape(shape: &Shape) -> Shape {
-    match shape {
-        Shape::Union(a, b) => {
-            let a_canon = canonicalize_shape(a);
-            let b_canon = canonicalize_shape(b);
-
-            // Union(true, false) or Union(false, true) -> Bool(None)
-            match (&a_canon, &b_canon) {
-                (Shape::Bool(Some(true)), Shape::Bool(Some(false)))
-                | (Shape::Bool(Some(false)), Shape::Bool(Some(true))) => Shape::Bool(None),
-                // Union of any bools -> Bool(None)
-                (Shape::Bool(_), Shape::Bool(_)) => Shape::Bool(None),
-                // Union(Number(x), Number(y)) where x != y -> Number(None)
-                (Shape::Number(Some(_)), Shape::Number(Some(_))) if a_canon != b_canon => {
-                    Shape::Number(None)
-                }
-                // Union(Number(_), Number(None)) or vice versa -> Number(None)
-                (Shape::Number(_), Shape::Number(None))
-                | (Shape::Number(None), Shape::Number(_)) => Shape::Number(None),
-                // Union(String(x), String(y)) where x != y -> String(None)
-                (Shape::String(Some(_)), Shape::String(Some(_))) if a_canon != b_canon => {
-                    Shape::String(None)
-                }
-                // Union(String(_), String(None)) or vice versa -> String(None)
-                (Shape::String(_), Shape::String(None))
-                | (Shape::String(None), Shape::String(_)) => Shape::String(None),
-                // If both sides are the same, just use one
-                (a, b) if a == b => a.clone(),
-                _ => Shape::Union(Box::new(a_canon), Box::new(b_canon)),
-            }
-        }
-        Shape::Object(fields) => Shape::Object(
-            fields
-                .iter()
-                .map(|(k, v)| (k.clone(), canonicalize_shape(v)))
-                .collect(),
-        ),
-        Shape::Array(elem, len) => Shape::Array(Box::new(canonicalize_shape(elem)), *len),
-        Shape::Tuple(elems) => Shape::Tuple(elems.iter().map(canonicalize_shape).collect()),
-        _ => shape.clone(),
-    }
+    // Single canonicalizer: Shape::canonicalize is validated against the
+    // check() denotation by the model tests in tjq_testing.
+    shape.canonicalize()
 }
 
 /// Check if a constraint is or contains Constraint::False
@@ -1572,6 +1906,16 @@ fn consequence_is_false(c: &Constraint) -> bool {
 }
 
 /// Check if a condition constraint is satisfied by the resolved types
+/// The set of falsy JSON values in jq: null and false.
+fn falsy_shape() -> Shape {
+    Shape::Union(Box::new(Shape::Null), Box::new(Shape::Bool(Some(false))))
+}
+
+/// Conditions of the form `X == true` / `X == false` come from conditionals
+/// and are truthiness tests, not boolean equalities: jq treats every value
+/// except null and false as true. For boolean-typed X the two readings
+/// coincide; for non-boolean X (e.g. `if -2 then ...`) only the truthiness
+/// reading is correct.
 fn condition_is_satisfied(condition: &Constraint, resolved: &HashMap<usize, Shape>) -> bool {
     match condition {
         Constraint::Rel {
@@ -1580,7 +1924,17 @@ fn condition_is_satisfied(condition: &Constraint, resolved: &HashMap<usize, Shap
             t2: value,
         } => {
             if let Some(resolved_val) = resolved.get(var) {
-                resolved_val == value
+                match value {
+                    // Provably truthy: disjoint from {null, false}
+                    Shape::Bool(Some(true)) => {
+                        resolved_val == value || resolved_val.disjoint_with(&falsy_shape())
+                    }
+                    // Provably falsy: included in {null, false}
+                    Shape::Bool(Some(false)) => {
+                        resolved_val == value || resolved_val.included_in(&falsy_shape())
+                    }
+                    _ => resolved_val == value,
+                }
             } else {
                 false
             }
@@ -1625,14 +1979,18 @@ fn extract_and_resolve_constraints(
         Constraint::Or(cs) => {
             // For disjunctions, collect all possible types
             let mut var_types: HashMap<usize, Vec<Shape>> = HashMap::new();
+            let mut poisoned: HashSet<usize> = HashSet::new();
             for c in cs {
-                let types = extract_types_from_branch(c, substitutions);
+                let types = extract_types_from_branch(c, substitutions, &mut poisoned);
                 for (var, shape) in types {
                     var_types.entry(var).or_default().push(shape);
                 }
             }
             // Create unions for variables with multiple possibilities
             for (var, types) in var_types {
+                if poisoned.contains(&var) {
+                    continue; // Some branch leaves this variable unknown
+                }
                 if let std::collections::hash_map::Entry::Vacant(e) = result.resolved.entry(var) {
                     let mut unique_types: Vec<Shape> = vec![];
                     for t in types {
@@ -2033,7 +2391,7 @@ fn level_to_shape(level: u8) -> Option<Shape> {
         2 => Some(Shape::Number(None)),
         3 => Some(Shape::String(None)),
         4 => Some(Shape::Array(Box::new(Shape::TVar(0)), None)), // Generic array
-        5 => Some(Shape::Object(vec![])),
+        5 => Some(Shape::object(vec![])),
         _ => None,
     }
 }
@@ -2057,29 +2415,30 @@ fn branch_is_satisfiable(
             let t1_resolved = t1.replace_tvars(substitutions).replace_tvars(resolved);
             let t2_resolved = t2.replace_tvars(substitutions).replace_tvars(resolved);
 
+            // An empty type (Mismatch, e.g. from contradictory bounds) has no
+            // inhabitants: no input can witness this branch, even though
+            // subtype relations hold vacuously for the empty set.
+            if matches!(t1_resolved.canonicalize(), Shape::Mismatch(_, _))
+                || matches!(t2_resolved.canonicalize(), Shape::Mismatch(_, _))
+            {
+                return false;
+            }
+
             // If either type is still a TVar, the constraint is potentially satisfiable
             if matches!(t1_resolved, Shape::TVar(_)) || matches!(t2_resolved, Shape::TVar(_)) {
                 return true;
             }
 
-            // Both are concrete - check if the relation holds
-            // Note: The subtype function has unusual semantics:
-            //   - Supertype means "self is more specific than other"
-            //   - Subtype means "self is more general than other"
-            // So for `t1 <: t2` (t1 should be a standard subtype of t2),
-            // we need to check if t1 is more specific (Supertype) or equal (Subtype) to t2
+            // Both are concrete - check if the relation can hold for SOME
+            // runtime value. A union-typed operand (e.g. `0, "b"`) satisfies
+            // an overload branch when any of its members does, so only
+            // provable disjointness rules a subtyping branch out.
             match rel {
-                Relation::Equality(Equality::Equal) => t1_resolved == t2_resolved,
+                Relation::Equality(Equality::Equal) => !t1_resolved.disjoint_with(&t2_resolved),
                 Relation::Equality(Equality::NotEqual) => t1_resolved != t2_resolved,
-                Relation::Subtyping(Subtyping::Subtype) => {
-                    // t1 <: t2 means t1 should be more specific or equal to t2
-                    let sub_rel = t1_resolved.subtype(&t2_resolved);
-                    matches!(sub_rel, Subtyping::Subtype | Subtyping::Supertype)
-                }
-                Relation::Subtyping(Subtyping::Supertype) => {
-                    // t1 :> t2 means t1 should be more general or equal to t2
-                    let sub_rel = t1_resolved.subtype(&t2_resolved);
-                    matches!(sub_rel, Subtyping::Subtype | Subtyping::Supertype)
+                Relation::Subtyping(Subtyping::Subtype)
+                | Relation::Subtyping(Subtyping::Supertype) => {
+                    !t1_resolved.disjoint_with(&t2_resolved)
                 }
                 Relation::Subtyping(Subtyping::Incompatible) => {
                     t1_resolved.subtype(&t2_resolved) == Subtyping::Incompatible
@@ -2108,73 +2467,112 @@ fn get_canonical_var(var: usize, substitutions: &HashMap<usize, Shape>) -> usize
 fn extract_types_from_branch(
     branch: &Constraint,
     substitutions: &HashMap<usize, Shape>,
+    poisoned: &mut HashSet<usize>,
 ) -> Vec<(usize, Shape)> {
-    let mut types = vec![];
+    // Collect the branch's relations first, then resolve with a local
+    // fixpoint: an equality between two variables is resolvable when either
+    // side is pinned down elsewhere *in the same branch* (e.g. `+`'s null
+    // overload: `T3 == null & T2 == T4` with `T4 == T3` globally). Only
+    // links that stay unknown after the fixpoint poison their variables.
+    let mut rels: Vec<&Constraint> = vec![];
+    collect_branch_rels(branch, &mut rels);
 
-    match branch {
-        Constraint::And(constraints) => {
-            for c in constraints {
-                types.extend(extract_types_from_branch(c, substitutions));
+    let mut locals: HashMap<usize, Shape> = HashMap::new();
+    let mut unknown_links: Vec<(usize, usize)> = vec![];
+
+    for rel_c in &rels {
+        let Constraint::Rel { t1, rel, t2 } = rel_c else {
+            continue;
+        };
+        match rel {
+            Relation::Equality(Equality::Equal) => match (t1, t2) {
+                (Shape::TVar(var), t) | (t, Shape::TVar(var)) if !matches!(t, Shape::TVar(_)) => {
+                    let canonical_var = get_canonical_var(*var, substitutions);
+                    let resolved_t = t.replace_tvars(substitutions);
+                    locals.insert(canonical_var, resolved_t);
+                }
+                (Shape::TVar(v1), Shape::TVar(v2)) => {
+                    let t1_resolved = t1.replace_tvars(substitutions);
+                    let t2_resolved = t2.replace_tvars(substitutions);
+
+                    if !matches!(t1_resolved, Shape::TVar(_)) {
+                        locals.insert(get_canonical_var(*v2, substitutions), t1_resolved);
+                    } else if !matches!(t2_resolved, Shape::TVar(_)) {
+                        locals.insert(get_canonical_var(*v1, substitutions), t2_resolved);
+                    } else {
+                        unknown_links.push((
+                            get_canonical_var(*v1, substitutions),
+                            get_canonical_var(*v2, substitutions),
+                        ));
+                    }
+                }
+                _ => {}
+            },
+            Relation::Subtyping(Subtyping::Subtype | Subtyping::Supertype) => {
+                if let Shape::TVar(var) = t1 {
+                    let t2_resolved = t2.replace_tvars(substitutions);
+                    if !matches!(t2_resolved, Shape::TVar(_)) {
+                        let canonical_var = get_canonical_var(*var, substitutions);
+                        locals.entry(canonical_var).or_insert(t2_resolved);
+                    }
+                }
             }
+            _ => {}
         }
-        Constraint::Rel { t1, rel, t2 } => {
-            match rel {
-                Relation::Equality(Equality::Equal) => {
-                    // If one side is TVar and other is concrete, assign the type
-                    match (t1, t2) {
-                        (Shape::TVar(var), t) | (t, Shape::TVar(var))
-                            if !matches!(t, Shape::TVar(_)) =>
-                        {
-                            // Follow substitution chain to get canonical variable
-                            let canonical_var = get_canonical_var(*var, substitutions);
-                            // Apply substitutions to get the final type
-                            let resolved_t = t.replace_tvars(substitutions);
-                            types.push((canonical_var, resolved_t));
-                        }
-                        (Shape::TVar(v1), Shape::TVar(v2)) => {
-                            // Both are TVars - check if one resolves to something concrete
-                            let t1_resolved = t1.replace_tvars(substitutions);
-                            let t2_resolved = t2.replace_tvars(substitutions);
+    }
 
-                            if !matches!(t1_resolved, Shape::TVar(_)) {
-                                let canonical_var = get_canonical_var(*v2, substitutions);
-                                types.push((canonical_var, t1_resolved));
-                            } else if !matches!(t2_resolved, Shape::TVar(_)) {
-                                let canonical_var = get_canonical_var(*v1, substitutions);
-                                types.push((canonical_var, t2_resolved));
-                            }
-                        }
-                        _ => {}
-                    }
+    // Local fixpoint over the variable-variable links
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (v1, v2) in &unknown_links {
+            match (locals.contains_key(v1), locals.contains_key(v2)) {
+                (true, false) => {
+                    let t = locals[v1].clone();
+                    locals.insert(*v2, t);
+                    changed = true;
                 }
-                Relation::Subtyping(Subtyping::Subtype) => {
-                    // t1 <: t2 means t1 must be a subtype of t2
-                    // If t1 is TVar and t2 is concrete, t1's type should be at most t2
-                    if let Shape::TVar(var) = t1 {
-                        let t2_resolved = t2.replace_tvars(substitutions);
-                        if !matches!(t2_resolved, Shape::TVar(_)) {
-                            let canonical_var = get_canonical_var(*var, substitutions);
-                            types.push((canonical_var, t2_resolved));
-                        }
-                    }
-                }
-                Relation::Subtyping(Subtyping::Supertype) => {
-                    // t1 :> t2 means t1 must be a supertype of t2
-                    if let Shape::TVar(var) = t1 {
-                        let t2_resolved = t2.replace_tvars(substitutions);
-                        if !matches!(t2_resolved, Shape::TVar(_)) {
-                            let canonical_var = get_canonical_var(*var, substitutions);
-                            types.push((canonical_var, t2_resolved));
-                        }
-                    }
+                (false, true) => {
+                    let t = locals[v2].clone();
+                    locals.insert(*v1, t);
+                    changed = true;
                 }
                 _ => {}
             }
         }
-        _ => {}
     }
 
-    types
+    // Any variable this branch mentions (including nested inside a shape,
+    // e.g. the output variable in `input :> {a: T_out}`) but does not pin
+    // down is tied to an unknown value here. Resolving it from the other
+    // branches alone would drop this branch from the union, so poison it.
+    for rel_c in &rels {
+        let Constraint::Rel { t1, t2, .. } = rel_c else {
+            continue;
+        };
+        for side in [t1, t2] {
+            for var in side.dependencies() {
+                let canonical = get_canonical_var(var, substitutions);
+                if !locals.contains_key(&canonical) {
+                    poisoned.insert(canonical);
+                }
+            }
+        }
+    }
+
+    locals.into_iter().collect()
+}
+
+fn collect_branch_rels<'a>(c: &'a Constraint, out: &mut Vec<&'a Constraint>) {
+    match c {
+        Constraint::And(cs) => {
+            for inner in cs {
+                collect_branch_rels(inner, out);
+            }
+        }
+        rel @ Constraint::Rel { .. } => out.push(rel),
+        _ => {}
+    }
 }
 
 /// Try to resolve a type from its subtyping bounds
@@ -2223,6 +2621,18 @@ fn resolve_from_bounds(fact: &Facts, substitutions: &HashMap<usize, Shape>) -> O
             }
             return Some(result);
         }
+
+        // Bounds of incompatible kinds (e.g. `T <: string` and `T <: number`
+        // in the same overload branch) cannot be satisfied by a single type.
+        // Surface the contradiction as a canonicalized intersection, which
+        // collapses to Mismatch for disjoint types, so callers can detect the
+        // unsatisfiable branch.
+        let meet = lower_bounds
+            .iter()
+            .map(|b| (*b).clone())
+            .reduce(|a, b| Shape::Intersection(Box::new(a), Box::new(b)).canonicalize())
+            .unwrap();
+        return Some(meet);
     }
 
     // If we have upper bounds, use the most specific one (GLB)
@@ -2279,14 +2689,37 @@ fn compute_lub(a: &Shape, b: &Shape) -> Shape {
 
         // Objects - intersection of fields with LUB of common field types
         (Shape::Object(o1), Shape::Object(o2)) => {
+            // The join keeps the common keys (join of their value types); a
+            // key present in only one side may be absent from the join's
+            // inhabitants, so it becomes optional. Openness joins to open.
             let mut fields = vec![];
-            for (k, v1) in o1 {
-                if let Some((_, v2)) = o2.iter().find(|(k2, _)| k2 == k) {
-                    fields.push((k.clone(), compute_lub(v1, v2)));
+            for f1 in o1.iter() {
+                match o2.get(&f1.key) {
+                    Some(f2) => fields.push(Field {
+                        key: f1.key.clone(),
+                        value: compute_lub(&f1.value, &f2.value),
+                        optional: f1.optional || f2.optional,
+                    }),
+                    None => fields.push(Field {
+                        key: f1.key.clone(),
+                        value: f1.value.clone(),
+                        optional: true,
+                    }),
                 }
-                // Fields only in o1 are dropped (can't require them in LUB)
             }
-            Shape::Object(fields)
+            for f2 in o2.iter() {
+                if o1.get(&f2.key).is_none() {
+                    fields.push(Field {
+                        key: f2.key.clone(),
+                        value: f2.value.clone(),
+                        optional: true,
+                    });
+                }
+            }
+            Shape::Object(Row {
+                fields,
+                open: o1.open || o2.open,
+            })
         }
 
         // Incompatible types - form a union
@@ -2303,20 +2736,37 @@ fn compute_lub(a: &Shape, b: &Shape) -> Shape {
 //     }
 // }
 
+/// Typing options (docs/type-system-scope.md §5): the leniency rules jq's
+/// dynamic semantics allow. Strict (all false) rejects programs that rely
+/// on them; lenient matches what jq actually does at runtime.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TypeOptions {
+    /// `.a` on null yields null instead of being a type error
+    /// (the `null-index` rule).
+    pub lenient_absence: bool,
+}
+
 pub struct Context {
     pub vars: usize,
     pub const_value: Json,
+    pub options: TypeOptions,
+    /// Lint findings raised during constraint generation (e.g. dead
+    /// branches of constant-folded conditionals); merged into the
+    /// SolverResult by `solve`.
+    pub warnings: Vec<TypeWarning>,
 }
 
 impl Context {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Context {
             vars: 0,
             const_value: Json::Null,
+            options: TypeOptions::default(),
+            warnings: vec![],
         }
     }
 
-    fn fresh(&mut self) -> usize {
+    pub fn fresh(&mut self) -> usize {
         self.vars += 1;
         self.vars
     }
@@ -2340,6 +2790,136 @@ pub fn compute_shape(
     )
 }
 
+/// dead-condition-branch lint for constant-folded conditionals: when a
+/// conditional's condition is itself constant, the dead branch is decidable
+/// right here (docs/type-system-scope.md §5).
+fn lint_const_conditionals(f: &Filter, ctx: &mut Context, filters: &HashMap<String, Filter>) {
+    if let Filter::IfThenElse(cond, _, _) = f {
+        if cond.is_const_computable() {
+            let outputs = Filter::filter(&ctx.const_value, cond, filters, &mut Default::default());
+            let values: Vec<&Json> = outputs.iter().filter_map(|r| r.as_ref().ok()).collect();
+            if !values.is_empty() {
+                if values.iter().all(|v| v.boolify()) {
+                    ctx.warnings.push(TypeWarning {
+                        message: format!(
+                            "condition `{cond}` is always truthy; the else branch is unreachable"
+                        ),
+                    });
+                } else if values.iter().all(|v| !v.boolify()) {
+                    ctx.warnings.push(TypeWarning {
+                        message: format!(
+                            "condition `{cond}` is always falsy; the then branch is unreachable"
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    // Recurse into every subterm of the constant subtree
+    match f {
+        Filter::Pipe(a, b) | Filter::Comma(a, b) => {
+            lint_const_conditionals(a, ctx, filters);
+            lint_const_conditionals(b, ctx, filters);
+        }
+        Filter::BinOp(l, _, r) => {
+            lint_const_conditionals(l, ctx, filters);
+            lint_const_conditionals(r, ctx, filters);
+        }
+        Filter::UnOp(_, x) => lint_const_conditionals(x, ctx, filters),
+        Filter::IfThenElse(c, t, e) => {
+            lint_const_conditionals(c, ctx, filters);
+            lint_const_conditionals(t, ctx, filters);
+            lint_const_conditionals(e, ctx, filters);
+        }
+        Filter::Array(items) => {
+            for item in items {
+                lint_const_conditionals(item, ctx, filters);
+            }
+        }
+        Filter::Object(items) => {
+            for (_, v) in items {
+                lint_const_conditionals(v, ctx, filters);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Syntactic under-approximation of "this filter never fails at runtime,
+/// on any input". This is the v1 of the failure effect in the arrow types
+/// (docs/type-system-scope.md §2): `true` is a hard claim the differential
+/// oracle checks against jq; `false` means "may fail", never the reverse.
+///
+/// jq facts underlying the table: comparisons and `and`/`or` are total
+/// (jq's order is total across kinds); `type` and `not` are total;
+/// constructors and `.`/`,`/`|` cannot themselves fail; everything
+/// arithmetic, indexing, or iterating can fail on some input.
+pub fn cannot_fail(f: &Filter) -> bool {
+    match f {
+        Filter::Dot | Filter::Null | Filter::Boolean(_) | Filter::Number(_) | Filter::String(_) => {
+            true
+        }
+        Filter::Pipe(a, b) | Filter::Comma(a, b) => cannot_fail(a) && cannot_fail(b),
+        Filter::Array(items) => items.iter().all(cannot_fail),
+        Filter::Object(items) => items.iter().all(|(_, v)| cannot_fail(v)),
+        Filter::IfThenElse(c, t, e) => cannot_fail(c) && cannot_fail(t) && cannot_fail(e),
+        Filter::BinOp(l, op, r) => {
+            cannot_fail(l)
+                && cannot_fail(r)
+                && matches!(
+                    op,
+                    BinOp::Eq
+                        | BinOp::Ne
+                        | BinOp::Gt
+                        | BinOp::Lt
+                        | BinOp::Ge
+                        | BinOp::Le
+                        | BinOp::And
+                        | BinOp::Or
+                )
+        }
+        // `type` and `not` are total; `length` fails on booleans
+        Filter::Call(name, None) => {
+            // `type`, `not`, and `tostring` are total; `length` fails on
+            // booleans, `keys`/`floor`/`tonumber` on wrong kinds.
+            matches!(name.as_str(), "type" | "not" | "tostring")
+        }
+        // Negation fails on non-numbers, indexing on wrong kinds,
+        // iteration on scalars; stay conservative.
+        _ => false,
+    }
+}
+
+/// Syntactic under-approximation of "this filter yields exactly one output
+/// for every input it does not fail on". Used to decide whether an array
+/// construction can be typed as a fixed-arity tuple. `false` means
+/// "possibly a stream", never the reverse.
+fn produces_single_output(f: &Filter) -> bool {
+    match f {
+        Filter::Dot | Filter::Null | Filter::Boolean(_) | Filter::Number(_) | Filter::String(_) => {
+            true
+        }
+        // Array construction always yields exactly one array
+        Filter::Array(_) => true,
+        Filter::ObjIndex(inner) | Filter::ArrayIndex(inner) | Filter::UnOp(_, inner) => {
+            produces_single_output(inner)
+        }
+        // An object with a stream-valued field yields one object per value
+        Filter::Object(items) => items.iter().all(|(_, v)| produces_single_output(v)),
+        Filter::BinOp(l, _, r) => produces_single_output(l) && produces_single_output(r),
+        Filter::Pipe(a, b) => produces_single_output(a) && produces_single_output(b),
+        Filter::IfThenElse(c, t, e) => {
+            produces_single_output(c) && produces_single_output(t) && produces_single_output(e)
+        }
+        // Conservative allowlist of single-output builtins
+        Filter::Call(name, None) => matches!(
+            name.as_str(),
+            "length" | "type" | "not" | "keys" | "floor" | "tostring" | "tonumber"
+        ),
+        _ => false,
+    }
+}
+
 fn compute_shape_internal(
     f: &Filter,
     ctx: &mut Context,
@@ -2350,32 +2930,42 @@ fn compute_shape_internal(
     function_outputs: &mut HashMap<String, usize>,
 ) -> Constraints {
     if f.is_const_computable() {
+        // Constant subtrees are folded whole, so their conditionals never
+        // reach the solver's implication machinery; lint them here.
+        lint_const_conditionals(f, ctx, filters);
         // The output type should be equal to the result of the computation
         tracing::trace!("Computing shape for constant computation: {f:?}");
-        let output = Filter::filter(
-            &ctx.const_value,
-            f,
-            &Default::default(),
-            &mut Default::default(),
-        );
+        // Evaluate with the real builtin definitions: a builtin call inside
+        // a constant program is still constant (`null | type`), and running
+        // with empty definitions used to fail those calls, silently
+        // dropping their outputs from the type.
+        let output = Filter::filter(&ctx.const_value, f, filters, &mut Default::default());
         tracing::trace!("Output: {output:?}");
-        // Assume a single output for now
-        match output.first() {
-            Some(Ok(output)) => {
-                let output_shape = Shape::from_json(output.clone());
-                return vec![Constraint::Rel {
-                    t1: Shape::TVar(output_type),
-                    rel: Relation::Equality(Equality::Equal),
-                    t2: output_shape,
-                }];
-            }
-            Some(Err(err)) => {
+        // A constant program may produce several outputs (`1, 2`); the value
+        // type is the union of all of them.
+        let ok_shapes: Vec<Shape> = output
+            .iter()
+            .filter_map(|r| r.as_ref().ok())
+            .map(|j| Shape::from_json(j.clone()))
+            .collect();
+        let any_err = output.iter().any(|r| r.is_err());
+        if ok_shapes.is_empty() {
+            if any_err {
+                // Every evaluation fails
                 return vec![Constraint::False];
             }
-            None => {
-                return vec![];
-            }
+            // `empty`: no outputs, no constraint on the output type
+            return vec![];
         }
+        let output_shape = ok_shapes
+            .into_iter()
+            .reduce(|a, b| Shape::Union(Box::new(a), Box::new(b)))
+            .unwrap();
+        return vec![Constraint::Rel {
+            t1: Shape::TVar(output_type),
+            rel: Relation::Equality(Equality::Equal),
+            t2: output_shape,
+        }];
     }
 
     match f {
@@ -2435,15 +3025,17 @@ fn compute_shape_internal(
                 function_outputs,
             ));
 
-            // output_type = left_output_type, right_output_type
-            // cs.push(Constraint::Comparison {
-            //     t1: Shape::Stream(vec![
-            //         Shape::TVar(left_output_type),
-            //         Shape::TVar(right_output_type),
-            //     ]),
-            //     rel: Relation::Equality(Equality::Equal),
-            //     t2: Shape::TVar(output_type),
-            // });
+            // `f, g` concatenates output streams; until stream types land
+            // (docs/type-system-scope.md §2) the value type is the union of
+            // the two sides.
+            cs.push(Constraint::Rel {
+                t1: Shape::TVar(output_type),
+                rel: Relation::Equality(Equality::Equal),
+                t2: Shape::Union(
+                    Box::new(Shape::TVar(left_output_type)),
+                    Box::new(Shape::TVar(right_output_type)),
+                ),
+            });
 
             cs
         }
@@ -2453,11 +3045,46 @@ fn compute_shape_internal(
             // First, try to get the field name if it's a constant string
             match key_filter.as_ref() {
                 Filter::String(field_name) => {
-                    vec![Constraint::Rel {
+                    // The input must be an object carrying `s`. Under lenient
+                    // semantics `.a` on an object *lacking* `a` yields null
+                    // rather than erroring, so the field is optional there
+                    // (docs/type-system-scope.md §6); the null output is
+                    // supplied by the null-input branch below. Strict mode
+                    // demands the key be present.
+                    let object_branch = Constraint::Rel {
                         t1: Shape::TVar(input_type),
                         rel: Relation::Subtyping(Subtyping::Supertype),
-                        t2: Shape::Object(vec![(field_name.clone(), Shape::TVar(output_type))]),
-                    }]
+                        t2: Shape::Object(Row {
+                            fields: vec![Field {
+                                key: field_name.clone(),
+                                value: Shape::TVar(output_type),
+                                optional: ctx.options.lenient_absence,
+                            }],
+                            open: true,
+                        }),
+                    };
+                    if ctx.options.lenient_absence {
+                        // jq's default semantics: `.a` on null yields null
+                        // (the `null-index` leniency rule,
+                        // docs/type-system-scope.md §5).
+                        vec![Constraint::Or(vec![
+                            object_branch,
+                            Constraint::And(vec![
+                                Constraint::Rel {
+                                    t1: Shape::TVar(input_type),
+                                    rel: Relation::Equality(Equality::Equal),
+                                    t2: Shape::Null,
+                                },
+                                Constraint::Rel {
+                                    t1: Shape::TVar(output_type),
+                                    rel: Relation::Equality(Equality::Equal),
+                                    t2: Shape::Null,
+                                },
+                            ]),
+                        ])]
+                    } else {
+                        vec![object_branch]
+                    }
                 }
                 _ => {
                     // Dynamic field access - can't statically determine the field name
@@ -2467,60 +3094,97 @@ fn compute_shape_internal(
             }
         }
         Filter::ArrayIndex(n) => {
-            // input_type <: [output_type]
-            // todo: if n is a constant, compute it.
+            // `.[i]`: the input is an array of some element type; the result
+            // is that element, or null when the index is out of bounds. The
+            // index expression is evaluated against the input and must be a
+            // number.
+            let elem_type = ctx.fresh();
+            let index_type = ctx.fresh();
+            let mut cs = compute_shape_internal(
+                n,
+                ctx,
+                input_type,
+                index_type,
+                filters,
+                computing,
+                function_outputs,
+            );
+            cs.push(Constraint::Rel {
+                t1: Shape::TVar(index_type),
+                rel: Relation::Subtyping(Subtyping::Subtype),
+                t2: Shape::Number(None),
+            });
 
-            // if *n >= 0 {
-            //     vec![Constraint::Rel {
-            //         t1: Shape::TVar(input_type),
-            //         rel: Relation::Subtyping(Subtyping::Subtype),
-            //         t2: Shape::Tuple(
-            //             [
-            //                 vec![Shape::Blob; *n as usize],
-            //                 vec![Shape::TVar(output_type)],
-            //             ]
-            //             .concat(),
-            //         ),
-            //     }]
-            // } else {
-            //     vec![
-            //         Constraint::Rel {
-            //             t1: Shape::TVar(input_type),
-            //             rel: Relation::Subtyping(Subtyping::Subtype),
-            //             t2: Shape::Array(Box::new(Shape::Blob), Some(*n)),
-            //         },
-            //         Constraint::Rel {
-            //             t1: Shape::TVar(output_type),
-            //             rel: Relation::Equality(Equality::Equal),
-            //             t2: Shape::Null,
-            //         },
-            //     ]
-            // }
-            vec![]
-        }
-        Filter::ArrayIterator => {
-            // todo: figure out object iteration
-            // output_type <: [input_type]
-
-            // this is the type of a single element of the output stream
-            let single_output_type = ctx.fresh();
-
-            vec![
-                // input must have been an array of the single_output_type
-                // [single_output_type] = input_type
+            let array_branch = Constraint::And(vec![
                 Constraint::Rel {
                     t1: Shape::TVar(input_type),
                     rel: Relation::Subtyping(Subtyping::Subtype),
-                    t2: Shape::Array(Box::new(Shape::TVar(single_output_type)), None),
+                    t2: Shape::Array(Box::new(Shape::TVar(elem_type)), None),
                 },
-                // output must be a stream of the single_output_type
-                // output_type = S<single_output_type>
-                // Constraint::Subtyping {
-                //     t1: Shape::TVar(single_output_type),
-                //     rel: Subtyping::Subtype,
-                //     t2: Shape::Stream(vec![Shape::TVar(single_output_type)]),
-                // },
-            ]
+                // element, or null when out of bounds
+                Constraint::Rel {
+                    t1: Shape::TVar(output_type),
+                    rel: Relation::Equality(Equality::Equal),
+                    t2: Shape::Union(Box::new(Shape::TVar(elem_type)), Box::new(Shape::Null)),
+                },
+            ]);
+
+            if ctx.options.lenient_absence {
+                // jq's default: `.[i]` on null yields null
+                cs.push(Constraint::Or(vec![
+                    array_branch,
+                    Constraint::And(vec![
+                        Constraint::Rel {
+                            t1: Shape::TVar(input_type),
+                            rel: Relation::Equality(Equality::Equal),
+                            t2: Shape::Null,
+                        },
+                        Constraint::Rel {
+                            t1: Shape::TVar(output_type),
+                            rel: Relation::Equality(Equality::Equal),
+                            t2: Shape::Null,
+                        },
+                    ]),
+                ]));
+            } else {
+                cs.push(array_branch);
+            }
+            cs
+        }
+        Filter::ArrayIterator => {
+            // `.[]` iterates an array's elements or an object's values (jq
+            // errors on any other input, null included). The output value
+            // type is the element type for arrays; object values are
+            // unconstrained here (rows carry named fields, not a uniform
+            // value type), so the object branch yields the top type.
+            let elem_type = ctx.fresh();
+            let array_branch = Constraint::And(vec![
+                Constraint::Rel {
+                    t1: Shape::TVar(input_type),
+                    rel: Relation::Subtyping(Subtyping::Subtype),
+                    t2: Shape::Array(Box::new(Shape::TVar(elem_type)), None),
+                },
+                // Tie the stream's value type to the element type so element
+                // constraints propagate (e.g. `.[] + 1` forces number).
+                Constraint::Rel {
+                    t1: Shape::TVar(output_type),
+                    rel: Relation::Equality(Equality::Equal),
+                    t2: Shape::TVar(elem_type),
+                },
+            ]);
+            let object_branch = Constraint::And(vec![
+                Constraint::Rel {
+                    t1: Shape::TVar(input_type),
+                    rel: Relation::Subtyping(Subtyping::Subtype),
+                    t2: Shape::object(vec![]),
+                },
+                Constraint::Rel {
+                    t1: Shape::TVar(output_type),
+                    rel: Relation::Equality(Equality::Equal),
+                    t2: Shape::Blob,
+                },
+            ]);
+            vec![Constraint::Or(vec![array_branch, object_branch])]
         }
         Filter::Null => {
             // output_type = null
@@ -2578,10 +3242,27 @@ fn compute_shape_internal(
                     (cs, output_types)
                 });
 
+            // `[f]` collects f's whole output stream. The tuple type is only
+            // valid when every element filter produces exactly one value;
+            // a stream-valued element (`[.[]]`, `[(1, 2)]`) collects an
+            // unknown number of values, so the type widens to an array of
+            // the union of the element types (empty union: unconstrained).
+            let all_single = array_filters.iter().all(produces_single_output);
+            let element_shape = if all_single {
+                Shape::Tuple(output_types)
+            } else if output_types.is_empty() {
+                Shape::Array(Box::new(Shape::Blob), None)
+            } else {
+                let elem_union = output_types
+                    .into_iter()
+                    .reduce(|a, b| Shape::Union(Box::new(a), Box::new(b)))
+                    .unwrap();
+                Shape::Array(Box::new(elem_union), None)
+            };
             cs.push(Constraint::Rel {
                 t1: Shape::TVar(output_type),
                 rel: Relation::Equality(Equality::Equal),
-                t2: Shape::Tuple(output_types),
+                t2: element_shape,
             });
 
             cs
@@ -2612,8 +3293,9 @@ fn compute_shape_internal(
                     (cs, output_types)
                 });
 
+            // Object construction yields exactly these keys: a closed row.
             cs.push(Constraint::Rel {
-                t1: Shape::Object(output_types),
+                t1: Shape::object_closed(output_types),
                 rel: Relation::Equality(Equality::Equal),
                 t2: Shape::TVar(output_type),
             });
@@ -2621,28 +3303,31 @@ fn compute_shape_internal(
             cs
         }
         Filter::UnOp(un_op, filter) => {
-            // let output_type = ctx.fresh();
+            let operand_type = ctx.fresh();
             let mut cs = compute_shape_internal(
                 filter,
                 ctx,
                 input_type,
-                output_type,
+                operand_type,
                 filters,
                 computing,
                 function_outputs,
             );
             match un_op {
                 UnOp::Neg => {
-                    // input type must be a number
+                    // The *operand's result* must be a number (the program
+                    // input is only constrained through the operand itself).
                     cs.push(Constraint::Rel {
-                        t1: Shape::TVar(input_type),
-                        rel: Relation::Equality(Equality::Equal),
+                        t1: Shape::TVar(operand_type),
+                        rel: Relation::Subtyping(Subtyping::Subtype),
                         t2: Shape::Number(None),
                     });
-                    // output_type must be a number
+                    // Negation flips the sign, which the constraint language
+                    // cannot express on singletons; widen the output to
+                    // number (sound, loses singleton precision).
                     cs.push(Constraint::Rel {
                         t1: Shape::TVar(output_type),
-                        rel: Relation::Equality(Equality::Equal),
+                        rel: Relation::Subtyping(Subtyping::Subtype),
                         t2: Shape::Number(None),
                     });
                 }
@@ -2749,14 +3434,113 @@ fn compute_shape_internal(
                                 t2: Shape::TVar(left_type),
                             },
                         ]),
+                        // Arrays concatenate
+                        Constraint::And(vec![
+                            Constraint::Rel {
+                                t1: Shape::TVar(left_type),
+                                rel: Relation::Subtyping(Subtyping::Subtype),
+                                t2: Shape::Array(Box::new(Shape::Blob), None),
+                            },
+                            Constraint::Rel {
+                                t1: Shape::TVar(right_type),
+                                rel: Relation::Subtyping(Subtyping::Subtype),
+                                t2: Shape::Array(Box::new(Shape::Blob), None),
+                            },
+                            Constraint::Rel {
+                                t1: Shape::TVar(output_type),
+                                rel: Relation::Subtyping(Subtyping::Subtype),
+                                t2: Shape::Array(Box::new(Shape::Blob), None),
+                            },
+                        ]),
+                        // Objects merge (right-biased)
+                        Constraint::And(vec![
+                            Constraint::Rel {
+                                t1: Shape::TVar(left_type),
+                                rel: Relation::Subtyping(Subtyping::Subtype),
+                                t2: Shape::object(vec![]),
+                            },
+                            Constraint::Rel {
+                                t1: Shape::TVar(right_type),
+                                rel: Relation::Subtyping(Subtyping::Subtype),
+                                t2: Shape::object(vec![]),
+                            },
+                            Constraint::Rel {
+                                t1: Shape::TVar(output_type),
+                                rel: Relation::Subtyping(Subtyping::Subtype),
+                                t2: Shape::object(vec![]),
+                            },
+                        ]),
                     ]));
 
                     cs
                 }
-                BinOp::Sub => todo!(),
-                BinOp::Mul => todo!(),
-                BinOp::Div => todo!(),
-                BinOp::Mod => todo!(),
+                BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
+                    let subtype = |var: usize, t: Shape| Constraint::Rel {
+                        t1: Shape::TVar(var),
+                        rel: Relation::Subtyping(Subtyping::Subtype),
+                        t2: t,
+                    };
+                    // One overload branch: left, right, and output are each
+                    // constrained to the given shape
+                    let branch = |l: Shape, r: Shape, o: Shape| {
+                        Constraint::And(vec![
+                            subtype(left_type, l),
+                            subtype(right_type, r),
+                            subtype(output_type, o),
+                        ])
+                    };
+                    let number = || Shape::Number(None);
+                    let string = || Shape::String(None);
+                    let array_of = |t: Shape| Shape::Array(Box::new(t), None);
+
+                    let branches = match bin_op {
+                        // Numbers subtract; arrays subtract as set difference
+                        BinOp::Sub => vec![
+                            branch(number(), number(), number()),
+                            branch(
+                                array_of(Shape::Blob),
+                                array_of(Shape::Blob),
+                                array_of(Shape::Blob),
+                            ),
+                        ],
+                        // Numbers multiply; a string times a number repeats
+                        // the string — but a negative count yields null
+                        // (verified against jq 1.7), so the output is
+                        // string | null. Two objects merge recursively.
+                        BinOp::Mul => {
+                            let string_or_null =
+                                || Shape::Union(Box::new(string()), Box::new(Shape::Null));
+                            let any_object = || Shape::object(vec![]);
+                            vec![
+                                branch(number(), number(), number()),
+                                branch(string(), number(), string_or_null()),
+                                branch(number(), string(), string_or_null()),
+                                branch(any_object(), any_object(), any_object()),
+                            ]
+                        }
+                        // Numbers divide; a string divided by a string splits it
+                        BinOp::Div => vec![
+                            branch(number(), number(), number()),
+                            branch(string(), string(), array_of(string())),
+                        ],
+                        // Modulo is numbers only
+                        BinOp::Mod => vec![branch(number(), number(), number())],
+                        _ => unreachable!(),
+                    };
+
+                    if branches.len() == 1 {
+                        // A single overload is not a disjunction; push its
+                        // parts as plain constraints so they resolve directly
+                        cs.extend(branches.into_iter().flat_map(|b| match b {
+                            Constraint::And(inner) => inner,
+                            other => vec![other],
+                        }));
+                    } else {
+                        cs.push(Constraint::Or(branches));
+                    }
+
+                    cs
+                }
                 BinOp::Eq => {
                     tracing::debug!("{output_type} == true ==> {left_type} == {right_type}");
                     cs.push(Constraint::Conditional {
@@ -2964,7 +3748,51 @@ fn compute_shape_internal(
 
                     cs
                 }
-                BinOp::Le => todo!(),
+                BinOp::Le => {
+                    // if the output is true, then left <= right
+                    cs.push(Constraint::Conditional {
+                        c1: Box::new(Constraint::Rel {
+                            t1: Shape::TVar(output_type),
+                            rel: Relation::Equality(Equality::Equal),
+                            t2: Shape::Bool(Some(true)),
+                        }),
+                        c2: Box::new(Constraint::Or(vec![
+                            Constraint::Rel {
+                                t1: Shape::TVar(left_type),
+                                rel: Relation::Comparison(Comparison::LessThan),
+                                t2: Shape::TVar(right_type),
+                            },
+                            Constraint::Rel {
+                                t1: Shape::TVar(left_type),
+                                rel: Relation::Equality(Equality::Equal),
+                                t2: Shape::TVar(right_type),
+                            },
+                        ])),
+                    });
+
+                    // if the output is false, then left > right
+                    cs.push(Constraint::Conditional {
+                        c1: Box::new(Constraint::Rel {
+                            t1: Shape::TVar(output_type),
+                            rel: Relation::Equality(Equality::Equal),
+                            t2: Shape::Bool(Some(false)),
+                        }),
+                        c2: Box::new(Constraint::Rel {
+                            t1: Shape::TVar(left_type),
+                            rel: Relation::Comparison(Comparison::GreaterThan),
+                            t2: Shape::TVar(right_type),
+                        }),
+                    });
+
+                    // Output must be of type bool
+                    cs.push(Constraint::Rel {
+                        t1: Shape::TVar(output_type),
+                        rel: Relation::Subtyping(Subtyping::Subtype),
+                        t2: Shape::Bool(None),
+                    });
+
+                    cs
+                }
                 BinOp::And => {
                     // if the output is true, then both left and right must be true
                     cs.push(Constraint::Conditional {
@@ -3101,6 +3929,68 @@ fn compute_shape_internal(
             vec![Constraint::False]
         }
         Filter::Call(f, args) => {
+            // Native builtin signatures (docs/type-system-scope.md §9): these
+            // have no faithful jq-level definition. The interpreter implements
+            // them natively; the axioms below keep the inference in sync.
+            if args.is_none() {
+                match f.as_str() {
+                    // length: defined on everything but booleans (arrays and
+                    // objects count, strings measure, null is 0, numbers give
+                    // their absolute value); always yields a number. The
+                    // defs.jq definition is an arrays-only stub.
+                    "length" => {
+                        return vec![Constraint::Rel {
+                            t1: Shape::TVar(output_type),
+                            rel: Relation::Subtyping(Subtyping::Subtype),
+                            t2: Shape::Number(None),
+                        }];
+                    }
+                    // type: total, yields one of the six type names
+                    "type" => {
+                        let names = ["null", "boolean", "number", "string", "array", "object"];
+                        let out = names
+                            .iter()
+                            .map(|n| Shape::String(Some(n.to_string())))
+                            .reduce(|a, b| Shape::Union(Box::new(a), Box::new(b)))
+                            .unwrap();
+                        return vec![Constraint::Rel {
+                            t1: Shape::TVar(output_type),
+                            rel: Relation::Equality(Equality::Equal),
+                            t2: out,
+                        }];
+                    }
+                    // keys: sorted key names for objects, indices for arrays
+                    "keys" => {
+                        let out = Shape::Union(
+                            Box::new(Shape::Array(Box::new(Shape::String(None)), None)),
+                            Box::new(Shape::Array(Box::new(Shape::Number(None)), None)),
+                        );
+                        return vec![Constraint::Rel {
+                            t1: Shape::TVar(output_type),
+                            rel: Relation::Equality(Equality::Equal),
+                            t2: out,
+                        }];
+                    }
+                    // floor: numbers only, yields a number
+                    // tonumber: numbers pass through, strings parse or fail
+                    "floor" | "tonumber" => {
+                        return vec![Constraint::Rel {
+                            t1: Shape::TVar(output_type),
+                            rel: Relation::Equality(Equality::Equal),
+                            t2: Shape::Number(None),
+                        }];
+                    }
+                    // tostring: total, always a string
+                    "tostring" => {
+                        return vec![Constraint::Rel {
+                            t1: Shape::TVar(output_type),
+                            rel: Relation::Equality(Equality::Equal),
+                            t2: Shape::String(None),
+                        }];
+                    }
+                    _ => {}
+                }
+            }
             if let Some(filter) = filters.get(f) {
                 if let Filter::Bound(params, body) = filter {
                     // Check if we're already computing this function (recursive call)
@@ -3190,12 +4080,10 @@ fn compute_shape_internal(
                 function_outputs,
             ));
 
-            // if expression must evaluate to a boolean
-            cs.push(Constraint::Rel {
-                t1: Shape::TVar(if_type),
-                rel: Relation::Subtyping(Subtyping::Subtype),
-                t2: Shape::Bool(None),
-            });
+            // jq conditions may have any type: every value except null and
+            // false is truthy. The `if_type == true/false` implication
+            // conditions below are interpreted as truthiness tests by the
+            // solver (see condition_is_satisfied).
 
             let then_type = ctx.fresh();
             let then_cs = compute_shape_internal(
@@ -3366,12 +4254,50 @@ fn compute_shape_internal(
                 });
             }
 
-            // Output type equals input type (slicing preserves the type)
-            cs.push(Constraint::Rel {
-                t1: Shape::TVar(output_type),
-                rel: Relation::Equality(Equality::Equal),
-                t2: Shape::TVar(input_type),
-            });
+            // The sliced value is an array or a string (jq errors on other
+            // kinds, null included under strict); slicing preserves the kind.
+            let elem_type = ctx.fresh();
+            let array_branch = Constraint::And(vec![
+                Constraint::Rel {
+                    t1: Shape::TVar(input_type),
+                    rel: Relation::Subtyping(Subtyping::Subtype),
+                    t2: Shape::Array(Box::new(Shape::TVar(elem_type)), None),
+                },
+                Constraint::Rel {
+                    t1: Shape::TVar(output_type),
+                    rel: Relation::Equality(Equality::Equal),
+                    t2: Shape::Array(Box::new(Shape::TVar(elem_type)), None),
+                },
+            ]);
+            let string_branch = Constraint::And(vec![
+                Constraint::Rel {
+                    t1: Shape::TVar(input_type),
+                    rel: Relation::Subtyping(Subtyping::Subtype),
+                    t2: Shape::String(None),
+                },
+                Constraint::Rel {
+                    t1: Shape::TVar(output_type),
+                    rel: Relation::Equality(Equality::Equal),
+                    t2: Shape::String(None),
+                },
+            ]);
+            let mut branches = vec![array_branch, string_branch];
+            if ctx.options.lenient_absence {
+                // jq's default: slicing null yields null
+                branches.push(Constraint::And(vec![
+                    Constraint::Rel {
+                        t1: Shape::TVar(input_type),
+                        rel: Relation::Equality(Equality::Equal),
+                        t2: Shape::Null,
+                    },
+                    Constraint::Rel {
+                        t1: Shape::TVar(output_type),
+                        rel: Relation::Equality(Equality::Equal),
+                        t2: Shape::Null,
+                    },
+                ]));
+            }
+            cs.push(Constraint::Or(branches));
 
             cs
         }
@@ -3484,7 +4410,7 @@ mod solver_tests {
     use tjq_exec::{builtin_filters, parse};
     use tjq_exec::{BinOp, Filter, UnOp};
 
-    use super::{solve, Constraint, Context};
+    use super::{solve, solve_arrows, Constraint, Context};
 
     use crate::experimental_type_inference::{compute_shape, Shape};
 
@@ -3538,6 +4464,81 @@ mod solver_tests {
         (tin, tout)
     }
 
+    /// Solve and return the lint warnings only.
+    fn solve_warnings(expression: &str) -> Vec<String> {
+        let (_, filter) = parse(expression);
+        let filter = (&filter).into();
+        let mut context = Context::new();
+        let i = context.fresh();
+        let o = context.fresh();
+        let constraints = compute_shape(&filter, &mut context, i, o, &builtin_filters());
+        let result = solve(constraints, &context).unwrap();
+        result.warnings.into_iter().map(|w| w.message).collect()
+    }
+
+    #[test]
+    fn test_dead_branch_lint_always_truthy() {
+        // 0 is truthy in jq: the else branch can never run
+        let warnings = solve_warnings(r#"if 0 then 1 else 2 end"#);
+        assert!(
+            warnings.iter().any(|w| w.contains("always truthy")),
+            "expected always-truthy warning, got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn test_dead_branch_lint_always_falsy() {
+        let warnings = solve_warnings(r#"if null then 1 else 2 end"#);
+        assert!(
+            warnings.iter().any(|w| w.contains("always falsy")),
+            "expected always-falsy warning, got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn test_dead_branch_lint_silent_when_undetermined() {
+        let warnings = solve_warnings(r#"if . == 1 then "one" else "other" end"#);
+        assert!(
+            warnings.is_empty(),
+            "undetermined condition must not warn, got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn test_dead_branch_lint_spares_error_narrowing() {
+        // `else error` is the narrowing idiom: the condition being forced
+        // truthy is intentional, not dead code
+        let warnings = solve_warnings(r#"if . == true then 1 else error end"#);
+        assert!(
+            warnings.is_empty(),
+            "error-narrowing must not warn, got {warnings:?}"
+        );
+    }
+
+    /// Solve for a filter's arrow type: an intersection of (input -> output)
+    /// arrows, one per satisfiable overload branch.
+    fn solve_arrow_type(expression: &str) -> Shape {
+        let (_, filter) = parse(expression);
+        let filter = (&filter).into();
+        let mut context = Context::new();
+        let i = context.fresh();
+        let o = context.fresh();
+        let constraints = compute_shape(&filter, &mut context, i, o, &builtin_filters());
+        solve_arrows(constraints, &context, i, o).unwrap()
+    }
+
+    /// Flatten nested intersections into a list of component shapes
+    fn intersection_members(shape: &Shape) -> Vec<&Shape> {
+        match shape {
+            Shape::Intersection(s1, s2) => {
+                let mut members = intersection_members(s1);
+                members.extend(intersection_members(s2));
+                members
+            }
+            other => vec![other],
+        }
+    }
+
     #[test]
     fn test_solver_dot() {
         let (tin, tout) = solve_constraints(r#"."#);
@@ -3586,14 +4587,13 @@ mod solver_tests {
     }
 
     #[test]
-    #[should_panic]
     fn test_solver_object() {
         let (tin, tout) = solve_constraints(r#"{ "a": 1, "b": 2 }"#);
         // t: T -> T
         assert_eq!(tin, Shape::TVar(1));
         assert_eq!(
             tout,
-            Shape::Object(vec![
+            Shape::object_closed(vec![
                 ("a".to_string(), Shape::Number(Some(1.0))),
                 ("b".to_string(), Shape::Number(Some(2.0)))
             ])
@@ -3698,9 +4698,9 @@ mod solver_tests {
         // t: { a: { b: T }} -> T
         assert_eq!(
             tin,
-            Shape::Object(vec![(
+            Shape::object(vec![(
                 "a".to_string(),
-                Shape::Object(vec![("b".to_string(), Shape::TVar(2))])
+                Shape::object(vec![("b".to_string(), Shape::TVar(2))])
             )])
         );
         assert_eq!(tout, Shape::TVar(2));
@@ -3739,25 +4739,41 @@ mod solver_tests {
 
     #[test]
     fn test_length() {
-        // The length function narrows input to array via backward propagation:
-        // 1. length uses: if isarray | not then error else ... end
-        // 2. isarray | not produces true when input is not an array
-        // 3. The then-branch errors, so `not`'s output must be false
-        // 4. Backward propagation: not(x)=false implies x=true
-        // 5. isarray(.)=true implies . is an array
-        //
-        // Output type resolution:
-        // 6. When T3=false (error branch not taken), T15 <: T2 is activated
-        // 7. T16 (is array empty?) has both true/false branches
-        // 8. T16=true branch: T19=0 flows through T19 <: T15 <: T2
-        // 9. T16=false branch: recursive call (not fully analyzed yet)
+        // `length` is a native builtin with an axiomatic signature
+        // (docs/type-system-scope.md §9): it works on everything except
+        // booleans (jq's real semantics — the defs.jq definition is an
+        // arrays-only stub) and always yields a number. The input is
+        // therefore unconstrained by the axiom.
         let (tin, tout) = solve_constraints(r#"length"#);
         tracing::debug!("tin: {tin}, tout: {tout}");
-        assert_eq!(tin, Shape::Array(Box::new(Shape::TVar(0)), None));
-        // Output is Number(0) from the base case - recursive case would add more
+        assert!(
+            matches!(tin, Shape::TVar(_)),
+            "tin should be unconstrained, got: {tin}"
+        );
         assert!(
             matches!(tout, Shape::Number(None)),
             "tout should be Number, got: {tout}"
+        );
+    }
+
+    #[test]
+    fn test_type_builtin() {
+        // `type` is total and yields one of the six type names.
+        let (tin, tout) = solve_constraints(r#"type"#);
+        tracing::debug!("tin: {tin}, tout: {tout}");
+        assert!(
+            matches!(tin, Shape::TVar(_)),
+            "tin should be unconstrained, got: {tin}"
+        );
+        for name in ["null", "boolean", "number", "string", "array", "object"] {
+            assert!(
+                Shape::String(Some(name.to_string())).included_in(&tout),
+                "tout should cover \"{name}\", got: {tout}"
+            );
+        }
+        assert!(
+            tout.included_in(&Shape::String(None)),
+            "tout should only contain strings, got: {tout}"
         );
     }
 
@@ -3775,5 +4791,304 @@ mod solver_tests {
         tracing::debug!("tin: {tin}, tout: {tout}");
         assert_eq!(tin, Shape::Array(Box::new(Shape::TVar(0)), None));
         assert_eq!(tout, Shape::number(1.0));
+    }
+
+    // ==================== Intersection Type Tests ====================
+    // These tests verify the set-theoretic intersection type semantics
+
+    /// Test that overloaded operators produce intersection-of-arrow types.
+    /// The `+` operator works on (Number, Number) -> Number AND (String, String) -> String,
+    /// so the filter type is an intersection of arrows, keeping the correlation
+    /// between input and output that the union-based solution loses.
+    #[test]
+    fn test_intersection_from_overloaded_operator() {
+        let t = solve_arrow_type(r#". + ."#);
+        tracing::debug!("filter type: {t}");
+        let members = intersection_members(&t);
+        assert!(
+            members.contains(&&Shape::arrow(Shape::Number(None), Shape::Number(None))),
+            "Expected (number -> number) among arrows, got {:?}",
+            t
+        );
+        assert!(
+            members.contains(&&Shape::arrow(Shape::String(None), Shape::String(None))),
+            "Expected (string -> string) among arrows, got {:?}",
+            t
+        );
+        // The null overload must not leak into the number/string arrows
+        assert!(
+            !members
+                .iter()
+                .any(|m| matches!(m, Shape::Arrow(input, _) if matches!(input.as_ref(), Shape::Union(_, _)))),
+            "Arrow inputs should be branch-specific, not unions: {:?}",
+            t
+        );
+    }
+
+    /// `. + 1` has exactly two satisfiable overloads: the number overload and
+    /// the null-input overload (null + 1 == 1). The string overload contradicts
+    /// the constant `1` and must be pruned.
+    #[test]
+    fn test_arrow_type_add_number() {
+        let t = solve_arrow_type(r#". + 1"#);
+        tracing::debug!("filter type: {t}");
+        let members = intersection_members(&t);
+        assert!(
+            members.contains(&&Shape::arrow(Shape::Number(None), Shape::Number(None))),
+            "Expected (number -> number) among arrows, got {:?}",
+            t
+        );
+        assert!(
+            !members.iter().any(
+                |m| matches!(m, Shape::Arrow(input, _) if matches!(input.as_ref(), Shape::String(_)))
+            ),
+            "String overload should be pruned for `. + 1`, got {:?}",
+            t
+        );
+    }
+
+    /// A filter with no overloading gets a single arrow, not an intersection.
+    #[test]
+    fn test_arrow_type_no_overload() {
+        let t = solve_arrow_type(r#"- ."#);
+        tracing::debug!("filter type: {t}");
+        assert_eq!(t, Shape::arrow(Shape::Number(None), Shape::Number(None)));
+    }
+
+    /// Test intersection canonicalization: Number & Number = Number
+    #[test]
+    fn test_intersection_canonicalize_same_type() {
+        use crate::shape::Shape;
+        let a = Shape::Number(None);
+        let b = Shape::Number(None);
+        let intersection = Shape::Intersection(Box::new(a), Box::new(b));
+        let canonicalized = intersection.canonicalize();
+        assert_eq!(canonicalized, Shape::Number(None));
+    }
+
+    /// Test intersection canonicalization: Number(1) & Number = Number(1)
+    #[test]
+    fn test_intersection_canonicalize_specific_general() {
+        use crate::shape::Shape;
+        let a = Shape::Number(Some(1.0));
+        let b = Shape::Number(None);
+        let intersection = Shape::Intersection(Box::new(a), Box::new(b));
+        let canonicalized = intersection.canonicalize();
+        assert_eq!(canonicalized, Shape::Number(Some(1.0)));
+    }
+
+    /// Test intersection of disjoint types produces Mismatch (bottom)
+    #[test]
+    fn test_intersection_disjoint_types() {
+        use crate::shape::Shape;
+        let a = Shape::Number(None);
+        let b = Shape::String(None);
+        let intersection = Shape::Intersection(Box::new(a.clone()), Box::new(b.clone()));
+        let canonicalized = intersection.canonicalize();
+        assert!(
+            matches!(canonicalized, Shape::Mismatch(_, _)),
+            "Number & String should be Mismatch (bottom), got {:?}",
+            canonicalized
+        );
+    }
+
+    /// Test intersection with Blob (top type): A & Blob = A
+    #[test]
+    fn test_intersection_with_blob() {
+        use crate::shape::Shape;
+        let a = Shape::Number(None);
+        let b = Shape::Blob;
+        let intersection = Shape::Intersection(Box::new(a.clone()), Box::new(b));
+        let canonicalized = intersection.canonicalize();
+        assert_eq!(canonicalized, Shape::Number(None));
+    }
+
+    /// Test Bool(true) & Bool(false) = Mismatch (empty type)
+    #[test]
+    fn test_intersection_contradictory_bools() {
+        use crate::shape::Shape;
+        let a = Shape::Bool(Some(true));
+        let b = Shape::Bool(Some(false));
+        let intersection = Shape::Intersection(Box::new(a.clone()), Box::new(b.clone()));
+        let canonicalized = intersection.canonicalize();
+        assert!(
+            matches!(canonicalized, Shape::Mismatch(_, _)),
+            "Bool(true) & Bool(false) should be Mismatch, got {:?}",
+            canonicalized
+        );
+    }
+
+    /// Test intersection Display format
+    #[test]
+    fn test_intersection_display() {
+        use crate::shape::Shape;
+        let intersection =
+            Shape::Intersection(Box::new(Shape::Number(None)), Box::new(Shape::String(None)));
+        let display = format!("{}", intersection);
+        assert_eq!(display, "(<number> & <string>)");
+    }
+
+    /// Test De Morgan's law: ¬(A & B) = ¬A | ¬B
+    #[test]
+    fn test_intersection_demorgan() {
+        use crate::shape::Shape;
+        let a = Shape::Number(None);
+        let b = Shape::String(None);
+        let intersection = Shape::Intersection(Box::new(a.clone()), Box::new(b.clone()));
+        let negated = Shape::Neg(Box::new(intersection));
+        let canonicalized = negated.canonicalize();
+        // Should become Union(Neg(Number), Neg(String))
+        assert!(
+            matches!(canonicalized, Shape::Union(_, _)),
+            "¬(A & B) should become Union, got {:?}",
+            canonicalized
+        );
+    }
+
+    /// Test if-then-else produces intersection type for conditional branches
+    /// `if cond then A else B` with different input constraints produces intersection
+    #[test]
+    fn test_conditional_intersection() {
+        // If the condition constrains input differently for then/else branches,
+        // we should get an intersection type representing the conditional behavior
+        let (tin, tout) = solve_constraints(r#"if . == 1 then "one" else "other" end"#);
+        tracing::debug!("tin: {tin}, tout: {tout}");
+        // Both branches return strings; the aggregate answer is the union of
+        // the two singletons (promotion to <string> is the widening policy's
+        // job, not the default — docs/type-system-scope.md §4).
+        let expected = Shape::Union(
+            Box::new(Shape::String(Some("one".to_string()))),
+            Box::new(Shape::String(Some("other".to_string()))),
+        );
+        assert!(
+            tout.included_in(&expected) && expected.included_in(&tout),
+            "Expected \"one\" | \"other\" for conditional output, got {:?}",
+            tout
+        );
+    }
+
+    // ==================== Arithmetic Operator Tests ====================
+
+    /// `. - 1` only keeps the number overload; the array overload contradicts
+    /// the constant `1`
+    #[test]
+    fn test_arrow_type_sub_number() {
+        let t = solve_arrow_type(r#". - 1"#);
+        assert_eq!(t, Shape::arrow(Shape::Number(None), Shape::Number(None)));
+    }
+
+    /// `. - .` keeps both the number and the array (set difference) overloads
+    #[test]
+    fn test_arrow_type_sub_dot_dot() {
+        let t = solve_arrow_type(r#". - ."#);
+        let members = intersection_members(&t);
+        let array_of_blob = || Shape::Array(Box::new(Shape::Blob), None);
+        assert!(
+            members.contains(&&Shape::arrow(Shape::Number(None), Shape::Number(None))),
+            "Expected (number -> number) among arrows, got {:?}",
+            t
+        );
+        assert!(
+            members.contains(&&Shape::arrow(array_of_blob(), array_of_blob())),
+            "Expected (array -> array) among arrows, got {:?}",
+            t
+        );
+    }
+
+    /// `. * 2` works for numbers and repeats strings. The string overload's
+    /// output is `string | null`: a non-positive count yields null (jq 1.7).
+    #[test]
+    fn test_arrow_type_mul_number() {
+        let t = solve_arrow_type(r#". * 2"#);
+        let members = intersection_members(&t);
+        assert!(
+            members.contains(&&Shape::arrow(Shape::Number(None), Shape::Number(None))),
+            "Expected (number -> number) among arrows, got {:?}",
+            t
+        );
+        let string_arrow = members.iter().find(
+            |m| matches!(m, Shape::Arrow(input, _) if matches!(input.as_ref(), Shape::String(_))),
+        );
+        match string_arrow {
+            Some(Shape::Arrow(_, output)) => {
+                let out_ok = output.included_in(&Shape::Union(
+                    Box::new(Shape::String(None)),
+                    Box::new(Shape::Null),
+                )) && Shape::String(None).included_in(output);
+                assert!(
+                    out_ok,
+                    "Expected string overload output to cover string within \
+                     string | null, got {:?}",
+                    t
+                );
+            }
+            _ => panic!("Expected a string-input arrow, got {:?}", t),
+        }
+    }
+
+    /// `. * .` keeps the number and object (recursive merge) overloads; the
+    /// string overload needs a number on the other side, but both sides are
+    /// the same input, so it is pruned.
+    #[test]
+    fn test_arrow_type_mul_dot_dot() {
+        let t = solve_arrow_type(r#". * ."#);
+        let members = intersection_members(&t);
+        assert!(
+            members.contains(&&Shape::arrow(Shape::Number(None), Shape::Number(None))),
+            "Expected (number -> number) among arrows, got {:?}",
+            t
+        );
+        assert!(
+            members.contains(&&Shape::arrow(Shape::object(vec![]), Shape::object(vec![]))),
+            "Expected (object -> object) among arrows, got {:?}",
+            t
+        );
+        assert!(
+            !members
+                .iter()
+                .any(|m| matches!(m, Shape::Arrow(i, _) if matches!(i.as_ref(), Shape::String(_)))),
+            "String overload should be pruned for `. * .`, got {:?}",
+            t
+        );
+    }
+
+    /// `. + .`'s null overload resolves to the precise `null -> null` (not a
+    /// free variable). Regression test for the Phase-2 substitution bug
+    /// where a smaller-variable alias could overwrite a concrete equality on
+    /// the same variable, leaving the whole equality class unresolved.
+    #[test]
+    fn test_arrow_type_add_dot_dot_null_precise() {
+        let t = solve_arrow_type(r#". + ."#);
+        let members = intersection_members(&t);
+        assert!(
+            members.contains(&&Shape::arrow(Shape::Null, Shape::Null)),
+            "Expected precise (null -> null) among arrows, got {:?}",
+            t
+        );
+        assert!(
+            members.contains(&&Shape::arrow(Shape::Number(None), Shape::Number(None))),
+            "Expected (number -> number), got {:?}",
+            t
+        );
+    }
+
+    /// `. / ","` is string splitting: the number overload contradicts `","`
+    #[test]
+    fn test_arrow_type_div_string() {
+        let t = solve_arrow_type(r#". / ",""#);
+        assert_eq!(
+            t,
+            Shape::arrow(
+                Shape::String(None),
+                Shape::Array(Box::new(Shape::String(None)), None)
+            )
+        );
+    }
+
+    /// Modulo is numbers only
+    #[test]
+    fn test_arrow_type_mod() {
+        let t = solve_arrow_type(r#". % 2"#);
+        assert_eq!(t, Shape::arrow(Shape::Number(None), Shape::Number(None)));
     }
 }

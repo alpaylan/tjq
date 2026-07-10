@@ -364,6 +364,15 @@ impl<'a> Cst<'a> {
         }
     }
 
+    pub(crate) fn comma(lhs: Cst<'a>, rhs: Cst<'a>, value: &'a str, range: Range) -> Self {
+        Self {
+            kind: NodeKind::FilterKind(FilterKind::Comma),
+            children: vec![lhs, rhs],
+            range,
+            value,
+        }
+    }
+
     pub(crate) fn string(range: Range, value: &'a str) -> Self {
         Self {
             kind: NodeKind::FilterKind(FilterKind::String),
@@ -666,11 +675,12 @@ pub(crate) fn parse_filter<'a>(
     match root.kind() {
         "dot" => (Cst::dot(root.range()), vec![]),
         "sequence_expression" => {
+            // `f, g` concatenates output streams; it is NOT `f | g`
             let (lhs, vl) = parse_filter(code, root.child(0).expect("sequence should have a lhs"));
             let (rhs, vr) = parse_filter(code, root.child(2).expect("sequence should have a rhs"));
             let v = vl.into_iter().chain(vr).collect();
             (
-                Cst::pipe(
+                Cst::comma(
                     lhs,
                     rhs,
                     &code[root.range().start_byte..root.range().end_byte],

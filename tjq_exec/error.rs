@@ -10,6 +10,7 @@ pub enum JQError {
     ArrIteratorForNonIterable(Json),
     NonStringObjectKey(Json),
     BinOpTypeError(Json, BinOp, Json),
+    DivisionByZero(Json, Json),
     UnOpTypeError(Json, UnOp),
     FilterNotDefined(String, usize),
     InvalidArrayIndex(Json, Json),
@@ -50,6 +51,14 @@ impl Display for JQError {
                         | BinOp::And
                         | BinOp::Or => unreachable!("{} is valid for all types", bin_op),
                     }
+                )
+            }
+            JQError::DivisionByZero(json, json1) => {
+                write!(
+                    f,
+                    "{} and {} cannot be divided because the divisor is zero",
+                    json.debug(),
+                    json1.debug()
                 )
             }
             JQError::Unknown => write!(f, "Unknown error"),

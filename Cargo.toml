@@ -7,4 +7,5 @@ members = [
     "tjq",
     "tjq_lsp",
     "tjq_grammar",
+    "tjq_testing",
 ]

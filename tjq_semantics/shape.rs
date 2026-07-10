@@ -19,11 +19,74 @@ pub enum Shape {
     String(Option<String>),
     Array(Box<Shape>, Option<isize>),
     Tuple(Vec<Shape>),
-    Object(Vec<(String, Shape)>),
+    Object(Row),
     Mismatch(Box<Shape>, Box<Shape>),
     Union(Box<Shape>, Box<Shape>),
     Intersection(Box<Shape>, Box<Shape>),
     Neg(Box<Shape>),
+    /// Arrow type for function/filter types: input -> output
+    Arrow(Box<Shape>, Box<Shape>),
+}
+
+/// An object type as a row (docs/type-system-scope.md §6): a set of named
+/// fields plus whether keys beyond them are permitted. A JSON object `o`
+/// inhabits the row iff every field is satisfied (a required field must be
+/// present with a conforming value; an optional field, if present, must
+/// conform) and, when the row is closed, `o` has no keys outside the row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Row {
+    pub fields: Vec<Field>,
+    /// Extra keys (beyond `fields`) are permitted, each with any value.
+    /// Field *access* patterns infer open rows; object *construction*
+    /// infers closed ones.
+    pub open: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Field {
+    pub key: String,
+    pub value: Shape,
+    /// The key may be absent from a conforming object (jq's lenient `.a`,
+    /// which yields null on a missing key, demands an optional field).
+    pub optional: bool,
+}
+
+impl Row {
+    pub fn iter(&self) -> std::slice::Iter<'_, Field> {
+        self.fields.iter()
+    }
+    pub fn get(&self, key: &str) -> Option<&Field> {
+        self.fields.iter().find(|f| f.key == key)
+    }
+    pub fn len(&self) -> usize {
+        self.fields.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.fields.is_empty()
+    }
+}
+
+impl std::ops::Index<usize> for Row {
+    type Output = Field;
+    fn index(&self, i: usize) -> &Field {
+        &self.fields[i]
+    }
+}
+
+impl IntoIterator for Row {
+    type Item = Field;
+    type IntoIter = std::vec::IntoIter<Field>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.fields.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a Row {
+    type Item = &'a Field;
+    type IntoIter = std::slice::Iter<'a, Field>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.fields.iter()
+    }
 }
 
 impl Shape {
@@ -63,8 +126,37 @@ impl Shape {
     pub(crate) fn tuple(shapes: Vec<Shape>) -> Self {
         Shape::Tuple(shapes)
     }
+    /// Back-compat constructor: an OPEN row of all-REQUIRED fields — exactly
+    /// the semantics `Object(Vec<(String, Shape)>)` had before rows. Most
+    /// call sites (field-access demands, `from_json`) want this.
     pub(crate) fn object(items: Vec<(String, Shape)>) -> Self {
-        Shape::Object(items)
+        Shape::Object(Row {
+            fields: items
+                .into_iter()
+                .map(|(key, value)| Field {
+                    key,
+                    value,
+                    optional: false,
+                })
+                .collect(),
+            open: true,
+        })
+    }
+
+    /// A CLOSED row of all-required fields: the object has exactly these
+    /// keys. Object construction (`{a: 1}`) produces this.
+    pub(crate) fn object_closed(items: Vec<(String, Shape)>) -> Self {
+        Shape::Object(Row {
+            fields: items
+                .into_iter()
+                .map(|(key, value)| Field {
+                    key,
+                    value,
+                    optional: false,
+                })
+                .collect(),
+            open: false,
+        })
     }
     pub(crate) fn mismatch(s1: Shape, s2: Shape) -> Self {
         Shape::Mismatch(Box::new(s1), Box::new(s2))
@@ -86,6 +178,24 @@ impl Shape {
 
     pub(crate) fn neg(self) -> Self {
         Shape::Neg(Box::new(self))
+    }
+
+    pub(crate) fn intersection(s1: Shape, s2: Shape) -> Self {
+        Shape::Intersection(Box::new(s1), Box::new(s2))
+    }
+
+    pub(crate) fn intersection_(shapes: Vec<Shape>) -> Self {
+        if shapes.is_empty() {
+            panic!("Cannot create intersection of empty shapes");
+        }
+        shapes
+            .into_iter()
+            .reduce(|a, b| Shape::intersection(a, b))
+            .unwrap()
+    }
+
+    pub(crate) fn arrow(input: Shape, output: Shape) -> Self {
+        Shape::Arrow(Box::new(input), Box::new(output))
     }
 }
 
@@ -219,11 +329,19 @@ impl Display for Shape {
             }
             Shape::Object(obj) => {
                 write!(f, "{{")?;
-                for (i, (key, value)) in obj.iter().enumerate() {
+                for (i, field) in obj.iter().enumerate() {
                     if i != 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "{}: {}", key, value)?;
+                    let opt = if field.optional { "?" } else { "" };
+                    write!(f, "{}{}: {}", field.key, opt, field.value)?;
+                }
+                if obj.open {
+                    if obj.fields.is_empty() {
+                        write!(f, "..")?;
+                    } else {
+                        write!(f, ", ..")?;
+                    }
                 }
                 write!(f, "}}")
             }
@@ -232,7 +350,8 @@ impl Display for Shape {
             Shape::Neg(shape) => {
                 write!(f, "(!{shape})")
             }
-            Shape::Intersection(shape, shape1) => todo!(),
+            Shape::Intersection(s1, s2) => write!(f, "({s1} & {s2})"),
+            Shape::Arrow(input, output) => write!(f, "({input} -> {output})"),
         }
     }
 }
@@ -352,6 +471,28 @@ impl TypeInference for DirectInference {
 }
 
 impl Shape {
+    /// Number of nodes in the shape tree. Used to bound substitution
+    /// growth: cyclic equalities with several occurrences of the same
+    /// variable double the shape every substitution round.
+    pub fn size(&self) -> usize {
+        1 + match self {
+            Shape::TVar(_)
+            | Shape::Blob
+            | Shape::Null
+            | Shape::Bool(_)
+            | Shape::Number(_)
+            | Shape::String(_) => 0,
+            Shape::Array(e, _) => e.size(),
+            Shape::Tuple(ts) => ts.iter().map(|s| s.size()).sum(),
+            Shape::Object(fs) => fs.iter().map(|f| f.value.size()).sum(),
+            Shape::Mismatch(a, b)
+            | Shape::Union(a, b)
+            | Shape::Intersection(a, b)
+            | Shape::Arrow(a, b) => a.size() + b.size(),
+            Shape::Neg(a) => a.size(),
+        }
+    }
+
     pub fn dependencies(&self) -> Vec<usize> {
         match self {
             Shape::TVar(t) => vec![*t],
@@ -362,14 +503,16 @@ impl Shape {
             Shape::String(_) => vec![],
             Shape::Array(shape, _) => shape.dependencies(),
             Shape::Tuple(tuple) => tuple.iter().flat_map(|s| s.dependencies()).collect(),
-            Shape::Object(obj) => obj.iter().flat_map(|(_, s)| s.dependencies()).collect(),
-            Shape::Mismatch(s1, s2) | Shape::Union(s1, s2) => s1
+            Shape::Object(obj) => obj.iter().flat_map(|f| f.value.dependencies()).collect(),
+            Shape::Mismatch(s1, s2)
+            | Shape::Union(s1, s2)
+            | Shape::Intersection(s1, s2)
+            | Shape::Arrow(s1, s2) => s1
                 .dependencies()
                 .into_iter()
                 .chain(s2.dependencies())
                 .collect(),
             Shape::Neg(shape) => shape.dependencies(),
-            Shape::Intersection(shape, shape1) => todo!(),
         }
     }
 
@@ -395,11 +538,17 @@ impl Shape {
             Shape::String(s) => Shape::String(s.clone()),
             Shape::Array(shape, u) => Shape::Array(Box::new(shape.normalize(ctx)), *u),
             Shape::Tuple(tuple) => Shape::Tuple(tuple.iter().map(|s| s.normalize(ctx)).collect()),
-            Shape::Object(obj) => Shape::Object(
-                obj.iter()
-                    .map(|(k, s)| (k.clone(), s.normalize(ctx)))
+            Shape::Object(obj) => Shape::Object(Row {
+                fields: obj
+                    .iter()
+                    .map(|f| Field {
+                        key: f.key.clone(),
+                        value: f.value.normalize(ctx),
+                        optional: f.optional,
+                    })
                     .collect(),
-            ),
+                open: obj.open,
+            }),
             Shape::Mismatch(s1, s2) => {
                 Shape::Mismatch(Box::new(s1.normalize(ctx)), Box::new(s2.normalize(ctx)))
             }
@@ -407,149 +556,146 @@ impl Shape {
                 Shape::Union(Box::new(s1.normalize(ctx)), Box::new(s2.normalize(ctx)))
             }
             Shape::Neg(shape) => Shape::Neg(Box::new(shape.normalize(ctx))),
-            Shape::Intersection(shape, shape1) => todo!(),
+            Shape::Intersection(s1, s2) => {
+                Shape::Intersection(Box::new(s1.normalize(ctx)), Box::new(s2.normalize(ctx)))
+            }
+            Shape::Arrow(input, output) => Shape::Arrow(
+                Box::new(input.normalize(ctx)),
+                Box::new(output.normalize(ctx)),
+            ),
         }
     }
 
-    pub fn subtype(&self, other: &Self) -> Subtyping {
+    /// Semantic inclusion: is every JSON value accepted by `self` also
+    /// accepted by `other`? (Standard subtyping, `self ⊆ other`, with
+    /// `check` as the denotation.)
+    ///
+    /// Conservative: `true` is a proof obligation (validated by the model
+    /// tests in tjq_testing), `false` means "not provably included". This
+    /// is the replacement direction for the legacy tri-state `subtype`,
+    /// which uses an inverted convention (see its doc comment).
+    pub fn included_in(&self, other: &Shape) -> bool {
         match (self, other) {
-            (Shape::TVar(_), _) | (_, Shape::TVar(_)) => {
-                // TVar can be any type, so it should not be a subtype of any other type
-                Subtyping::Incompatible
+            // Top and bottom
+            (_, Shape::Blob) => true,
+            (Shape::Mismatch(_, _), _) => true, // empty set is included in everything
+            // Unknowns: no claims
+            (Shape::TVar(_), _) | (_, Shape::TVar(_)) => false,
+            // Set operators on the left
+            (Shape::Union(a, b), t) => a.included_in(t) && b.included_in(t),
+            (Shape::Intersection(a, b), t) => a.included_in(t) || b.included_in(t),
+            // Set operators on the right
+            (t, Shape::Intersection(a, b)) => t.included_in(a) && t.included_in(b),
+            (t, Shape::Union(a, b)) => t.included_in(a) || t.included_in(b),
+            (Shape::Neg(a), Shape::Neg(b)) => b.included_in(a),
+            (t, Shape::Neg(b)) => t.disjoint_with(b),
+            (Shape::Neg(_), _) => false, // ¬A ⊆ B needs completeness reasoning; stay conservative
+            // Scalars
+            (Shape::Null, Shape::Null) => true,
+            (Shape::Bool(_), Shape::Bool(None)) => true,
+            (Shape::Bool(Some(a)), Shape::Bool(Some(b))) => a == b,
+            (Shape::Number(_), Shape::Number(None)) => true,
+            (Shape::Number(Some(a)), Shape::Number(Some(b))) => a == b,
+            (Shape::String(_), Shape::String(None)) => true,
+            (Shape::String(Some(a)), Shape::String(Some(b))) => a == b,
+            // Arrays are covariant in the element type; `check` ignores the
+            // length annotation, so inclusion does too.
+            (Shape::Array(e1, _), Shape::Array(e2, _)) => e1.included_in(e2),
+            // A tuple accepts arrays with at least its prefix, rest
+            // unconstrained; it fits in Array(e) only if e is ⊤.
+            (Shape::Tuple(ts), Shape::Array(e, _)) => {
+                matches!(e.as_ref(), Shape::Blob) && ts.iter().all(|t| t.included_in(e))
             }
-            (Shape::Null, Shape::Null) => Subtyping::Subtype,
-            (Shape::Blob, Shape::Blob) => Subtyping::Subtype,
-            (Shape::Bool(b1), Shape::Bool(b2)) => match (b1, b2) {
-                (Some(b1), Some(b2)) if b1 == b2 => Subtyping::Subtype,
-                (Some(_), None) => Subtyping::Supertype,
-                (None, Some(_)) => Subtyping::Subtype,
-                (None, None) => Subtyping::Subtype,
-                _ => Subtyping::Incompatible,
-            },
-            (Shape::Number(n1), Shape::Number(n2)) => match (n1, n2) {
-                (Some(n1), Some(n2)) if n1 == n2 => Subtyping::Subtype,
-                (Some(_), None) => Subtyping::Supertype,
-                (None, Some(_)) => Subtyping::Subtype,
-                (None, None) => Subtyping::Subtype,
-                _ => Subtyping::Incompatible,
-            },
-            (Shape::String(s1), Shape::String(s2)) => match (s1, s2) {
-                (Some(s1), Some(s2)) if s1 == s2 => Subtyping::Subtype,
-                (Some(_), None) => Subtyping::Supertype,
-                (None, Some(_)) => Subtyping::Subtype,
-                (None, None) => Subtyping::Subtype,
-                _ => Subtyping::Incompatible,
-            },
-            (Shape::Array(shape1, u1), Shape::Array(shape2, u2)) => {
-                let inner_subtyping = shape1.subtype(shape2);
-                let outer_subtyping = match (u1, u2) {
-                    // Larger arrays can be used in place of smaller arrays, so the smaller array is the supertype
-                    (Some(u1), Some(u2)) => match u1.cmp(u2) {
-                        Ordering::Less => Subtyping::Supertype,
-                        Ordering::Greater => Subtyping::Subtype,
-                        Ordering::Equal => Subtyping::Subtype,
-                    },
-                    (None, Some(_)) => Subtyping::Supertype,
-                    (Some(_), None) => Subtyping::Subtype,
-                    (None, None) => Subtyping::Subtype,
-                };
-
-                match (inner_subtyping, outer_subtyping) {
-                    (Subtyping::Subtype, Subtyping::Subtype) => Subtyping::Subtype,
-                    (Subtyping::Supertype, Subtyping::Supertype) => Subtyping::Supertype,
-                    (Subtyping::Incompatible, _)
-                    | (_, Subtyping::Incompatible)
-                    | (Subtyping::Subtype, Subtyping::Supertype)
-                    | (Subtyping::Supertype, Subtyping::Subtype) => Subtyping::Incompatible,
-                }
+            // Array(e) contains the empty array, so it only fits in an
+            // empty-prefix tuple (which accepts every array).
+            (Shape::Array(_, _), Shape::Tuple(ts)) => ts.is_empty(),
+            // Tuple ⊆ Tuple: at least as long a prefix, pointwise included
+            (Shape::Tuple(t1), Shape::Tuple(t2)) => {
+                t1.len() >= t2.len() && t2.iter().zip(t1).all(|(s2, s1)| s1.included_in(s2))
             }
-            (Shape::Array(shape, u), Shape::Tuple(shapes)) => {
-                // If `shape` is a subtype of all elements in `shapes`
-                // and `u` is greater than `shapes.len()`, then array is a subtype of the tuple
-                // because for any place that expects the tuple, we can use the array instead.
-                let inner_subtyping = shapes
-                    .iter()
-                    .all(|s| matches!(shape.subtype(s), Subtyping::Subtype));
-
-                if inner_subtyping && u.unwrap_or(0).max(0) as usize >= shapes.len() {
-                    return Subtyping::Subtype;
-                }
-
-                // If `shape` is a supertype of all elements in `shapes`
-                // and `u` is less than `shapes.len()`, then array is a supertype of the tuple
-                // because for any place that expects the array, we can use the tuple instead.
-                let inner_subtyping = shapes
-                    .iter()
-                    .all(|s| matches!(shape.subtype(s), Subtyping::Supertype));
-
-                if inner_subtyping && u.unwrap_or(0).max(0) as usize <= shapes.len() {
-                    return Subtyping::Supertype;
-                }
-
-                Subtyping::Incompatible
-            }
-            (Shape::Tuple(shapes), Shape::Array(shape, u)) => {
-                todo!("should be the reverse of the above")
-            }
-            (Shape::Tuple(shapes1), Shape::Tuple(shapes2)) => {
-                let subtypings = shapes1
-                    .iter()
-                    .zip(shapes2)
-                    .map(|(s1, s2)| s1.subtype(s2))
-                    .collect::<Vec<_>>();
-
-                if subtypings.iter().all(|s| *s == Subtyping::Subtype)
-                    && shapes1.len() >= shapes2.len()
-                {
-                    Subtyping::Subtype
-                } else if subtypings.iter().all(|s| *s == Subtyping::Supertype)
-                    && shapes1.len() <= shapes2.len()
-                {
-                    Subtyping::Supertype
-                } else {
-                    Subtyping::Incompatible
-                }
-            }
-            (Shape::Object(obj1), Shape::Object(obj2)) => {
-                let mut subtypings = vec![];
-
-                for (k, s1) in obj1 {
-                    let s2 = obj2.iter().find(|(key, _)| key == k).map(|(_, s)| s);
-
-                    if let Some(s2) = s2 {
-                        subtypings.push(s1.subtype(s2));
-                    } else {
-                        subtypings.push(Subtyping::Subtype);
+            // Row subtyping: every inhabitant of o1 must inhabit o2.
+            (Shape::Object(o1), Shape::Object(o2)) => {
+                // Each field o2 constrains must hold for every o1-inhabitant.
+                let fields_ok = o2.iter().all(|f2| match o1.get(&f2.key) {
+                    Some(f1) => {
+                        // Present-value bound must refine; and if o1 may omit
+                        // the key, o2 must tolerate the absence too.
+                        f1.value.included_in(&f2.value) && (!f1.optional || f2.optional)
                     }
-                }
-
-                for (k, s2) in obj2 {
-                    let s1 = obj1.iter().find(|(key, _)| key == k).map(|(_, s)| s);
-
-                    if let Some(s1) = s1 {
-                        subtypings.push(s1.subtype(s2));
-                    } else {
-                        subtypings.push(Subtyping::Supertype);
+                    None if o1.open => {
+                        // o1 leaves the key unconstrained (any value or
+                        // absent); o2 can only cover that if it accepts
+                        // anything and allows absence.
+                        matches!(f2.value, Shape::Blob) && f2.optional
                     }
-                }
+                    // closed o1 never carries the key, so o2 must allow absence
+                    None => f2.optional,
+                });
+                // A closed o2 forbids keys o1 might carry beyond o2's fields.
+                let closed_ok =
+                    o2.open || (!o1.open && o1.iter().all(|f1| o2.get(&f1.key).is_some()));
+                fields_ok && closed_ok
+            }
+            _ => false,
+        }
+    }
 
-                if subtypings.iter().all(|s| *s == Subtyping::Subtype) {
-                    Subtyping::Subtype
-                } else if subtypings.iter().all(|s| *s == Subtyping::Supertype) {
-                    Subtyping::Supertype
-                } else {
-                    Subtyping::Incompatible
+    /// Provable disjointness: no JSON value inhabits both shapes.
+    /// Conservative: `false` means "not provably disjoint".
+    pub fn disjoint_with(&self, other: &Shape) -> bool {
+        use Shape::*;
+        let kind_disjoint = |a: &Shape, b: &Shape| -> bool {
+            // Kind classes: null / bool / number / string / array-like / object
+            fn kind(s: &Shape) -> Option<u8> {
+                match s {
+                    Null => Some(0),
+                    Bool(_) => Some(1),
+                    Number(_) => Some(2),
+                    String(_) => Some(3),
+                    Array(_, _) | Tuple(_) => Some(4),
+                    Object(_) => Some(5),
+                    _ => None,
                 }
             }
-            (Shape::Mismatch(s1, s2), _) | (_, Shape::Mismatch(s1, s2)) => Subtyping::Incompatible,
-            (Shape::Union(s1, s2), s) | (s, Shape::Union(s1, s2)) => {
-                match (s1.subtype(s), s2.subtype(s)) {
-                    (Subtyping::Subtype, Subtyping::Subtype) => Subtyping::Subtype,
-                    (Subtyping::Supertype, Subtyping::Supertype) => Subtyping::Supertype,
-                    _ => Subtyping::Incompatible,
-                }
+            match (kind(a), kind(b)) {
+                (Some(ka), Some(kb)) => ka != kb,
+                _ => false,
             }
-            _ => Subtyping::Incompatible,
+        };
+        match (self, other) {
+            (Mismatch(_, _), _) | (_, Mismatch(_, _)) => true,
+            (TVar(_), _) | (_, TVar(_)) => false,
+            (Blob, _) | (_, Blob) => false,
+            (Union(a, b), t) | (t, Union(a, b)) => t.disjoint_with(a) && t.disjoint_with(b),
+            (Intersection(a, b), t) | (t, Intersection(a, b)) => {
+                t.disjoint_with(a) || t.disjoint_with(b)
+            }
+            (Neg(a), t) | (t, Neg(a)) => t.included_in(a),
+            (Bool(Some(a)), Bool(Some(b))) => a != b,
+            (Number(Some(a)), Number(Some(b))) => a != b,
+            (String(Some(a)), String(Some(b))) => a != b,
+            (a, b) => kind_disjoint(a, b),
+        }
+    }
+
+    /// Legacy tri-state subtyping used by the constraint solver.
+    ///
+    /// NOTE: the convention is *inverted* relative to standard subtyping:
+    /// `Subtyping::Subtype` means `self ⊇ other` (self is the more general
+    /// type, or equal), and `Subtyping::Supertype` means `self ⊂ other`
+    /// (self is strictly more specific). `Incompatible` makes no claim.
+    /// New code should use `included_in` / `disjoint_with`; the model tests
+    /// in tjq_testing enforce both contracts.
+    pub fn subtype(&self, other: &Self) -> Subtyping {
+        // Derived from the model-tested semantic primitives so the claims
+        // are sound by construction; Incompatible is returned whenever
+        // inclusion is not provable in either direction.
+        if other.included_in(self) {
+            Subtyping::Subtype
+        } else if self.included_in(other) {
+            Subtyping::Supertype
+        } else {
+            Subtyping::Incompatible
         }
     }
 
@@ -563,46 +709,39 @@ impl Shape {
             Shape::Tuple(shapes) => {
                 Shape::Tuple(shapes.iter().map(|s| s.canonicalize()).collect::<Vec<_>>())
             }
-            Shape::Object(items) => Shape::Object(
-                items
+            Shape::Object(items) => Shape::Object(Row {
+                fields: items
                     .iter()
-                    .map(|(k, v)| (k.clone(), v.canonicalize()))
-                    .collect::<Vec<_>>(),
-            ),
+                    .map(|f| Field {
+                        key: f.key.clone(),
+                        value: f.value.canonicalize(),
+                        optional: f.optional,
+                    })
+                    .collect(),
+                open: items.open,
+            }),
             Shape::Mismatch(s1, s2) => {
                 Shape::Mismatch(Box::new(s1.canonicalize()), Box::new(s2.canonicalize()))
             }
-            Shape::Union(s1, s2) => match (*s1.clone(), *s2.clone()) {
-                (Shape::Union(s2, s3), s1) | (s1, Shape::Union(s2, s3)) => {
-                    let s1 = s1.canonicalize();
-                    let s2 = s2.canonicalize();
-                    let s3 = s3.canonicalize();
-                    match (s1.subtype(&s2), s1.subtype(&s3)) {
-                        (Subtyping::Subtype, _) | (_, Subtyping::Subtype) => {
-                            Shape::Union(Box::new(s2), Box::new(s3)).canonicalize()
-                        }
-                        (Subtyping::Supertype, _) => {
-                            Shape::Union(Box::new(s1), Box::new(s3)).canonicalize()
-                        }
-                        (_, Subtyping::Supertype) => {
-                            Shape::Union(Box::new(s1), Box::new(s2)).canonicalize()
-                        }
-                        (Subtyping::Incompatible, Subtyping::Incompatible) => Shape::Union(
-                            Box::new(s1),
-                            Box::new(Shape::Union(Box::new(s2), Box::new(s3))),
-                        ),
-                    }
+            Shape::Union(s1, s2) => {
+                // Absorption via semantic inclusion: A | B = B when A ⊆ B.
+                let s1 = s1.canonicalize();
+                let s2 = s2.canonicalize();
+                if s1.included_in(&s2) {
+                    s2
+                } else if s2.included_in(&s1) {
+                    s1
+                } else if matches!(
+                    (&s1, &s2),
+                    (Shape::Bool(Some(true)), Shape::Bool(Some(false)))
+                        | (Shape::Bool(Some(false)), Shape::Bool(Some(true)))
+                ) {
+                    // Exact promotion: true | false covers all of bool
+                    Shape::Bool(None)
+                } else {
+                    Shape::Union(Box::new(s1), Box::new(s2))
                 }
-                (s1, s2) => {
-                    let s1 = s1.canonicalize();
-                    let s2 = s2.canonicalize();
-                    match s1.subtype(&s2) {
-                        Subtyping::Subtype => s2,
-                        Subtyping::Supertype => s1,
-                        Subtyping::Incompatible => Shape::Union(Box::new(s1), Box::new(s2)),
-                    }
-                }
-            },
+            }
             Shape::Neg(shape) => match *shape.clone() {
                 // Basic types: canonicalize inner and keep Neg wrapper
                 Shape::TVar(_)
@@ -613,21 +752,95 @@ impl Shape {
                 | Shape::String(_)
                 | Shape::Array(_, _)
                 | Shape::Tuple(_)
-                | Shape::Object(_) => Shape::Neg(Box::new(shape.canonicalize())),
+                | Shape::Object(_)
+                | Shape::Arrow(_, _) => Shape::Neg(Box::new(shape.canonicalize())),
                 // Double negation cancels out
                 Shape::Neg(inner) => inner.canonicalize(),
-                // Distribute Neg over Union: Neg(A | B) = Neg(A) | Neg(B)
-                Shape::Union(s1, s2) => Shape::Union(
+                // De Morgan's law: Neg(A | B) = Neg(A) & Neg(B)
+                Shape::Union(s1, s2) => Shape::Intersection(
+                    Box::new(Shape::Neg(s1).canonicalize()),
+                    Box::new(Shape::Neg(s2).canonicalize()),
+                )
+                .canonicalize(),
+                // Mismatch is the empty set; its complement is everything
+                Shape::Mismatch(_, _) => Shape::Blob,
+                // De Morgan's law: Neg(A & B) = Neg(A) | Neg(B)
+                Shape::Intersection(s1, s2) => Shape::Union(
                     Box::new(Shape::Neg(s1).canonicalize()),
                     Box::new(Shape::Neg(s2).canonicalize()),
                 ),
-                Shape::Mismatch(s1, s2) => Shape::Mismatch(
-                    Box::new(Shape::Neg(s1).canonicalize()),
-                    Box::new(Shape::Neg(s2).canonicalize()),
-                ),
-                Shape::Intersection(_shape, _shape1) => todo!(),
             },
-            Shape::Intersection(shape, shape1) => todo!(),
+            Shape::Intersection(s1, s2) => {
+                let s1 = s1.canonicalize();
+                let s2 = s2.canonicalize();
+
+                // A & A = A
+                if s1 == s2 {
+                    return s1;
+                }
+
+                // A & Blob = A (Blob is top type)
+                if matches!(s1, Shape::Blob) {
+                    return s2;
+                }
+                if matches!(s2, Shape::Blob) {
+                    return s1;
+                }
+
+                // Disjoint concrete types = bottom (Mismatch)
+                let is_disjoint = matches!(
+                    (&s1, &s2),
+                    (Shape::Number(_), Shape::String(_))
+                        | (Shape::String(_), Shape::Number(_))
+                        | (Shape::Number(_), Shape::Bool(_))
+                        | (Shape::Bool(_), Shape::Number(_))
+                        | (Shape::String(_), Shape::Bool(_))
+                        | (Shape::Bool(_), Shape::String(_))
+                        | (
+                            Shape::Null,
+                            Shape::Number(_) | Shape::String(_) | Shape::Bool(_)
+                        )
+                        | (
+                            Shape::Number(_) | Shape::String(_) | Shape::Bool(_),
+                            Shape::Null
+                        )
+                        | (Shape::Array(_, _), Shape::Object(_))
+                        | (Shape::Object(_), Shape::Array(_, _))
+                );
+                if is_disjoint {
+                    return Shape::Mismatch(Box::new(s1), Box::new(s2));
+                }
+
+                // Specific & General = Specific
+                match (&s1, &s2) {
+                    (Shape::Number(Some(n)), Shape::Number(None)) => {
+                        return Shape::Number(Some(*n))
+                    }
+                    (Shape::Number(None), Shape::Number(Some(n))) => {
+                        return Shape::Number(Some(*n))
+                    }
+                    (Shape::String(Some(s)), Shape::String(None)) => {
+                        return Shape::String(Some(s.clone()))
+                    }
+                    (Shape::String(None), Shape::String(Some(s))) => {
+                        return Shape::String(Some(s.clone()))
+                    }
+                    (Shape::Bool(Some(b)), Shape::Bool(None)) => return Shape::Bool(Some(*b)),
+                    (Shape::Bool(None), Shape::Bool(Some(b))) => return Shape::Bool(Some(*b)),
+                    // Bool(Some(true)) & Bool(Some(false)) -> Mismatch (empty/bottom)
+                    (Shape::Bool(Some(true)), Shape::Bool(Some(false)))
+                    | (Shape::Bool(Some(false)), Shape::Bool(Some(true))) => {
+                        return Shape::Mismatch(Box::new(s1), Box::new(s2))
+                    }
+                    _ => {}
+                }
+
+                Shape::Intersection(Box::new(s1), Box::new(s2))
+            }
+            Shape::Arrow(input, output) => Shape::Arrow(
+                Box::new(input.canonicalize()),
+                Box::new(output.canonicalize()),
+            ),
         }
     }
 
@@ -638,7 +851,9 @@ impl Shape {
             Json::Number(n) => Shape::Number(Some(n)),
             Json::String(s) => Shape::String(Some(s)),
             Json::Array(arr) => Shape::Tuple(arr.into_iter().map(Shape::from_json).collect()),
-            Json::Object(obj) => Shape::Object(
+            // A concrete object has exactly these keys, all present: a
+            // closed row of required fields.
+            Json::Object(obj) => Shape::object_closed(
                 obj.into_iter()
                     .map(|(k, v)| (k, Shape::from_json(v)))
                     .collect(),
@@ -824,11 +1039,33 @@ impl Shape {
                     )],
                     Shape::Array(shape, _) => vec![*shape.clone()],
                     Shape::Tuple(vec) => vec,
-                    Shape::Object(vec) => vec.into_iter().map(|(_, shape)| shape).collect(),
+                    Shape::Object(vec) => vec.into_iter().map(|f| f.value).collect(),
                     Shape::Mismatch(_, _) => todo!(),
                     Shape::Union(_, _) => todo!(),
                     Shape::Neg(shape) => todo!(),
-                    Shape::Intersection(shape, shape1) => todo!(),
+                    Shape::Arrow(_, _) => vec![Shape::Mismatch(
+                        Box::new(shape.clone()),
+                        Box::new(Shape::Array(Box::new(Shape::Blob), None)),
+                    )],
+                    // For intersection types, the result is the intersection of iterating each branch
+                    // A & B iterated = (A iterated) & (B iterated)
+                    Shape::Intersection(s1, s2) => {
+                        // For arrays: get element type intersection
+                        match (s1.as_ref(), s2.as_ref()) {
+                            (Shape::Array(e1, _), Shape::Array(e2, _)) => {
+                                vec![Shape::Intersection(e1.clone(), e2.clone())]
+                            }
+                            (Shape::Tuple(t1), Shape::Tuple(t2)) => t1
+                                .iter()
+                                .zip(t2.iter())
+                                .map(|(a, b)| {
+                                    Shape::Intersection(Box::new(a.clone()), Box::new(b.clone()))
+                                })
+                                .collect(),
+                            // For other cases, fall back to Blob
+                            _ => vec![Shape::Blob],
+                        }
+                    }
                 })
                 .collect(),
             Filter::Null => vec![Shape::Null],
@@ -857,7 +1094,7 @@ impl Shape {
             Filter::Object(vec) => shapes
                 .into_iter()
                 .map(|shape| {
-                    Shape::Object(
+                    Shape::object_closed(
                         vec.iter()
                             .map(|(f1, f2)| {
                                 (
@@ -975,29 +1212,33 @@ impl Shape {
                                     // todo: check this
                                     let mut obj = HashMap::new();
 
-                                    for (k, s1) in obj1.clone() {
-                                        let s2 =
-                                            obj2.iter().find(|(key, _)| key == &k).map(|(_, s)| s);
+                                    for f1 in obj1.clone() {
+                                        let s2 = obj2.get(&f1.key).map(|f| f.value.clone());
 
                                         if let Some(s2) = s2 {
-                                            obj.insert(k, Shape::merge_shapes(s1, s2.clone(), ctx));
+                                            obj.insert(
+                                                f1.key,
+                                                Shape::merge_shapes(f1.value, s2, ctx),
+                                            );
                                         } else {
-                                            obj.insert(k, s1);
+                                            obj.insert(f1.key, f1.value);
                                         }
                                     }
 
-                                    for (k, s2) in obj2 {
-                                        let s1 =
-                                            obj1.iter().find(|(key, _)| key == &k).map(|(_, s)| s);
+                                    for f2 in obj2 {
+                                        let s1 = obj1.get(&f2.key).map(|f| f.value.clone());
 
                                         if let Some(s1) = s1 {
-                                            obj.insert(k, Shape::merge_shapes(s1.clone(), s2, ctx));
+                                            obj.insert(
+                                                f2.key,
+                                                Shape::merge_shapes(s1, f2.value, ctx),
+                                            );
                                         } else {
-                                            obj.insert(k, s2);
+                                            obj.insert(f2.key, f2.value);
                                         }
                                     }
 
-                                    Shape::Object(obj.into_iter().collect())
+                                    Shape::object(obj.into_iter().collect())
                                 }
                                 (Shape::Object(obj), Shape::TVar(t))
                                 | (Shape::TVar(t), Shape::Object(obj)) => {
@@ -1409,27 +1650,27 @@ impl Shape {
             (Shape::Object(obj1), Shape::Object(obj2)) => {
                 let mut obj = HashMap::new();
 
-                for (k, s1) in obj1.clone() {
-                    let s2 = obj2.iter().find(|(key, _)| key == &k).map(|(_, s)| s);
+                for f1 in obj1.clone() {
+                    let s2 = obj2.get(&f1.key).map(|f| f.value.clone());
 
                     if let Some(s2) = s2 {
-                        obj.insert(k, Shape::merge_shapes(s1, s2.clone(), ctx));
+                        obj.insert(f1.key, Shape::merge_shapes(f1.value, s2, ctx));
                     } else {
-                        obj.insert(k, s1);
+                        obj.insert(f1.key, f1.value);
                     }
                 }
 
-                for (k, s2) in obj2 {
-                    let s1 = obj1.iter().find(|(key, _)| key == &k).map(|(_, s)| s);
+                for f2 in obj2 {
+                    let s1 = obj1.get(&f2.key).map(|f| f.value.clone());
 
                     if let Some(s1) = s1 {
-                        obj.insert(k, Shape::merge_shapes(s1.clone(), s2, ctx));
+                        obj.insert(f2.key, Shape::merge_shapes(s1, f2.value, ctx));
                     } else {
-                        obj.insert(k, s2);
+                        obj.insert(f2.key, f2.value);
                     }
                 }
 
-                Shape::Object(obj.into_iter().collect())
+                Shape::object(obj.into_iter().collect())
             }
             (Shape::Mismatch(s1, s2), Shape::Mismatch(s3, s4)) => Shape::Mismatch(
                 Box::new(Shape::merge_shapes(*s1, *s3, ctx)),
@@ -1565,36 +1806,47 @@ impl Shape {
                 }
             }
             Shape::Object(obj_shape) => {
-                if let Json::Object(obj) = j {
+                if let Json::Object(obj) = &j {
                     let obj_map = obj.clone().into_iter().collect::<HashMap<String, Json>>();
 
-                    let (_, mismatches): (Vec<_>, Vec<_>) = obj_shape
-                        .iter()
-                        .map(|(key, shape)| {
-                            let v = obj_map.get(key);
-
-                            if let Some(v) = v {
-                                Shape::check(
-                                    shape,
+                    // Each field: a required key must be present and conform;
+                    // an optional key, if present, must conform; absence is
+                    // fine for optional fields.
+                    for field in obj_shape.iter() {
+                        match obj_map.get(&field.key) {
+                            Some(v) => {
+                                if let Some(m) = Shape::check(
+                                    &field.value,
                                     v.clone(),
-                                    [path.clone(), vec![Access::Field(key.to_string())]].concat(),
-                                )
-                            } else {
-                                Some(ShapeMismatch::new(
-                                    path.clone(),
-                                    self.clone(),
-                                    Shape::Object(
-                                        obj.clone()
-                                            .into_iter()
-                                            .map(|(k, v)| (k, Shape::from_json(v)))
-                                            .collect(),
-                                    ),
-                                ))
+                                    [path.clone(), vec![Access::Field(field.key.clone())]].concat(),
+                                ) {
+                                    return Some(m);
+                                }
                             }
-                        })
-                        .partition(Option::is_none);
+                            None if field.optional => {}
+                            None => {
+                                return Some(ShapeMismatch::new(
+                                    path,
+                                    self.clone(),
+                                    Shape::from_json(j),
+                                ));
+                            }
+                        }
+                    }
 
-                    mismatches.into_iter().next().flatten()
+                    // A closed row forbids any key beyond its fields.
+                    if !obj_shape.open {
+                        let has_extra = obj.iter().any(|(k, _)| obj_shape.get(k).is_none());
+                        if has_extra {
+                            return Some(ShapeMismatch::new(
+                                path,
+                                self.clone(),
+                                Shape::from_json(j),
+                            ));
+                        }
+                    }
+
+                    None
                 } else {
                     Some(ShapeMismatch::new(path, self.clone(), Shape::from_json(j)))
                 }
@@ -1625,7 +1877,16 @@ impl Shape {
                     Some(_) => None,
                 }
             }
-            Shape::Intersection(shape, shape1) => todo!(),
+            // Intersection: value must satisfy BOTH types
+            Shape::Intersection(s1, s2) => {
+                let check1 = s1.check(j.clone(), path.clone());
+                let check2 = s2.check(j, path);
+                // Both must pass (return None) for intersection to pass
+                check1.or(check2)
+            }
+            // Arrow types are not JSON values; checking a JSON value against a function
+            // type is a category mismatch.
+            Shape::Arrow(_, _) => Some(ShapeMismatch::new(path, self.clone(), Shape::from_json(j))),
         }
     }
 
@@ -1648,9 +1909,9 @@ impl Shape {
             Shape::Object(obj) => {
                 let (_, mismatches): (Vec<_>, Vec<_>) = obj
                     .iter()
-                    .map(|(key, shape)| {
-                        shape.check_self(
-                            [path.clone(), vec![Access::Field(key.to_string())]].concat(),
+                    .map(|field| {
+                        field.value.check_self(
+                            [path.clone(), vec![Access::Field(field.key.clone())]].concat(),
                         )
                     })
                     .partition(Option::is_none);
@@ -1673,7 +1934,16 @@ impl Shape {
                     Some(_) => None,
                 }
             }
-            Shape::Intersection(shape, shape1) => todo!(),
+            // Intersection: check both components for self-consistency
+            Shape::Intersection(s1, s2) => {
+                let check1 = s1.check_self(path.clone());
+                let check2 = s2.check_self(path);
+                check1.or(check2)
+            }
+            // Arrow self-check: each side must be internally consistent.
+            Shape::Arrow(input, output) => input
+                .check_self(path.clone())
+                .or_else(|| output.check_self(path)),
         }
     }
 }
@@ -1726,9 +1996,9 @@ mod shape_computation_tests {
             }
             (Shape::Object(a), Shape::Object(b)) => {
                 a.len() == b.len()
-                    && a.iter()
-                        .zip(b.iter())
-                        .all(|((k1, v1), (k2, v2))| k1 == k2 && shapes_structurally_equal(v1, v2))
+                    && a.iter().zip(b.iter()).all(|(f1, f2)| {
+                        f1.key == f2.key && shapes_structurally_equal(&f1.value, &f2.value)
+                    })
             }
             (Shape::Union(a1, a2), Shape::Union(b1, b2)) => {
                 shapes_structurally_equal(a1, b1) && shapes_structurally_equal(a2, b2)
@@ -1747,7 +2017,10 @@ mod shape_computation_tests {
             Shape::TVar(n) => vec![*n],
             Shape::Array(s, _) => collect_tvars(s),
             Shape::Tuple(shapes) => shapes.iter().flat_map(collect_tvars).collect(),
-            Shape::Object(fields) => fields.iter().flat_map(|(_, v)| collect_tvars(v)).collect(),
+            Shape::Object(fields) => fields
+                .iter()
+                .flat_map(|f| collect_tvars(&f.value))
+                .collect(),
             Shape::Union(a, b) | Shape::Mismatch(a, b) => {
                 let mut v = collect_tvars(a);
                 v.extend(collect_tvars(b));
@@ -2215,11 +2488,11 @@ mod shape_computation_tests {
         // Check tin has structure {a: {b: TVar}}
         if let Shape::Object(fields) = &tin {
             assert_eq!(fields.len(), 1);
-            assert_eq!(fields[0].0, "a");
-            if let Shape::Object(inner_fields) = &fields[0].1 {
+            assert_eq!(fields[0].key, "a");
+            if let Shape::Object(inner_fields) = &fields[0].value {
                 assert_eq!(inner_fields.len(), 1);
-                assert_eq!(inner_fields[0].0, "b");
-                let inner_tvar = &inner_fields[0].1;
+                assert_eq!(inner_fields[0].key, "b");
+                let inner_tvar = &inner_fields[0].value;
                 assert!(is_tvar(inner_tvar), "inner field should be a type variable");
                 // tout should be the same TVar as the nested one
                 assert!(
@@ -2336,14 +2609,13 @@ mod constraint_inference_tests {
     }
 
     #[test]
-    #[should_panic]
     fn test_constraint_solver_object() {
-        // Known issue: constraint solver includes quotes in object keys
         let (tin, tout) = get_type(r#"{ "a": 1, "b": 2 }"#);
         assert!(is_tvar(&tin), "input should be a type variable");
         assert_eq!(
             tout,
-            Shape::object(vec![
+            // object construction produces a closed row (exactly these keys)
+            Shape::object_closed(vec![
                 ("a".to_string(), Shape::number(1.0)),
                 ("b".to_string(), Shape::number(2.0))
             ])
@@ -2360,16 +2632,28 @@ mod constraint_inference_tests {
     #[test]
     fn test_constraint_solver_math_dot_dot() {
         let (tin, tout) = get_type(r#". + ."#);
-        // Constraint solver infers union of types that support addition
-        assert_eq!(
-            tin,
+        // `+` accepts numbers, strings, arrays (concat), objects (merge),
+        // and null (identity); union nesting order is not semantically
+        // meaningful, so compare via mutual inclusion.
+        let addable = Shape::union(
+            Shape::Null,
             Shape::union(
-                Shape::Null,
-                Shape::union(Shape::number_(), Shape::string_())
-            )
+                Shape::union(Shape::number_(), Shape::string_()),
+                Shape::union(
+                    Shape::Array(Box::new(Shape::Blob), None),
+                    Shape::object(vec![]),
+                ),
+            ),
         );
-        // Output is union of addable types
-        assert_eq!(tout, Shape::union(Shape::number_(), Shape::string_()));
+        assert!(
+            tin.included_in(&addable) && addable.included_in(&tin),
+            "expected {addable}, got {tin}"
+        );
+        // Output covers the same set (null + null yields null in jq)
+        assert!(
+            tout.included_in(&addable) && addable.included_in(&tout),
+            "expected {addable}, got {tout}"
+        );
     }
 
     #[test]
@@ -2377,8 +2661,9 @@ mod constraint_inference_tests {
         let (tin, tout) = get_type(r#". + 1"#);
         // Constraint solver infers union with null
         assert_eq!(tin, Shape::union(Shape::number_(), Shape::Null));
-        // Output is the literal 1 (canonicalized)
-        assert_eq!(tout, Shape::number(1.0));
+        // Output joins the number branch (number) with the null branch (1);
+        // number | 1 canonicalizes to number.
+        assert_eq!(tout, Shape::number_());
     }
 
     #[test]
@@ -2388,11 +2673,11 @@ mod constraint_inference_tests {
         // Check tin has structure {a: {b: TVar}}
         if let Shape::Object(fields) = &tin {
             assert_eq!(fields.len(), 1);
-            assert_eq!(fields[0].0, "a");
-            if let Shape::Object(inner_fields) = &fields[0].1 {
+            assert_eq!(fields[0].key, "a");
+            if let Shape::Object(inner_fields) = &fields[0].value {
                 assert_eq!(inner_fields.len(), 1);
-                assert_eq!(inner_fields[0].0, "b");
-                let inner_tvar = &inner_fields[0].1;
+                assert_eq!(inner_fields[0].key, "b");
+                let inner_tvar = &inner_fields[0].value;
                 assert!(is_tvar(inner_tvar), "inner field should be a type variable");
                 // tout should be the same TVar as the nested one
                 assert!(
@@ -2436,8 +2721,8 @@ mod constraint_inference_tests {
         // Constraint solver infers object with field: {foo: T} -> T
         if let Shape::Object(fields) = &tin {
             assert_eq!(fields.len(), 1);
-            assert_eq!(fields[0].0, "foo");
-            let field_tvar = &fields[0].1;
+            assert_eq!(fields[0].key, "foo");
+            let field_tvar = &fields[0].value;
             assert!(is_tvar(field_tvar), "field should be a type variable");
             assert!(
                 same_tvar(field_tvar, &tout),

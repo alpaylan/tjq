@@ -1238,6 +1238,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tjq_testing"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tjq_exec",
+ "tjq_semantics",
+]
+
+[[package]]
 name = "tokio"
 version = "1.47.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

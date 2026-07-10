@@ -1,0 +1,81 @@
+name: Differential Fuzzing
+
+# Runs the tjq_testing differential rig against the real jq binary at scale.
+# The `difftest` runner exits non-zero on any hard finding (soundness,
+# arrow-soundness, failure-effect, jq/tjq divergence, jq crash, or inference
+# panic), so a genuine bug fails the job. Timeouts (the string-repetition
+# resource-exhaustion shape) and the precision/exactness metrics are not
+# bugs and do not fail.
+
+on:
+  pull_request:
+    branches: ["main"]
+  schedule:
+    # Nightly large-scale run at 04:17 UTC
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+    inputs:
+      iters:
+        description: "Iterations per shard"
+        required: false
+        default: "40000"
+      seed_base:
+        description: "Base seed (shards are offset from this)"
+        required: false
+        default: ""
+
+env:
+  CARGO_TERM_COLOR: always
+  # Small smoke on PRs; large run on schedule / manual dispatch.
+  ITERS: ${{ github.event_name == 'pull_request' && '3000' || (github.event.inputs.iters || '40000') }}
+  # Fresh seed range each run so the campaign keeps exploring; overridable.
+  SEED_BASE: ${{ github.event.inputs.seed_base || github.run_id }}
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Eight parallel shards with disjoint seed ranges. Shards 6 and 7
+        # run deeper programs (depth 4 and 5) to exercise nesting.
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned jq 1.7.1
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/jq" \
+            https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64
+          chmod +x "$RUNNER_TEMP/jq"
+          sudo mv "$RUNNER_TEMP/jq" /usr/local/bin/jq
+          jq --version
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build difftest (release)
+        run: cargo build --release -p tjq_testing --bin difftest
+
+      - name: Run differential fuzzing shard ${{ matrix.shard }}
+        run: |
+          SHARD=${{ matrix.shard }}
+          SEED=$(( SEED_BASE % 1000000 * 100000000 + SHARD * 10000000 ))
+          # Deeper programs on the last two shards.
+          case "$SHARD" in
+            6) DEPTH=4; INPUTS=4 ;;
+            7) DEPTH=5; INPUTS=6 ;;
+            *) DEPTH=3; INPUTS=4 ;;
+          esac
+          echo "shard=$SHARD seed=$SEED iters=$ITERS depth=$DEPTH inputs=$INPUTS"
+          ./target/release/difftest \
+            --iters "$ITERS" --seed "$SEED" --depth "$DEPTH" --inputs "$INPUTS" \
+            --findings "target/findings-shard-$SHARD.jsonl"
+
+      - name: Upload findings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: findings-shard-${{ matrix.shard }}
+          path: target/findings-shard-*.jsonl
+          if-no-files-found: ignore

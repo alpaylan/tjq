@@ -145,16 +145,35 @@ impl Ord for Json {
             (Json::Array(_), _) => std::cmp::Ordering::Less,
             (_, Json::Array(_)) => std::cmp::Ordering::Greater,
             (Json::Object(o1), Json::Object(o2)) => {
-                for ((k1, j1), (k2, j2)) in o1.iter().zip(o2.iter()) {
-                    match k1.cmp(k2) {
-                        std::cmp::Ordering::Equal => match j1.cmp(j2) {
-                            std::cmp::Ordering::Equal => continue,
-                            other => return other,
-                        },
-                        other => return other,
+                // jq compares objects by their *sorted* key arrays first,
+                // and only on equal key sets compares values in sorted key
+                // order (insertion order is never significant).
+                let mut k1: Vec<&String> = o1.iter().map(|(k, _)| k).collect();
+                let mut k2: Vec<&String> = o2.iter().map(|(k, _)| k).collect();
+                k1.sort();
+                k2.sort();
+                match k1.cmp(&k2) {
+                    std::cmp::Ordering::Equal => {
+                        for k in k1 {
+                            let j1 = o1
+                                .iter()
+                                .find(|(kk, _)| kk == k)
+                                .map(|(_, v)| v)
+                                .expect("key present");
+                            let j2 = o2
+                                .iter()
+                                .find(|(kk, _)| kk == k)
+                                .map(|(_, v)| v)
+                                .expect("key present");
+                            match j1.cmp(j2) {
+                                std::cmp::Ordering::Equal => continue,
+                                other => return other,
+                            }
+                        }
+                        std::cmp::Ordering::Equal
                     }
+                    other => other,
                 }
-                o1.len().cmp(&o2.len())
             }
         }
     }
@@ -191,7 +210,94 @@ impl Display for Json {
     }
 }
 
+/// Canonical number text: integer-valued doubles print as integers (jq's
+/// computed-number style: `1+1` prints `2`, not `2.0`); everything else
+/// uses serde_json's shortest-roundtrip formatting. Test harnesses must
+/// serialize inputs with the same function so that jq 1.7's number-literal
+/// preservation agrees with tjq's formatting.
+pub fn canonical_number(n: f64) -> String {
+    if n == n.trunc() && n.abs() < 1e17 && (n != 0.0 || n.is_sign_positive()) {
+        format!("{}", n as i64)
+    } else {
+        // Non-finite numbers print as null in jq (NaN); infinities are
+        // clamped upstream and should not reach here
+        let text = serde_json::Number::from_f64(n)
+            .map(|m| m.to_string())
+            .unwrap_or_else(|| "null".to_string());
+        // jq prints exponents as `E+308` / `E-324`; serde/ryu print
+        // `e308` / `e-324`
+        if let Some(pos) = text.find(['e', 'E']) {
+            let (mantissa, exp) = text.split_at(pos);
+            let exp = &exp[1..];
+            if exp.starts_with('-') {
+                format!("{mantissa}E{exp}")
+            } else {
+                format!("{mantissa}E+{exp}")
+            }
+        } else {
+            text
+        }
+    }
+}
+
 impl Json {
+    /// Compact RFC 8259 serialization, matching `jq -c` (and therefore
+    /// `tostring`): proper key quoting and string escaping, no spaces.
+    /// `Display` is looser (unquoted keys) and must not be used for
+    /// interchange.
+    pub fn to_compact_string(&self) -> String {
+        fn escape(s: &str, out: &mut String) {
+            out.push('"');
+            for c in s.chars() {
+                match c {
+                    '"' => out.push_str("\\\""),
+                    '\\' => out.push_str("\\\\"),
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '\t' => out.push_str("\\t"),
+                    c if (c as u32) < 0x20 => {
+                        out.push_str(&format!("\\u{:04x}", c as u32));
+                    }
+                    c => out.push(c),
+                }
+            }
+            out.push('"');
+        }
+        fn go(j: &Json, out: &mut String) {
+            match j {
+                Json::Null => out.push_str("null"),
+                Json::Boolean(b) => out.push_str(if *b { "true" } else { "false" }),
+                Json::Number(n) => out.push_str(&canonical_number(*n)),
+                Json::String(s) => escape(s, out),
+                Json::Array(arr) => {
+                    out.push('[');
+                    for (i, v) in arr.iter().enumerate() {
+                        if i != 0 {
+                            out.push(',');
+                        }
+                        go(v, out);
+                    }
+                    out.push(']');
+                }
+                Json::Object(obj) => {
+                    out.push('{');
+                    for (i, (k, v)) in obj.iter().enumerate() {
+                        if i != 0 {
+                            out.push(',');
+                        }
+                        escape(k, out);
+                        out.push(':');
+                        go(v, out);
+                    }
+                    out.push('}');
+                }
+            }
+        }
+        let mut out = String::new();
+        go(self, &mut out);
+        out
+    }
+
     pub fn debug(&self) -> String {
         match self {
             Json::Null => "null".to_string(),

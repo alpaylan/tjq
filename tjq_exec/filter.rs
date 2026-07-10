@@ -242,6 +242,38 @@ impl Filter {
     }
 }
 
+/// jq clamps infinite arithmetic results to the largest finite double
+/// (`1e308 * 10` prints `1.7976931348623157e+308`, not an error).
+fn clamp_number(n: f64) -> f64 {
+    if n.is_infinite() {
+        if n > 0.0 {
+            f64::MAX
+        } else {
+            -f64::MAX
+        }
+    } else {
+        n
+    }
+}
+
+/// Recursive object merge for jq's `*` on objects: right wins, except two
+/// objects merge recursively.
+fn deep_merge(l: Vec<(String, Json)>, r: Vec<(String, Json)>) -> Vec<(String, Json)> {
+    let mut merged = l;
+    for (k, rv) in r {
+        if let Some(slot) = merged.iter_mut().find(|(mk, _)| mk == &k) {
+            let combined = match (slot.1.clone(), rv) {
+                (Json::Object(lo), Json::Object(ro)) => Json::Object(deep_merge(lo, ro)),
+                (_, rv) => rv,
+            };
+            slot.1 = combined;
+        } else {
+            merged.push((k, rv));
+        }
+    }
+    merged
+}
+
 impl Filter {
     #[tracing::instrument(skip_all, ret)]
     pub fn filter(
@@ -283,6 +315,17 @@ impl Filter {
                         })
                         .collect::<Vec<_>>()
                 }
+                // jq's default semantics: field access on null yields null
+                Json::Null => {
+                    let s = Filter::filter(json, s, global_definitions, variable_ctx);
+                    s.into_iter()
+                        .map(|s| match s {
+                            Ok(Json::String(_)) => Ok(Json::Null),
+                            Ok(other) => Err(JQError::NonStringObjectKey(other)),
+                            err => err,
+                        })
+                        .collect::<Vec<_>>()
+                }
                 _ => vec![Err(JQError::ObjIndexForNonObject(json.clone()))],
             },
             Filter::ArrayIndex(i) => match json {
@@ -302,6 +345,17 @@ impl Filter {
                             } else {
                                 i
                             }
+                        })
+                        .collect::<Vec<_>>()
+                }
+                // jq's default semantics: array index on null yields null
+                Json::Null => {
+                    let i = Filter::filter(json, i, global_definitions, variable_ctx);
+                    i.into_iter()
+                        .map(|i| match i {
+                            Ok(Json::Number(_)) => Ok(Json::Null),
+                            Ok(other) => Err(JQError::InvalidArrayIndex(json.clone(), other)),
+                            err => err,
                         })
                         .collect::<Vec<_>>()
                 }
@@ -374,7 +428,18 @@ impl Filter {
                         objs.into_iter()
                             .map(|obj| {
                                 Ok(Json::Object(
-                                    obj.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+                                    obj.into_iter()
+                                        .map(|(k, v)| {
+                                            // Keys are verified strings above;
+                                            // Display would add quotes around
+                                            // the key text
+                                            let key = match k {
+                                                Json::String(s) => s,
+                                                _ => unreachable!("checked above"),
+                                            };
+                                            (key, v)
+                                        })
+                                        .collect(),
                                 ))
                             })
                             .collect()
@@ -403,16 +468,55 @@ impl Filter {
                     })
                     .collect()
             }
+            Filter::BinOp(l, bin_op @ (BinOp::And | BinOp::Or), r) => {
+                // jq's and/or iterate the LEFT stream in the outer loop and
+                // short-circuit per left value: a truthy `or` lhs (falsy
+                // `and` lhs) emits without evaluating the right side at all
+                // (`true or error` is `true`).
+                let is_and = matches!(bin_op, BinOp::And);
+                let ls = Filter::filter(json, l, global_definitions, variable_ctx);
+                let mut out = vec![];
+                for lres in ls {
+                    match lres {
+                        Err(e) => out.push(Err(e)),
+                        Ok(lv) => {
+                            let lt = lv.boolify();
+                            if is_and && !lt {
+                                out.push(Ok(Json::Boolean(false)));
+                            } else if !is_and && lt {
+                                out.push(Ok(Json::Boolean(true)));
+                            } else {
+                                for rres in
+                                    Filter::filter(json, r, global_definitions, variable_ctx)
+                                {
+                                    match rres {
+                                        Err(e) => out.push(Err(e)),
+                                        Ok(rv) => out.push(Ok(Json::Boolean(rv.boolify()))),
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                out
+            }
             Filter::BinOp(l, bin_op, r) => {
                 let ls = Filter::filter(json, l, global_definitions, variable_ctx);
                 let rs = Filter::filter(json, r, global_definitions, variable_ctx);
 
-                itertools::iproduct!(ls, rs)
-                    .map(|(l, r)| match (l, r) {
+                // jq iterates the right operand's stream in the outer loop:
+                // (1,2) + (10,20) yields 11, 12, 21, 22
+                itertools::iproduct!(rs, ls)
+                    .map(|(r, l)| match (l, r) {
                         (Err(err), _) | (_, Err(err)) => Err(err),
                         (Ok(l), Ok(r)) => match bin_op {
                             BinOp::Add => match (l, r) {
-                                (Json::Number(l), Json::Number(r)) => Ok(Json::Number(l + r)),
+                                // null is the identity of + in jq
+                                (Json::Null, r) => Ok(r),
+                                (l, Json::Null) => Ok(l),
+                                (Json::Number(l), Json::Number(r)) => {
+                                    Ok(Json::Number(clamp_number(l + r)))
+                                }
                                 (Json::String(l), Json::String(r)) => {
                                     Ok(Json::String(format!("{}{}", l, r)))
                                 }
@@ -420,41 +524,94 @@ impl Filter {
                                     Ok(Json::Array([l, r].concat()))
                                 }
                                 (Json::Object(l), Json::Object(r)) => {
-                                    Ok(Json::Object([l, r].concat()))
+                                    // Right-biased merge: duplicate keys take
+                                    // the right operand's value
+                                    let mut merged = l.clone();
+                                    for (k, v) in r {
+                                        if let Some(slot) =
+                                            merged.iter_mut().find(|(mk, _)| mk == &k)
+                                        {
+                                            slot.1 = v;
+                                        } else {
+                                            merged.push((k, v));
+                                        }
+                                    }
+                                    Ok(Json::Object(merged))
                                 }
                                 (l, r) => Err(JQError::BinOpTypeError(l, *bin_op, r)),
                             },
                             BinOp::Sub => match (l, r) {
-                                (Json::Number(l), Json::Number(r)) => Ok(Json::Number(l - r)),
+                                (Json::Number(l), Json::Number(r)) => {
+                                    Ok(Json::Number(clamp_number(l - r)))
+                                }
                                 (Json::Array(l), Json::Array(r)) => Ok(Json::Array(
                                     l.iter().filter(|x| !r.contains(x)).cloned().collect(),
                                 )),
                                 (l, r) => Err(JQError::BinOpTypeError(l, *bin_op, r)),
                             },
                             BinOp::Mul => match (l, r) {
-                                (Json::Number(l), Json::Number(r)) => Ok(Json::Number(l * r)),
+                                (Json::Number(l), Json::Number(r)) => {
+                                    Ok(Json::Number(clamp_number(l * r)))
+                                }
+                                // String repetition (jq 1.7): a negative count
+                                // yields null; otherwise the count truncates
+                                // (0 yields "")
                                 (Json::String(s), Json::Number(n))
                                 | (Json::Number(n), Json::String(s)) => {
                                     if n < 0.0 {
                                         Ok(Json::Null)
                                     } else {
-                                        Ok(Json::String(s.repeat(n as usize)))
+                                        Ok(Json::String(s.repeat(n.trunc() as usize)))
                                     }
                                 }
-                                (Json::Array(l), Json::Number(r)) => Ok(Json::Array(
-                                    l.iter().cycle().take(r as usize).cloned().collect(),
-                                )),
-                                (Json::Number(l), Json::Array(r)) => Ok(Json::Array(
-                                    r.iter().cycle().take(l as usize).cloned().collect(),
-                                )),
+                                // Object multiplication is recursive merge
+                                (Json::Object(l), Json::Object(r)) => {
+                                    Ok(Json::Object(deep_merge(l, r)))
+                                }
+                                // jq has no array repetition: `[1] * 2` is a
+                                // type error
                                 (l, r) => Err(JQError::BinOpTypeError(l, *bin_op, r)),
                             },
                             BinOp::Div => match (l, r) {
-                                (Json::Number(l), Json::Number(r)) => Ok(Json::Number(l / r)),
+                                (Json::Number(l), Json::Number(r)) => {
+                                    if r == 0.0 {
+                                        Err(JQError::DivisionByZero(
+                                            Json::Number(l),
+                                            Json::Number(r),
+                                        ))
+                                    } else {
+                                        Ok(Json::Number(clamp_number(l / r)))
+                                    }
+                                }
+                                // Dividing a string by a string splits it;
+                                // splitting the empty string yields [] in jq
+                                (Json::String(l), Json::String(r)) => {
+                                    let parts: Vec<Json> = if l.is_empty() {
+                                        vec![]
+                                    } else if r.is_empty() {
+                                        l.chars().map(|c| Json::String(c.to_string())).collect()
+                                    } else {
+                                        l.split(r.as_str())
+                                            .map(|p| Json::String(p.to_string()))
+                                            .collect()
+                                    };
+                                    Ok(Json::Array(parts))
+                                }
                                 (l, r) => Err(JQError::BinOpTypeError(l, *bin_op, r)),
                             },
                             BinOp::Mod => match (l, r) {
-                                (Json::Number(l), Json::Number(r)) => Ok(Json::Number(l % r)),
+                                // jq truncates both operands to integers
+                                (Json::Number(l), Json::Number(r)) => {
+                                    let (li, ri) = (l.trunc() as i64, r.trunc() as i64);
+                                    if ri == 0 {
+                                        Err(JQError::DivisionByZero(
+                                            Json::Number(l),
+                                            Json::Number(r),
+                                        ))
+                                    } else {
+                                        Ok(Json::Number((li % ri) as f64))
+                                    }
+                                }
                                 (l, r) => Err(JQError::BinOpTypeError(l, *bin_op, r)),
                             },
                             BinOp::Eq => Ok(Json::Boolean(l == r)),
@@ -496,6 +653,61 @@ impl Filter {
                     }
                 }
                 None => {
+                    // Native builtins (jq implements these in C; they have no
+                    // jq-level definition — docs/type-system-scope.md §9)
+                    if name == "length" {
+                        return vec![match json {
+                            Json::Null => Ok(Json::Number(0.0)),
+                            Json::Boolean(_) => Err(JQError::UnOpTypeError(
+                                json.clone(),
+                                UnOp::Neg, // closest existing variant: "has no length"
+                            )),
+                            Json::Number(n) => Ok(Json::Number(n.abs())),
+                            Json::String(s) => Ok(Json::Number(s.chars().count() as f64)),
+                            Json::Array(arr) => Ok(Json::Number(arr.len() as f64)),
+                            Json::Object(obj) => Ok(Json::Number(obj.len() as f64)),
+                        }];
+                    }
+                    if name == "keys" {
+                        // Object keys come out sorted; array "keys" are the
+                        // indices; everything else has no keys
+                        return vec![match json {
+                            Json::Object(obj) => {
+                                let mut ks: Vec<String> =
+                                    obj.iter().map(|(k, _)| k.clone()).collect();
+                                ks.sort();
+                                Ok(Json::Array(ks.into_iter().map(Json::String).collect()))
+                            }
+                            Json::Array(arr) => Ok(Json::Array(
+                                (0..arr.len()).map(|i| Json::Number(i as f64)).collect(),
+                            )),
+                            other => Err(JQError::ObjIndexForNonObject(other.clone())),
+                        }];
+                    }
+                    if name == "floor" {
+                        return vec![match json {
+                            Json::Number(n) => Ok(Json::Number(n.floor())),
+                            other => Err(JQError::UnOpTypeError(other.clone(), UnOp::Neg)),
+                        }];
+                    }
+                    if name == "tostring" {
+                        // Strings pass through unquoted; everything else is
+                        // compact JSON
+                        return vec![Ok(Json::String(match json {
+                            Json::String(s) => s.clone(),
+                            other => other.to_compact_string(),
+                        }))];
+                    }
+                    if name == "tonumber" {
+                        return vec![match json {
+                            Json::Number(n) => Ok(Json::Number(*n)),
+                            Json::String(s) => match s.trim().parse::<f64>() {
+                                Ok(n) if n.is_finite() => Ok(Json::Number(n)),
+                                _ => Err(JQError::UnOpTypeError(json.clone(), UnOp::Neg)),
+                            },
+                            other => Err(JQError::UnOpTypeError(other.clone(), UnOp::Neg)),
+                        }];
+                    }
                     let filter = global_definitions.get(name).ok_or_else(|| {
                         JQError::FilterNotDefined(
                             name.to_string(),
@@ -516,7 +728,8 @@ impl Filter {
                     .into_iter()
                     .flat_map(|result| {
                         result.map(|json_| {
-                            if let Json::Boolean(true) = json_ {
+                            // jq truthiness: everything except null and false
+                            if json_.boolify() {
                                 Filter::filter(json, filter1, global_definitions, variable_ctx)
                             } else {
                                 Filter::filter(json, filter2, global_definitions, variable_ctx)
