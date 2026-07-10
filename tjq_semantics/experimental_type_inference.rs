@@ -3793,132 +3793,56 @@ fn compute_shape_internal(
 
                     cs
                 }
-                BinOp::And => {
-                    // if the output is true, then both left and right must be true
+                BinOp::And | BinOp::Or => {
+                    // jq boolifies both operands (ANY type is accepted), so the
+                    // operands must NOT be constrained to bool — doing so made
+                    // `. or .` wrongly demand a bool input and let the input
+                    // value escape the output type.
+                    //
+                    // The narrowing implications below are kept: they only
+                    // fire when the result is forced to a definite bool (e.g.
+                    // by `... else error end`), and they tighten the operand
+                    // *outputs* — for the `x >= a and x < b` guard idioms this
+                    // chains through the comparison operators to narrow the
+                    // input. They can only make the input type narrower (an
+                    // exactness trade-off), never let an output escape.
+                    let eq = |var: usize, shape: Shape| Constraint::Rel {
+                        t1: Shape::TVar(var),
+                        rel: Relation::Equality(Equality::Equal),
+                        t2: shape,
+                    };
+                    // Only the `result == true` implication is emitted. The
+                    // guard idiom (`then … else error`) forces the result
+                    // true, and this fires forward to narrow the operands. A
+                    // bare `. or .` leaves the result undetermined; with a
+                    // single implication (not both polarities) the solver's
+                    // possibility machinery does not explore it, so the input
+                    // stays unconstrained instead of being inferred as bool.
+                    // The false-polarity narrowing is dropped: it only ever
+                    // tightens tin (exactness), never soundness.
+                    let out_when_true: Constraint = if matches!(bin_op, BinOp::And) {
+                        // and == true  => both operands truthy
+                        Constraint::And(vec![
+                            eq(left_type, Shape::Bool(Some(true))),
+                            eq(right_type, Shape::Bool(Some(true))),
+                        ])
+                    } else {
+                        // or == true   => at least one operand truthy
+                        Constraint::Or(vec![
+                            eq(left_type, Shape::Bool(Some(true))),
+                            eq(right_type, Shape::Bool(Some(true))),
+                        ])
+                    };
                     cs.push(Constraint::Conditional {
-                        c1: Box::new(Constraint::Rel {
-                            t1: Shape::TVar(output_type),
-                            rel: Relation::Equality(Equality::Equal),
-                            t2: Shape::Bool(Some(true)),
-                        }),
-                        c2: Box::new(Constraint::And(vec![
-                            Constraint::Rel {
-                                t1: Shape::TVar(left_type),
-                                rel: Relation::Equality(Equality::Equal),
-                                t2: Shape::Bool(Some(true)),
-                            },
-                            Constraint::Rel {
-                                t1: Shape::TVar(right_type),
-                                rel: Relation::Equality(Equality::Equal),
-                                t2: Shape::Bool(Some(true)),
-                            },
-                        ])),
+                        c1: Box::new(eq(output_type, Shape::Bool(Some(true)))),
+                        c2: Box::new(out_when_true),
                     });
-
-                    // if the output is false, then either left or right must be false
-                    cs.push(Constraint::Conditional {
-                        c1: Box::new(Constraint::Rel {
-                            t1: Shape::TVar(output_type),
-                            rel: Relation::Equality(Equality::Equal),
-                            t2: Shape::Bool(Some(false)),
-                        }),
-                        c2: Box::new(Constraint::Or(vec![
-                            Constraint::Rel {
-                                t1: Shape::TVar(left_type),
-                                rel: Relation::Equality(Equality::Equal),
-                                t2: Shape::Bool(Some(false)),
-                            },
-                            Constraint::Rel {
-                                t1: Shape::TVar(right_type),
-                                rel: Relation::Equality(Equality::Equal),
-                                t2: Shape::Bool(Some(false)),
-                            },
-                        ])),
-                    });
-
-                    // left and right and output must be of type bool
+                    // The result is always a bool.
                     cs.push(Constraint::Rel {
                         t1: Shape::TVar(output_type),
                         rel: Relation::Subtyping(Subtyping::Subtype),
                         t2: Shape::Bool(None),
                     });
-
-                    cs.push(Constraint::Rel {
-                        t1: Shape::TVar(left_type),
-                        rel: Relation::Subtyping(Subtyping::Subtype),
-                        t2: Shape::Bool(None),
-                    });
-
-                    cs.push(Constraint::Rel {
-                        t1: Shape::TVar(right_type),
-                        rel: Relation::Subtyping(Subtyping::Subtype),
-                        t2: Shape::Bool(None),
-                    });
-
-                    cs
-                }
-                BinOp::Or => {
-                    // if the output is true, then either left or right must be true
-                    cs.push(Constraint::Conditional {
-                        c1: Box::new(Constraint::Rel {
-                            t1: Shape::TVar(output_type),
-                            rel: Relation::Equality(Equality::Equal),
-                            t2: Shape::Bool(Some(true)),
-                        }),
-                        c2: Box::new(Constraint::Or(vec![
-                            Constraint::Rel {
-                                t1: Shape::TVar(left_type),
-                                rel: Relation::Equality(Equality::Equal),
-                                t2: Shape::Bool(Some(true)),
-                            },
-                            Constraint::Rel {
-                                t1: Shape::TVar(right_type),
-                                rel: Relation::Equality(Equality::Equal),
-                                t2: Shape::Bool(Some(true)),
-                            },
-                        ])),
-                    });
-
-                    // if the output is false, then both left and right must be false
-                    cs.push(Constraint::Conditional {
-                        c1: Box::new(Constraint::Rel {
-                            t1: Shape::TVar(output_type),
-                            rel: Relation::Equality(Equality::Equal),
-                            t2: Shape::Bool(Some(false)),
-                        }),
-                        c2: Box::new(Constraint::And(vec![
-                            Constraint::Rel {
-                                t1: Shape::TVar(left_type),
-                                rel: Relation::Equality(Equality::Equal),
-                                t2: Shape::Bool(Some(false)),
-                            },
-                            Constraint::Rel {
-                                t1: Shape::TVar(right_type),
-                                rel: Relation::Equality(Equality::Equal),
-                                t2: Shape::Bool(Some(false)),
-                            },
-                        ])),
-                    });
-
-                    // left and right and output must be of type bool
-                    cs.push(Constraint::Rel {
-                        t1: Shape::TVar(output_type),
-                        rel: Relation::Subtyping(Subtyping::Subtype),
-                        t2: Shape::Bool(None),
-                    });
-
-                    cs.push(Constraint::Rel {
-                        t1: Shape::TVar(left_type),
-                        rel: Relation::Subtyping(Subtyping::Subtype),
-                        t2: Shape::Bool(None),
-                    });
-
-                    cs.push(Constraint::Rel {
-                        t1: Shape::TVar(right_type),
-                        rel: Relation::Subtyping(Subtyping::Subtype),
-                        t2: Shape::Bool(None),
-                    });
-
                     cs
                 }
             }
@@ -4791,6 +4715,38 @@ mod solver_tests {
         tracing::debug!("tin: {tin}, tout: {tout}");
         assert_eq!(tin, Shape::Array(Box::new(Shape::TVar(0)), None));
         assert_eq!(tout, Shape::number(1.0));
+    }
+
+    /// jq boolifies `and`/`or` operands, so a bare `. or .` accepts ANY
+    /// input and yields a bool — the operands must not be constrained to
+    /// bool. Regression for a soundness bug: constraining the operands made
+    /// `tin` = bool, and in `(., (. or .))` the actual input value then
+    /// escaped the inferred output type. (The guard-narrowing above is
+    /// unaffected — it fires only when the result is forced by `else error`.)
+    #[test]
+    fn test_and_or_operands_boolified() {
+        let (tin, tout) = solve_constraints(r#". or ."#);
+        assert!(
+            matches!(tin, Shape::TVar(_)),
+            "`. or .` input must be unconstrained (any type is boolified), got {tin}"
+        );
+        assert!(
+            matches!(tout, Shape::Bool(None)),
+            "`. or .` output must be bool, got {tout}"
+        );
+
+        // The comma output must contain the input value (a type variable)
+        // alongside the bool — not collapse to just bool.
+        let (_, tout2) = solve_constraints(r#"(., (. or .))"#);
+        let members: Vec<&Shape> = match &tout2 {
+            Shape::Union(a, b) => vec![a.as_ref(), b.as_ref()],
+            _ => vec![&tout2],
+        };
+        assert!(
+            members.iter().any(|s| matches!(s, Shape::TVar(_)))
+                && members.iter().any(|s| matches!(s, Shape::Bool(None))),
+            "`(., (. or .))` output must be (input | bool), got {tout2}"
+        );
     }
 
     // ==================== Intersection Type Tests ====================

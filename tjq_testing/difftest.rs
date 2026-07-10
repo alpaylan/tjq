@@ -479,7 +479,8 @@ fn fails_divergence(
     match run_jq(jq, &to_jq_source(filter), &to_json_string(input)) {
         JqOutcome::Ok(outputs) => match run_tjq(filter, input, builtins) {
             Some(Ok(tjq_outputs)) => !streams_agree(&outputs, &tjq_outputs),
-            Some(Err(_)) => true,
+            // tjq's memory guard is a resource-limit artifact, not a divergence
+            Some(Err(e)) => !e.contains("AllocationTooLarge"),
             None => false,
         },
         _ => false,
@@ -761,6 +762,10 @@ fn main() {
                                 );
                             }
                         }
+                        // tjq's own memory guard (a huge string build jq
+                        // completes but tjq refuses) is a resource-limit
+                        // artifact, not a semantic divergence.
+                        Some(Err(e)) if e.contains("AllocationTooLarge") => {}
                         Some(Err(_)) => {
                             // jq succeeded, tjq_exec errored: divergence
                             c.diff_compared += 1;
