@@ -42,11 +42,22 @@ enum JqOutcome {
     Timeout,
 }
 
-fn run_jq(jq: &str, program: &str, input: &str) -> JqOutcome {
+/// Raw outcome of running the jq process, before per-mode classification.
+enum JqRun {
+    Exited { code: i32, stdout: String },
+    Signal(i32),
+    Timeout,
+    SpawnError(String),
+}
+
+/// Spawn jq on `program` with `stdin_data` piped in, pumping stdin/stdout on
+/// threads (a full pipe buffer would otherwise deadlock and masquerade as a
+/// timeout) and killing it past the timeout. `null_input` adds `-n` so the
+/// program reads the piped stream via `inputs` (used for batched runs).
+fn spawn_jq_impl(jq: &str, program: &str, stdin_data: String, null_input: bool) -> JqRun {
+    let flags = if null_input { "-cn" } else { "-c" };
     let mut child = match Command::new(jq)
-        .arg("-c")
-        // `--` keeps programs that start with `-` (e.g. `-length`) from
-        // being taken as CLI flags
+        .arg(flags)
         .arg("--")
         .arg(program)
         .stdin(Stdio::piped())
@@ -56,18 +67,13 @@ fn run_jq(jq: &str, program: &str, input: &str) -> JqOutcome {
         .spawn()
     {
         Ok(c) => c,
-        Err(e) => return JqOutcome::Crash(format!("spawn failed: {e}")),
+        Err(e) => return JqRun::SpawnError(format!("spawn failed: {e}")),
     };
 
-    // Both stdin and stdout must be pumped concurrently with the wait:
-    // large inputs/outputs otherwise deadlock on full pipe buffers and
-    // masquerade as timeouts.
     let stdin_thread = child.stdin.take().map(|mut stdin| {
-        let input_owned = input.to_string();
         std::thread::spawn(move || {
             // jq may exit early on compile errors; ignore EPIPE
-            let _ = stdin.write_all(input_owned.as_bytes());
-            let _ = stdin.write_all(b"\n");
+            let _ = stdin.write_all(stdin_data.as_bytes());
         })
     });
     let mut stdout_thread = child.stdout.take().map(|mut out| {
@@ -94,24 +100,12 @@ fn run_jq(jq: &str, program: &str, input: &str) -> JqOutcome {
                 {
                     use std::os::unix::process::ExitStatusExt;
                     if let Some(sig) = status.signal() {
-                        return JqOutcome::Crash(format!("signal {sig}"));
+                        return JqRun::Signal(sig);
                     }
                 }
                 return match status.code() {
-                    Some(0) => {
-                        let values: Option<Vec<Json>> = stdout
-                            .lines()
-                            .filter(|l| !l.trim().is_empty())
-                            .map(parse_json)
-                            .collect();
-                        match values {
-                            Some(vs) => JqOutcome::Ok(vs),
-                            None => JqOutcome::Crash("unparseable jq stdout".to_string()),
-                        }
-                    }
-                    Some(3) => JqOutcome::CompileError,
-                    Some(_) => JqOutcome::RuntimeError,
-                    None => JqOutcome::Crash("no exit code".to_string()),
+                    Some(code) => JqRun::Exited { code, stdout },
+                    None => JqRun::SpawnError("no exit code".to_string()),
                 };
             }
             Ok(None) => {
@@ -124,12 +118,148 @@ fn run_jq(jq: &str, program: &str, input: &str) -> JqOutcome {
                     if let Some(t) = stdin_thread {
                         let _ = t.join();
                     }
-                    return JqOutcome::Timeout;
+                    return JqRun::Timeout;
                 }
                 std::thread::sleep(Duration::from_millis(2));
             }
-            Err(e) => return JqOutcome::Crash(format!("wait failed: {e}")),
+            Err(e) => return JqRun::SpawnError(format!("wait failed: {e}")),
         }
+    }
+}
+
+fn spawn_jq(jq: &str, program: &str, stdin_data: String) -> JqRun {
+    spawn_jq_impl(jq, program, stdin_data, false)
+}
+
+/// Single-input run (used by the shrinker): a runtime error surfaces as a
+/// non-zero exit, which we report as `RuntimeError`.
+fn run_jq(jq: &str, program: &str, input: &str) -> JqOutcome {
+    match spawn_jq(jq, program, format!("{input}\n")) {
+        JqRun::Exited { code: 0, stdout } => {
+            let values: Option<Vec<Json>> = stdout
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(parse_json)
+                .collect();
+            match values {
+                Some(vs) => JqOutcome::Ok(vs),
+                None => JqOutcome::Crash("unparseable jq stdout".to_string()),
+            }
+        }
+        JqRun::Exited { code: 3, .. } => JqOutcome::CompileError,
+        JqRun::Exited { .. } => JqOutcome::RuntimeError,
+        JqRun::Signal(s) => JqOutcome::Crash(format!("signal {s}")),
+        JqRun::Timeout => JqOutcome::Timeout,
+        JqRun::SpawnError(e) => JqOutcome::Crash(e),
+    }
+}
+
+/// One input's outcome within a batched run.
+enum InputResult {
+    Ok(Vec<Json>),
+    Errored,
+    Crash(String),
+    Timeout,
+    CompileError,
+}
+
+/// Largest number of inputs fed to a single jq process. Keeps the blast
+/// radius of a hung input bounded — a timeout loses at most this many
+/// inputs, and the caller re-runs those per-input to isolate it.
+const BATCH_SIZE: usize = 64;
+
+/// Outcome of one batched jq run.
+enum BatchOutcome {
+    /// Per-input results, aligned with the inputs.
+    Results(Vec<InputResult>),
+    /// The whole program failed to compile — every input is a compile error.
+    CompileError,
+    /// Timeout, crash, or misaligned output — the caller bisects to isolate
+    /// the offending input(s).
+    Anomaly,
+}
+
+/// Evaluate `program` on many inputs with few jq spawns. Each input's
+/// outputs (or its runtime error) are recovered individually via a wrapper
+/// that collects `[program]` per input and catches errors in-jq:
+/// `inputs | try {r:[program]} catch {e:true}` yields one self-delimiting
+/// line per input.
+fn eval_inputs(jq: &str, program: &str, inputs: &[Json]) -> Vec<InputResult> {
+    let mut out = Vec::with_capacity(inputs.len());
+    for chunk in inputs.chunks(BATCH_SIZE) {
+        eval_chunk(jq, program, chunk, &mut out);
+    }
+    out
+}
+
+/// Evaluate a chunk, bisecting on an anomaly so a single hung input costs
+/// O(log n) batch timeouts to isolate rather than O(n) per-input ones.
+fn eval_chunk(jq: &str, program: &str, inputs: &[Json], out: &mut Vec<InputResult>) {
+    if inputs.is_empty() {
+        return;
+    }
+    match run_jq_batch(jq, program, inputs) {
+        BatchOutcome::Results(results) => out.extend(results),
+        BatchOutcome::CompileError => {
+            out.extend((0..inputs.len()).map(|_| InputResult::CompileError));
+        }
+        BatchOutcome::Anomaly if inputs.len() == 1 => {
+            // Isolated: classify the single culprit directly.
+            out.push(match run_jq(jq, program, &to_json_string(&inputs[0])) {
+                JqOutcome::Ok(o) => InputResult::Ok(o),
+                JqOutcome::RuntimeError => InputResult::Errored,
+                JqOutcome::CompileError => InputResult::CompileError,
+                JqOutcome::Crash(m) => InputResult::Crash(m),
+                JqOutcome::Timeout => InputResult::Timeout,
+            });
+        }
+        BatchOutcome::Anomaly => {
+            let mid = inputs.len() / 2;
+            eval_chunk(jq, program, &inputs[..mid], out);
+            eval_chunk(jq, program, &inputs[mid..], out);
+        }
+    }
+}
+
+/// Run one batch through the collecting wrapper.
+fn run_jq_batch(jq: &str, program: &str, inputs: &[Json]) -> BatchOutcome {
+    let wrapped = format!("inputs | try {{r:[{program}]}} catch {{e:true}}");
+    let mut stdin_data = String::new();
+    for inp in inputs {
+        stdin_data.push_str(&to_json_string(inp));
+        stdin_data.push('\n');
+    }
+    // `-n`: null primary input; the wrapper reads the piped stream via
+    // `inputs`.
+    match spawn_jq_impl(jq, &wrapped, stdin_data, true) {
+        JqRun::Exited { code: 0, stdout } => {
+            let lines: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+            if lines.len() != inputs.len() {
+                return BatchOutcome::Anomaly; // partial / misaligned output
+            }
+            let mut results = Vec::with_capacity(inputs.len());
+            for line in lines {
+                match parse_json(line) {
+                    Some(Json::Object(fields)) => {
+                        if let Some((_, Json::Array(outputs))) =
+                            fields.iter().find(|(k, _)| k == "r")
+                        {
+                            results.push(InputResult::Ok(outputs.clone()));
+                        } else if fields.iter().any(|(k, _)| k == "e") {
+                            results.push(InputResult::Errored);
+                        } else {
+                            return BatchOutcome::Anomaly;
+                        }
+                    }
+                    _ => return BatchOutcome::Anomaly,
+                }
+            }
+            BatchOutcome::Results(results)
+        }
+        JqRun::Exited { code: 3, .. } => BatchOutcome::CompileError,
+        // Non-zero, non-compile exit shouldn't happen (errors are caught in
+        // jq), but treat it as an anomaly to bisect just in case.
+        _ => BatchOutcome::Anomaly,
     }
 }
 
@@ -432,7 +562,9 @@ fn main() {
     let seed: u64 = get_arg("--seed", "1").parse().expect("--seed");
     let jq = get_arg("--jq", "jq");
     let depth: usize = get_arg("--depth", "3").parse().expect("--depth");
-    let inputs_per_program: usize = get_arg("--inputs", "4").parse().expect("--inputs");
+    // Inputs are cheap (inference is amortized over them) and evaluated in
+    // batched jq processes, so exercise each program with tens of thousands.
+    let inputs_per_program: usize = get_arg("--inputs", "20000").parse().expect("--inputs");
     let findings_path = get_arg("--findings", "target/difftest-findings.jsonl");
     let trace = std::env::var("DIFFTEST_TRACE").is_ok();
     let trace_path = format!("{findings_path}.trace");
@@ -510,6 +642,9 @@ fn main() {
         }
 
         // --- satisfying inputs: soundness + differential ---
+        // Generate many inputs up front, then evaluate them through jq in a
+        // few batched processes rather than one spawn each.
+        let mut sat_inputs = Vec::with_capacity(inputs_per_program);
         for _ in 0..inputs_per_program {
             // Mostly small collision-friendly inputs, with a steady diet of
             // large, deep, and degenerate ones — the shrinker keeps any
@@ -520,14 +655,17 @@ fn main() {
                 8 => SizeProfile::Deep,
                 _ => SizeProfile::Degenerate,
             };
-            let Some(input) = inhabit_profiled(&tin, &mut rng, profile) else {
-                continue;
-            };
+            if let Some(input) = inhabit_profiled(&tin, &mut rng, profile) {
+                sat_inputs.push(input);
+            }
+        }
+        let sat_results = eval_inputs(&jq, &program, &sat_inputs);
+        for (input, result) in sat_inputs.iter().zip(sat_results) {
             c.satisfying_inputs += 1;
-            let input_text = to_json_string(&input);
+            let input_text = to_json_string(input);
 
-            match run_jq(&jq, &program, &input_text) {
-                JqOutcome::Ok(outputs) => {
+            match result {
+                InputResult::Ok(outputs) => {
                     // Soundness: every output inhabits tout
                     for out in &outputs {
                         c.outputs_checked += 1;
@@ -547,7 +685,7 @@ fn main() {
                                     serde_json::to_string(&tout.to_string()).unwrap(),
                                     shrunk_fields(
                                         &filter,
-                                        &input,
+                                        input,
                                         |f, i| fails_soundness(f, i, &jq, &builtins),
                                         SHRINK_BUDGET
                                     )
@@ -556,7 +694,7 @@ fn main() {
                         }
                         // Correlated arrow-codomain check (stronger than the
                         // union tout: catches input/output correlation bugs).
-                        if let Some(reason) = arrow_soundness_violation(&arrows, &input, out) {
+                        if let Some(reason) = arrow_soundness_violation(&arrows, input, out) {
                             c.arrow_soundness_violations += 1;
                             emit(
                                 &mut findings,
@@ -570,7 +708,7 @@ fn main() {
                                     serde_json::to_string(&reason).unwrap(),
                                     shrunk_fields(
                                         &filter,
-                                        &input,
+                                        input,
                                         |f, i| fails_arrow_soundness(f, i, &jq, &builtins),
                                         SHRINK_BUDGET
                                     )
@@ -579,7 +717,7 @@ fn main() {
                         }
                     }
                     // Differential: tjq_exec must agree
-                    match run_tjq(&filter, &input, &builtins) {
+                    match run_tjq(&filter, input, &builtins) {
                         Some(Ok(tjq_outputs)) => {
                             c.diff_compared += 1;
                             let agree = tjq_outputs.len() == outputs.len()
@@ -615,7 +753,7 @@ fn main() {
                                         .unwrap(),
                                         shrunk_fields(
                                             &filter,
-                                            &input,
+                                            input,
                                             |f, i| fails_divergence(f, i, &jq, &builtins),
                                             SHRINK_BUDGET,
                                         )
@@ -637,7 +775,7 @@ fn main() {
                                     serde_json::to_string(&input_text).unwrap(),
                                     shrunk_fields(
                                         &filter,
-                                        &input,
+                                        input,
                                         |f, i| fails_divergence(f, i, &jq, &builtins),
                                         SHRINK_BUDGET,
                                     )
@@ -649,7 +787,7 @@ fn main() {
                         }
                     }
                 }
-                JqOutcome::RuntimeError => {
+                InputResult::Errored => {
                     if no_fail {
                         // The effect analysis claimed this program is total
                         c.effect_violations += 1;
@@ -663,7 +801,7 @@ fn main() {
                                 serde_json::to_string(&input_text).unwrap(),
                                 shrunk_fields(
                                     &filter,
-                                    &input,
+                                    input,
                                     |f, i| fails_effect(f, i, &jq),
                                     SHRINK_BUDGET
                                 )
@@ -674,7 +812,7 @@ fn main() {
                         c.satisfying_input_errored += 1;
                     }
                 }
-                JqOutcome::CompileError => {
+                InputResult::CompileError => {
                     c.jq_compile_errors += 1;
                     emit(
                         &mut findings,
@@ -685,7 +823,7 @@ fn main() {
                     );
                     break;
                 }
-                JqOutcome::Crash(msg) => {
+                InputResult::Crash(msg) => {
                     c.jq_crashes += 1;
                     emit(
                         &mut findings,
@@ -696,11 +834,11 @@ fn main() {
                             "\"input\":{},\"detail\":{}{}",
                             serde_json::to_string(&input_text).unwrap(),
                             serde_json::to_string(&msg).unwrap(),
-                            shrunk_fields(&filter, &input, |f, i| fails_crash(f, i, &jq), 30)
+                            shrunk_fields(&filter, input, |f, i| fails_crash(f, i, &jq), 30)
                         ),
                     );
                 }
-                JqOutcome::Timeout => {
+                InputResult::Timeout => {
                     c.jq_timeouts += 1;
                     emit(
                         &mut findings,
@@ -710,7 +848,7 @@ fn main() {
                         &format!(
                             "\"input\":{}{}",
                             serde_json::to_string(&input_text).unwrap(),
-                            shrunk_fields(&filter, &input, |f, i| fails_crash(f, i, &jq), 30)
+                            shrunk_fields(&filter, input, |f, i| fails_crash(f, i, &jq), 30)
                         ),
                     );
                 }
@@ -719,19 +857,26 @@ fn main() {
 
         // --- non-satisfying inputs: exactness metric ---
         if !tin_unconstrained {
+            let mut mutants = Vec::with_capacity(inputs_per_program);
             for _ in 0..inputs_per_program {
                 let Some(base) = inhabit(&tin, &mut rng) else {
                     continue;
                 };
                 let mutant = mutate(&base, &mut rng);
-                if denotes(&tin, &mutant) {
-                    continue; // mutant did not escape; not a counterexample
+                // Only keep mutants that escaped tin (true counterexamples).
+                if !denotes(&tin, &mutant) {
+                    mutants.push(mutant);
                 }
+            }
+            let mutant_results = eval_inputs(&jq, &program, &mutants);
+            for (mutant, result) in mutants.iter().zip(mutant_results) {
                 c.mutants += 1;
-                match run_jq(&jq, &program, &to_json_string(&mutant)) {
-                    JqOutcome::RuntimeError => c.mutants_rejected_by_jq += 1,
-                    JqOutcome::Ok(_) => c.mutants_accepted_by_jq += 1,
-                    JqOutcome::Crash(msg) => {
+                match result {
+                    // jq errored -> tin correctly excluded this input
+                    InputResult::Errored => c.mutants_rejected_by_jq += 1,
+                    // jq accepted -> the exactness gap (tin too narrow)
+                    InputResult::Ok(_) => c.mutants_accepted_by_jq += 1,
+                    InputResult::Crash(msg) => {
                         c.jq_crashes += 1;
                         emit(
                             &mut findings,
@@ -740,14 +885,14 @@ fn main() {
                             &program,
                             &format!(
                                 "\"input\":{},\"detail\":{}{}",
-                                serde_json::to_string(&to_json_string(&mutant)).unwrap(),
+                                serde_json::to_string(&to_json_string(mutant)).unwrap(),
                                 serde_json::to_string(&msg).unwrap(),
-                                shrunk_fields(&filter, &mutant, |f, i| fails_crash(f, i, &jq), 30)
+                                shrunk_fields(&filter, mutant, |f, i| fails_crash(f, i, &jq), 30)
                             ),
                         );
                     }
-                    JqOutcome::Timeout => c.jq_timeouts += 1,
-                    JqOutcome::CompileError => {}
+                    InputResult::Timeout => c.jq_timeouts += 1,
+                    InputResult::CompileError => {}
                 }
             }
         }

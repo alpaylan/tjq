@@ -20,19 +20,26 @@ on:
   workflow_dispatch:
     inputs:
       iters:
-        description: "Iterations per shard"
+        description: "Programs per shard"
         required: false
-        default: "40000"
+        default: "200"
+      inputs:
+        description: "Inputs per program"
+        required: false
+        default: "20000"
       seed_base:
         description: "Base seed (shards are offset from this)"
         required: false
         default: ""
 
 env:
+  # ITERS = programs per shard, INPUTS = inputs per program (batched into few
+  # jq processes). Each program costs ~24s at 20k inputs, so a shard of ~200
+  # programs runs ~80 min. PRs use a fast smoke; push/schedule/dispatch run
+  # deep (many inputs) over fewer programs.
   CARGO_TERM_COLOR: always
-  # Small smoke on PRs; larger run on push to experimental and on
-  # schedule / manual dispatch.
-  ITERS: ${{ github.event_name == 'pull_request' && '3000' || (github.event.inputs.iters || '25000') }}
+  ITERS: ${{ github.event_name == 'pull_request' && '100' || (github.event.inputs.iters || '200') }}
+  INPUTS: ${{ github.event_name == 'pull_request' && '1000' || (github.event.inputs.inputs || '20000') }}
   # Fresh seed range each run so the campaign keeps exploring; overridable.
   SEED_BASE: ${{ github.event.inputs.seed_base || github.run_id }}
   # Leave the culprit program on disk if a shard hits an uncatchable abort.
@@ -68,16 +75,16 @@ jobs:
         run: |
           SHARD=${{ matrix.shard }}
           SEED=$(( SEED_BASE % 1000000 * 100000000 + SHARD * 10000000 ))
-          # Depth spreads 3..7 across shards; deeper shards use fewer
-          # inputs per program to keep wall-clock bounded.
+          # Depth spreads 3..7 across shards to exercise progressively deeper
+          # programs; INPUTS (from env) is the same everywhere.
           case "$SHARD" in
-            0|1|2|3) DEPTH=3; INPUTS=4 ;;
-            4|5)     DEPTH=4; INPUTS=4 ;;
-            6|7)     DEPTH=5; INPUTS=4 ;;
-            8)       DEPTH=6; INPUTS=3 ;;
-            9)       DEPTH=7; INPUTS=3 ;;
+            0|1|2|3) DEPTH=3 ;;
+            4|5)     DEPTH=4 ;;
+            6|7)     DEPTH=5 ;;
+            8)       DEPTH=6 ;;
+            9)       DEPTH=7 ;;
           esac
-          echo "shard=$SHARD seed=$SEED iters=$ITERS depth=$DEPTH inputs=$INPUTS"
+          echo "shard=$SHARD seed=$SEED iters=$ITERS inputs=$INPUTS depth=$DEPTH"
           ./target/release/difftest \
             --iters "$ITERS" --seed "$SEED" --depth "$DEPTH" --inputs "$INPUTS" \
             --findings "target/findings-shard-$SHARD.jsonl"
