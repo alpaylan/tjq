@@ -8,6 +8,10 @@ name: Differential Fuzzing
 # bugs and do not fail.
 
 on:
+  push:
+    # Fast smoke on every push to the experimental branch (schedule and
+    # workflow_dispatch only work once this file lands on the default branch).
+    branches: ["experimental"]
   pull_request:
     branches: ["main"]
   schedule:
@@ -26,8 +30,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # Small smoke on PRs; large run on schedule / manual dispatch.
-  ITERS: ${{ github.event_name == 'pull_request' && '3000' || (github.event.inputs.iters || '40000') }}
+  # Small smoke on push/PR; large run on schedule / manual dispatch.
+  ITERS: ${{ (github.event_name == 'pull_request' || github.event_name == 'push') && '3000' || (github.event.inputs.iters || '40000') }}
   # Fresh seed range each run so the campaign keeps exploring; overridable.
   SEED_BASE: ${{ github.event.inputs.seed_base || github.run_id }}
 
