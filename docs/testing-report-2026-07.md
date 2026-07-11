@@ -418,8 +418,11 @@ was extracted so both engines evaluate binops through the same code and
 cannot drift. The supported core is generator control flow: identity,
 literals, pipe, comma, `.foo`/`.[expr]` indexing, `.[]` iteration,
 arithmetic/comparison, short-circuiting `and`/`or` (compiled with
-`JumpIf`/`ToBool`, not as cartesian binops), negation, and if/then/else;
-unsupported constructs return `Err(Unsupported)` and are skipped.
+`JumpIf`/`ToBool`, not as cartesian binops), negation, if/then/else, array
+construction (`[f]` via a `Collect` sub-run), and object construction
+(restricted to single-output fields — a stream-valued field needs error
+unwinding across an internal fork that the flat model does not yet express).
+Unsupported constructs return `Err(Unsupported)` and are skipped.
 
 Validation is a new differential harness (`examples/bytecheck`) comparing
 the VM against the interpreter on generated programs: **0 divergences across

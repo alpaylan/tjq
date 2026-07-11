@@ -31,6 +31,13 @@ pub enum Inst {
     Dup,
     /// Swap the top two stack values.
     Swap,
+    /// Discard the top of stack.
+    Pop,
+    /// Push a clone of the stack value `n` below the top (`Pick(0)` == `Dup`).
+    Pick(usize),
+    /// Object field set: pop value, key, accumulator; push the accumulator with
+    /// `key: value` appended (key must be a string).
+    SetField,
     /// Index the current value by a constant string key (`.foo`).
     IndexField(String),
     /// Generic index `.[expr]`: pop the index, then the container, push
@@ -52,6 +59,10 @@ pub enum Inst {
     JumpIf(usize),
     /// Replace the current value with its boolean truthiness.
     ToBool,
+    /// Array construction `[f]`: run the element stream (a sub-program) to
+    /// exhaustion on the current value and push the collected array; the first
+    /// error in the stream fails the construction.
+    Collect(Vec<Inst>),
     /// Produce nothing for this path (`empty`): backtrack immediately.
     Backtrack,
     /// Raise an error for this path (`error`).
@@ -107,6 +118,50 @@ fn emit(f: &Filter, code: &mut Vec<Inst>) -> Result<(), Unsupported> {
             code.push(Inst::IndexGeneric);
         }
         Filter::ArrayIterator => code.push(Inst::Iterate),
+        Filter::Array(items) => {
+            // `[a, b, …]` collects the stream `(a, b, …)` into one array. Build
+            // that stream as a sub-program and collect it at runtime.
+            let mut sub = Vec::new();
+            match items.split_first() {
+                None => sub.push(Inst::Backtrack), // `[]` collects nothing
+                Some((first, rest)) => {
+                    let inner = rest.iter().fold((*first).clone(), |acc, f| {
+                        Filter::Comma(Box::new(acc), Box::new(f.clone()))
+                    });
+                    emit(&inner, &mut sub)?;
+                }
+            }
+            code.push(Inst::Collect(sub));
+        }
+        Filter::Object(fields) => {
+            // A stream-valued field makes construction a cartesian product,
+            // and an error mid-stream must unwind *past* the internal comma
+            // fork (jq stops the object stream there) — which the flat fork
+            // model does not yet express. Restrict to single-output fields
+            // (the common case), where no such fork exists.
+            if !fields
+                .iter()
+                .all(|(k, v)| single_output(k) && single_output(v))
+            {
+                return Err(Unsupported);
+            }
+            // Thread an accumulator object above the preserved input `I`, so
+            // each field's key/value can be computed on `I` and the cartesian
+            // product of stream-valued fields falls out of the backtracking.
+            // Stack: [I] -> [I, {}] -> per field [I, acc, key, val] -> [I, acc']
+            // -> finally [acc].
+            code.push(Inst::Dup); // [I, I]
+            code.push(Inst::Push(Json::Object(Vec::new()))); // [I, {}]
+            for (kf, vf) in fields {
+                code.push(Inst::Pick(1)); // copy I under acc -> [I, acc, I]
+                emit(kf, code)?; // [I, acc, key]
+                code.push(Inst::Pick(2)); // copy I -> [I, acc, key, I]
+                emit(vf, code)?; // [I, acc, key, val]
+                code.push(Inst::SetField); // [I, acc']
+            }
+            code.push(Inst::Swap); // [acc, I]
+            code.push(Inst::Pop); // [acc]
+        }
         Filter::UnOp(UnOp::Neg, inner) => {
             emit(inner, code)?;
             code.push(Inst::Neg);
@@ -174,6 +229,33 @@ fn emit(f: &Filter, code: &mut Vec<Inst>) -> Result<(), Unsupported> {
         _ => return Err(Unsupported),
     }
     Ok(())
+}
+
+/// Conservative check that a filter yields at most one output per input (never
+/// a stream). Used to keep object construction on the single-output path where
+/// error-unwinding across an internal fork cannot arise. `false` never means
+/// "definitely a stream" — it just declines to promise single output.
+fn single_output(f: &Filter) -> bool {
+    match f {
+        Filter::Dot
+        | Filter::Null
+        | Filter::Boolean(_)
+        | Filter::Number(_)
+        | Filter::String(_) => true,
+        // `[f]` is always exactly one array, whatever f does.
+        Filter::Array(_) => true,
+        Filter::ObjIndex(inner) | Filter::ArrayIndex(inner) | Filter::UnOp(_, inner) => {
+            single_output(inner)
+        }
+        Filter::BinOp(l, _, r) | Filter::Pipe(l, r) => single_output(l) && single_output(r),
+        Filter::Object(fields) => fields
+            .iter()
+            .all(|(k, v)| single_output(k) && single_output(v)),
+        Filter::IfThenElse(c, t, e) => {
+            single_output(c) && single_output(t) && single_output(e)
+        }
+        _ => false,
+    }
 }
 
 /// A choice point. `Branch` resumes at a pc; `Iter` resumes iteration over a
@@ -263,6 +345,33 @@ pub fn run(code: &[Inst], input: Json) -> Vec<Result<Json, JQError>> {
                 let n = stack.len();
                 stack.swap(n - 1, n - 2);
                 pc += 1;
+            }
+            Inst::Pop => {
+                stack.pop();
+                pc += 1;
+            }
+            Inst::Pick(n) => {
+                let v = stack[stack.len() - 1 - n].clone();
+                stack.push(v);
+                pc += 1;
+            }
+            Inst::SetField => {
+                let val = stack.pop().unwrap_or(Json::Null);
+                let key = stack.pop().unwrap_or(Json::Null);
+                let acc = stack.pop().unwrap_or(Json::Null);
+                match (acc, key) {
+                    (Json::Object(mut o), Json::String(k)) => {
+                        o.push((k, val));
+                        stack.push(Json::Object(o));
+                        pc += 1;
+                    }
+                    (_, other) => {
+                        out.push(Err(JQError::NonStringObjectKey(other)));
+                        if !backtrack(&mut forks, &mut stack, &mut pc) {
+                            return out;
+                        }
+                    }
+                }
             }
             Inst::IndexField(key) => {
                 let top = stack.pop().unwrap_or(Json::Null);
@@ -389,6 +498,39 @@ pub fn run(code: &[Inst], input: Json) -> Vec<Result<Json, JQError>> {
                 let top = stack.pop().unwrap_or(Json::Null);
                 stack.push(Json::Boolean(top.boolify()));
                 pc += 1;
+            }
+            Inst::Collect(sub) => {
+                // Run the element stream on the current value; collect its Ok
+                // outputs into an array, failing on the first error.
+                let input = stack.pop().unwrap_or(Json::Null);
+                let results = run(sub, input);
+                let mut arr = Vec::with_capacity(results.len());
+                let mut err = None;
+                for r in results {
+                    match r {
+                        Ok(v) => arr.push(v),
+                        Err(e) => {
+                            err = Some(e);
+                            break;
+                        }
+                    }
+                    if arr.len() > STEP_BUDGET {
+                        err = Some(JQError::AllocationTooLarge);
+                        break;
+                    }
+                }
+                match err {
+                    None => {
+                        stack.push(Json::Array(arr));
+                        pc += 1;
+                    }
+                    Some(e) => {
+                        out.push(Err(e));
+                        if !backtrack(&mut forks, &mut stack, &mut pc) {
+                            return out;
+                        }
+                    }
+                }
             }
             Inst::Backtrack => {
                 if !backtrack(&mut forks, &mut stack, &mut pc) {
