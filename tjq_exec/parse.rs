@@ -130,6 +130,7 @@ pub enum FilterKind {
     Bound,
     ReduceExpression,
     SliceExpression,
+    TryCatch,
     Hole,
     Empty,
     Error,
@@ -288,6 +289,16 @@ impl From<&Cst<'_>> for Filter {
                         Box::new(update),
                     )
                 }
+                FilterKind::TryCatch => {
+                    assert!(!cst.children.is_empty());
+                    let body = Box::new((&cst.children[0]).into());
+                    let handler = if cst.children.len() > 1 {
+                        Some(Box::new((&cst.children[1]).into()))
+                    } else {
+                        None
+                    };
+                    Filter::TryCatch(body, handler)
+                }
                 FilterKind::FunctionExpression => {
                     tracing::trace!(
                         "Parsing FunctionExpression with {}",
@@ -396,6 +407,7 @@ impl Display for FilterKind {
             FilterKind::Error => write!(f, "error"),
             FilterKind::BindingExpression => write!(f, "binding_expression"),
             FilterKind::SliceExpression => write!(f, ".[:]"),
+            FilterKind::TryCatch => write!(f, "try"),
         }
     }
 }
@@ -673,6 +685,26 @@ impl<'a> Cst<'a> {
         Self {
             kind: NodeKind::FilterKind(FilterKind::ReduceExpression),
             children: vec![var_cst, generator, init, update],
+            range,
+            value,
+        }
+    }
+
+    pub fn try_catch(
+        range: Range,
+        value: &'a str,
+        body: Cst<'a>,
+        handler: Option<Cst<'a>>,
+    ) -> Self {
+        // children = [body] for `try f` / `f?`; [body, handler] for
+        // `try f catch g`. The handler's presence is the catch marker.
+        let mut children = vec![body];
+        if let Some(h) = handler {
+            children.push(h);
+        }
+        Self {
+            kind: NodeKind::FilterKind(FilterKind::TryCatch),
+            children,
             range,
             value,
         }
@@ -1164,23 +1196,46 @@ pub(crate) fn parse_filter<'a>(
             )
         }
         "optional_expression" => {
-            let field = root
-                .child(0)
-                .expect("optional expression should have the first child as its field");
-
-            let (identifier, vfield) = parse_filter(
-                code,
-                field
-                    .child(1)
-                    .expect("field access should have the second child as its field"),
-            );
-
+            // `f?` is sugar for `try f`: run f, suppress any error (yielding
+            // nothing). The single named child is the body expression.
+            let body_node = root
+                .named_child(0)
+                .expect("optional_expression should have a body expression");
+            let (body, v) = parse_filter(code, body_node);
             (
-                Cst::object_index(
+                Cst::try_catch(
                     root.range(),
                     &code[root.range().start_byte..root.range().end_byte],
+                    body,
+                    None,
                 ),
-                vfield,
+                v,
+            )
+        }
+        "try_expression" => {
+            // `try f [catch g]`. The `try`/`catch` keywords are anonymous, and
+            // `_catch_expression` is a hidden rule, so the two named children
+            // are exactly the body and (optionally) the catch expression.
+            let body_node = root
+                .named_child(0)
+                .expect("try_expression should have a body");
+            let (body, vb) = parse_filter(code, body_node);
+            let (handler, vc) = match root.named_child(1) {
+                Some(catch_node) => {
+                    let (h, vc) = parse_filter(code, catch_node);
+                    (Some(h), vc)
+                }
+                None => (None, vec![]),
+            };
+            let v = vb.into_iter().chain(vc).collect();
+            (
+                Cst::try_catch(
+                    root.range(),
+                    &code[root.range().start_byte..root.range().end_byte],
+                    body,
+                    handler,
+                ),
+                v,
             )
         }
         "reduce_expression" => {

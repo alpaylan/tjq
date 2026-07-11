@@ -1579,6 +1579,7 @@ impl Shape {
             Filter::BindingExpression(_, _) => todo!(),
             Filter::Variable(_) => todo!(),
             Filter::ReduceExpression(_, _, _, _) => todo!(),
+            Filter::TryCatch(_, _) => todo!(),
             Filter::Hole => todo!(),
             Filter::SliceExpression(_, _) => {
                 // Slicing preserves the type: array -> array, string -> string

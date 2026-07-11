@@ -260,3 +260,78 @@ only timeouts are `string * huge_number` (e.g. `. * "a"` on a `1e308`
 input), where jq itself tries to build an astronomically large string; the
 oracle skips jq-timeout and tjq's allocation-guard error, so these are not
 findings.
+
+## Round 7: try / catch / `?`, and four interpreter bugs it exposed
+
+Added error handling — `try f`, `try f catch g`, and postfix `f?` — end to
+end (parser, interpreter, `cannot_fail`, generator, printer). This targets
+the VM's `TRY_BEGIN`/`FORK_OPT`/`BACKTRACK` opcodes, the part of `jq_next`
+most distinct from straight-line evaluation.
+
+Semantics: `try` emits the body's outputs until the first error, at which
+point the stream stops; `catch g` then runs `g` on the error value, while
+bare `try`/`?` yield nothing. Inference types `try` as `any -> any` (sound:
+error suppression means the body's *input* constraints must not narrow the
+outer input — `try .a` does not require an object), and `cannot_fail`
+captures the effect precisely (`f?` never fails; `try f catch g` fails only
+if `g` can). Because tjq's error *messages* differ from jq's, generated
+`catch` handlers are restricted to input-ignoring constant leaves — enough to
+exercise the catch path without fabricating message-text divergences.
+
+Typing `try` as `any -> any` feeds every input (not just type-satisfying
+ones) into the body, which surfaced **six pre-existing interpreter bugs**
+that type-directed generation had been hiding — mostly cases where tjq
+silently produced a value or empty stream where jq raises an error:
+
+1. **`Pipe` dropped left-operand errors.** `error | 5` and `.x | 0.25` on a
+   number produced an *empty* stream instead of propagating the error (a
+   `flat_map(|r| r.map(…))` whose `Result`-as-iterator yields nothing for
+   `Err`). Now errors propagate.
+2. **`if` dropped condition errors.** The same `flat_map`/`flatten`
+   antipattern: `if error then … end` and `if flatten then …` (on `null`)
+   vanished instead of erroring. Fixed identically.
+3. **`.[expr]` was not generic indexing.** It only handled arrays with
+   numeric indices, *returned the index itself* on a type mismatch
+   (`[1] | .["k"]` → `"k"`), never handled object inputs (`{"a":1} | .["a"]`
+   errored), and lacked negative indices. Rewritten to dispatch on both input
+   and index type (array+int with end-relative negatives, object+string,
+   null→null, else error).
+4. **Object construction returned the wrong value on a field error.**
+   `{b: 5, k: reverse}` on `"a"` (where `reverse` errors) returned `5` — an
+   arbitrary field's value — instead of the error. Now it surfaces the first
+   actual error in the combination.
+5. **`reverse` on the number `0`.** jq's `[.[length-1-range(0;length)]]`
+   gives `[]` for any length-0 input, and a number's length is its absolute
+   value, so `0 | reverse` is `[]` (only `0`/`-0` qualify; other numbers
+   index into themselves and error). tjq errored.
+6. **`catch` panicked on some errors.** `catch` stringifies the error value
+   via `JQError`'s `Display`, which still had a `todo!()` arm
+   (`NonStringObjectKey`, reachable via `try .[0] catch …` on an object).
+   Implemented it; `Display` is now total.
+
+To keep the eager interpreter from hanging where jq streams lazily, a
+`MAX_STREAM_LEN` guard (4M values) caps the stream-multiplying arms (pipe,
+comma, array/object construction); overflow becomes the harness-skipped
+`AllocationTooLarge`, turning a would-be hang into a non-finding.
+
+All six fixes are covered by new `tjq_exec` unit tests. After them,
+differential runs with `try`/`?`/`catch` live are clean across seeds: e.g.
+three 300 × 120 sweeps and a 500-program sweep, **0 divergences / 0
+soundness / arrow / effect violations / panics** — down from 3,319
+divergences when `try` first fed every input through the buggy paths.
+
+**Coverage payoff.** The whole point was the VM core. `jq_next`'s branch
+coverage rose **70.8% → 75.5%** (63 → 53 missed branches) — with a quarter
+the programs of the round-6 measurement — because `try`/`catch`/`?` are the
+only constructs that emit the `TRY_BEGIN`/`FORK_OPT`/`BACKTRACK` opcode
+family. `execute.c` branch coverage rose 63.3% → 66.3%.
+
+**A limitation this exercised.** tjq evaluates eagerly where jq streams
+lazily, so a stream-multiplying program on a large input (`.[] op .[]` is a
+cartesian product; nested, it is quadratic-and-up) can materialize far more
+than jq ever holds at once. Beyond the `MAX_STREAM_LEN` guard on the
+multiplying arms (pipe/comma/array/object/binop/and-or, all with an O(1)
+product-size pre-check), such programs are slow-but-finite rather than
+hanging; the remaining cost falls on the minority of large/deep input
+profiles. A per-evaluation wall-clock budget in the harness is the cleaner
+long-term bound.

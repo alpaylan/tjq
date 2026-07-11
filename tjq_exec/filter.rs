@@ -35,6 +35,7 @@ pub enum Filter {
     Variable(String),                                  // $var
     ReduceExpression(String, Box<Filter>, Box<Filter>, Box<Filter>), // reduce <f> as $<s> (<init>, <update>)
     SliceExpression(Option<Box<Filter>>, Option<Box<Filter>>), // .[start:end], .[start:], .[:end]
+    TryCatch(Box<Filter>, Option<Box<Filter>>),                // try <f> [catch <g>]; `f?` is try <f>
     Hole, // Placeholder for a missing value in the AST
 }
 
@@ -47,6 +48,14 @@ pub fn builtin_filters() -> HashMap<String, Filter> {
 /// anything jq produces within the differential harness's timeout, and far
 /// below the astronomical sizes an extreme numeric count would demand.
 pub const MAX_ALLOC_BYTES: usize = 256 * 1024 * 1024;
+
+/// Ceiling on the number of values a single (sub)expression may materialize.
+/// The interpreter is eager where jq is lazy, so a stream-multiplying program
+/// (nested pipes, comma, object/array cartesian products) can blow up to sizes
+/// jq would stream through lazily. Exceeding this yields
+/// `AllocationTooLarge`, which the differential harness skips — so a resource
+/// blowup becomes a non-finding instead of an unbounded hang.
+pub const MAX_STREAM_LEN: usize = 4_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinOp {
@@ -154,6 +163,10 @@ impl Display for Filter {
                     write!(f, "{}", e)?;
                 }
                 write!(f, "]")
+            }
+            Filter::TryCatch(body, None) => write!(f, "try {}", body),
+            Filter::TryCatch(body, Some(handler)) => {
+                write!(f, "try {} catch {}", body, handler)
             }
             Filter::Hole => write!(f, "(_)"),
         }
@@ -264,6 +277,14 @@ fn clamp_number(n: f64) -> f64 {
 
 /// jq's `+` on two values: null is the identity, numbers add, strings and
 /// arrays concatenate, objects merge (right-biased). Shared by `BinOp::Add`
+/// The value a `catch` clause receives for a raised error. jq passes the
+/// error's payload — a string message for builtin errors, or the raw value
+/// for `error(v)`. We only model message strings today (there is no
+/// value-carrying `error(v)` yet), so this yields the message as a string.
+fn jqerror_to_json(e: &JQError) -> Json {
+    Json::String(e.to_string())
+}
+
 /// and the `add` builtin.
 fn add_json(l: Json, r: Json) -> Result<Json, JQError> {
     match (l, r) {
@@ -317,18 +338,32 @@ impl Filter {
         tracing::trace!("JSON: {}", json);
         match filter {
             Filter::Dot => vec![Ok(json.clone())],
-            Filter::Pipe(f1, f2) => Filter::filter(json, f1, global_definitions, variable_ctx)
-                .into_iter()
-                .flat_map(|result| {
-                    result.map(|json| Filter::filter(&json, f2, global_definitions, variable_ctx))
-                })
-                .flatten()
-                .collect::<Vec<_>>(),
-            Filter::Comma(f1, f2) => [
-                Filter::filter(json, f1, global_definitions, variable_ctx),
-                Filter::filter(json, f2, global_definitions, variable_ctx),
-            ]
-            .concat(),
+            Filter::Pipe(f1, f2) => {
+                // Feed each of f1's outputs into f2. Errors from f1 must
+                // propagate (not be silently dropped): `error | f` is an error,
+                // and `try`/`?` rely on seeing it.
+                let mut out = Vec::new();
+                for result in Filter::filter(json, f1, global_definitions, variable_ctx) {
+                    match result {
+                        Ok(j) => {
+                            out.extend(Filter::filter(&j, f2, global_definitions, variable_ctx))
+                        }
+                        Err(e) => out.push(Err(e)),
+                    }
+                    if out.len() > MAX_STREAM_LEN {
+                        return vec![Err(JQError::AllocationTooLarge)];
+                    }
+                }
+                out
+            }
+            Filter::Comma(f1, f2) => {
+                let mut out = Filter::filter(json, f1, global_definitions, variable_ctx);
+                out.extend(Filter::filter(json, f2, global_definitions, variable_ctx));
+                if out.len() > MAX_STREAM_LEN {
+                    return vec![Err(JQError::AllocationTooLarge)];
+                }
+                out
+            }
             Filter::ObjIndex(s) => match json {
                 Json::Object(obj) => {
                     let s = Filter::filter(json, s, global_definitions, variable_ctx);
@@ -359,39 +394,58 @@ impl Filter {
                 }
                 _ => vec![Err(JQError::ObjIndexForNonObject(json.clone()))],
             },
-            Filter::ArrayIndex(i) => match json {
-                Json::Array(arr) => {
-                    let i = Filter::filter(json, i, global_definitions, variable_ctx);
-                    i.into_iter()
-                        .map(|i| {
-                            if let Ok(Json::Number(i)) = i {
-                                if i.is_nan() || i.is_infinite() || i.fract() != 0.0 {
+            Filter::ArrayIndex(i) => {
+                // `.[expr]` is jq's generic index: it dispatches on both the
+                // input value and the index value. Arrays take integer indices
+                // (negative counts from the end), objects take string keys,
+                // and null indexes to null; every other pairing is an error.
+                let indices = Filter::filter(json, i, global_definitions, variable_ctx);
+                indices
+                    .into_iter()
+                    .map(|idx| {
+                        let idx = match idx {
+                            Ok(v) => v,
+                            Err(e) => return Err(e),
+                        };
+                        match (json, &idx) {
+                            (Json::Array(arr), Json::Number(n)) => {
+                                if n.is_nan() || n.is_infinite() || n.fract() != 0.0 {
                                     return Err(JQError::InvalidArrayIndex(
                                         json.clone(),
-                                        Json::Number(i),
+                                        Json::Number(*n),
                                     ));
                                 }
-
-                                Ok(arr.get(i as usize).cloned().unwrap_or(Json::Null))
-                            } else {
-                                i
+                                let len = arr.len() as i64;
+                                let mut k = *n as i64;
+                                if k < 0 {
+                                    k += len;
+                                }
+                                if k < 0 || k >= len {
+                                    Ok(Json::Null)
+                                } else {
+                                    Ok(arr[k as usize].clone())
+                                }
                             }
-                        })
-                        .collect::<Vec<_>>()
-                }
-                // jq's default semantics: array index on null yields null
-                Json::Null => {
-                    let i = Filter::filter(json, i, global_definitions, variable_ctx);
-                    i.into_iter()
-                        .map(|i| match i {
-                            Ok(Json::Number(_)) => Ok(Json::Null),
-                            Ok(other) => Err(JQError::InvalidArrayIndex(json.clone(), other)),
-                            err => err,
-                        })
-                        .collect::<Vec<_>>()
-                }
-                _ => vec![Err(JQError::ArrIndexForNonArray(json.clone()))],
-            },
+                            (Json::Object(obj), Json::String(key)) => Ok(obj
+                                .iter()
+                                .find(|(k, _)| k.as_str() == key.as_str())
+                                .map(|(_, v)| v.clone())
+                                .unwrap_or(Json::Null)),
+                            // jq's default semantics: indexing null yields null.
+                            (Json::Null, Json::Number(_)) | (Json::Null, Json::String(_)) => {
+                                Ok(Json::Null)
+                            }
+                            (Json::Array(_), other) => {
+                                Err(JQError::InvalidArrayIndex(json.clone(), other.clone()))
+                            }
+                            (Json::Object(_), other) => {
+                                Err(JQError::NonStringObjectKey(other.clone()))
+                            }
+                            _ => Err(JQError::ArrIndexForNonArray(json.clone())),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            }
             Filter::ArrayIterator => match json {
                 Json::Array(arr) => arr.iter().map(|value| Ok(value.clone())).collect(),
                 Json::Object(obj) => obj.iter().map(|(_, value)| Ok(value.clone())).collect(),
@@ -405,7 +459,11 @@ impl Filter {
                 let results = arr
                     .iter()
                     .flat_map(|f| Filter::filter(json, f, global_definitions, variable_ctx))
+                    .take(MAX_STREAM_LEN + 1)
                     .collect::<Vec<_>>();
+                if results.len() > MAX_STREAM_LEN {
+                    return vec![Err(JQError::AllocationTooLarge)];
+                }
                 let (results, errs): (Vec<_>, Vec<_>) =
                     results.into_iter().partition(Result::is_ok);
 
@@ -432,7 +490,11 @@ impl Filter {
                     .into_iter()
                     .map(|(keys, values)| itertools::iproduct!(keys, values).collect::<Vec<_>>())
                     .multi_cartesian_product()
+                    .take(MAX_STREAM_LEN + 1)
                     .collect::<Vec<_>>();
+                if results.len() > MAX_STREAM_LEN {
+                    return vec![Err(JQError::AllocationTooLarge)];
+                }
 
                 let (results, errs): (Vec<_>, Vec<_>) = results
                     .into_iter()
@@ -476,12 +538,21 @@ impl Filter {
                             .collect()
                     }
                 } else {
-                    let (k, v) = errs[0][0].clone();
-                    if k.is_err() {
-                        vec![k]
-                    } else {
-                        vec![v]
-                    }
+                    // Some combination contains an error. Surface the first
+                    // actual error (scanning the combination's pairs
+                    // left-to-right, key before value) rather than an
+                    // arbitrary pair's value.
+                    let combo = &errs[0];
+                    let first_err = combo.iter().find_map(|(k, v)| {
+                        if k.is_err() {
+                            Some(k.clone())
+                        } else if v.is_err() {
+                            Some(v.clone())
+                        } else {
+                            None
+                        }
+                    });
+                    vec![first_err.unwrap_or(Err(JQError::Unknown))]
                 }
             }
             Filter::UnOp(un_op, f) => {
@@ -528,12 +599,23 @@ impl Filter {
                             }
                         }
                     }
+                    if out.len() > MAX_STREAM_LEN {
+                        return vec![Err(JQError::AllocationTooLarge)];
+                    }
                 }
                 out
             }
             Filter::BinOp(l, bin_op, r) => {
                 let ls = Filter::filter(json, l, global_definitions, variable_ctx);
                 let rs = Filter::filter(json, r, global_definitions, variable_ctx);
+
+                // A binop over two streams is their cartesian product, so
+                // `.[] op .[]` on a large array is quadratic (and nested
+                // binops compound it). Guard the product size before
+                // materializing it (this check is O(1)).
+                if ls.len().saturating_mul(rs.len()) > MAX_STREAM_LEN {
+                    return vec![Err(JQError::AllocationTooLarge)];
+                }
 
                 // jq iterates the right operand's stream in the outer loop:
                 // (1,2) + (10,20) yields 11, 12, 21, 22
@@ -738,6 +820,11 @@ impl Filter {
                             Json::Null => Ok(Json::Array(vec![])),
                             Json::Object(obj) if obj.is_empty() => Ok(Json::Array(vec![])),
                             Json::String(s) if s.is_empty() => Ok(Json::Array(vec![])),
+                            // Any length-0 input reverses to []; a number's
+                            // length is its absolute value, so only 0 / -0 has
+                            // length 0 (any other number would index into
+                            // itself and error).
+                            Json::Number(n) if *n == 0.0 => Ok(Json::Array(vec![])),
                             other => Err(JQError::ArrIndexForNonArray(other.clone())),
                         }];
                     }
@@ -827,21 +914,28 @@ impl Filter {
                 }
             },
             Filter::IfThenElse(filter, filter1, filter2) => {
-                let results = Filter::filter(json, filter, global_definitions, variable_ctx);
-                results
-                    .into_iter()
-                    .flat_map(|result| {
-                        result.map(|json_| {
-                            // jq truthiness: everything except null and false
-                            if json_.boolify() {
-                                Filter::filter(json, filter1, global_definitions, variable_ctx)
-                            } else {
-                                Filter::filter(json, filter2, global_definitions, variable_ctx)
-                            }
-                        })
-                    })
-                    .flatten()
-                    .collect()
+                // The condition is itself a stream; an error in it must
+                // propagate (not be dropped), so `try`/`?` can see it.
+                let mut out = Vec::new();
+                for result in Filter::filter(json, filter, global_definitions, variable_ctx) {
+                    match result {
+                        Ok(cond) => {
+                            // jq truthiness: everything except null and false.
+                            let branch = if cond.boolify() { filter1 } else { filter2 };
+                            out.extend(Filter::filter(
+                                json,
+                                branch,
+                                global_definitions,
+                                variable_ctx,
+                            ));
+                        }
+                        Err(e) => out.push(Err(e)),
+                    }
+                    if out.len() > MAX_STREAM_LEN {
+                        return vec![Err(JQError::AllocationTooLarge)];
+                    }
+                }
+                out
             }
             Filter::Bound(items, filter) => {
                 // for item in items {
@@ -938,6 +1032,34 @@ impl Filter {
                 }
 
                 vec![Ok(acc)]
+            }
+
+            Filter::TryCatch(body, handler) => {
+                // jq: emit the body's outputs until (if) it raises an error, at
+                // which point the stream stops. `try f catch g` runs g with the
+                // error value as input; bare `try f` / `f?` yields nothing on
+                // error. Errors after the first are unreachable in jq's lazy
+                // model, so we drop the eager tail past the first error.
+                let results = Filter::filter(json, body, global_definitions, variable_ctx);
+                let mut out = Vec::new();
+                for r in results {
+                    match r {
+                        Ok(v) => out.push(Ok(v)),
+                        Err(e) => {
+                            if let Some(handler) = handler {
+                                let err_val = jqerror_to_json(&e);
+                                out.extend(Filter::filter(
+                                    &err_val,
+                                    handler,
+                                    global_definitions,
+                                    variable_ctx,
+                                ));
+                            }
+                            break;
+                        }
+                    }
+                }
+                out
             }
 
             Filter::SliceExpression(start, end) => {
@@ -1123,6 +1245,12 @@ impl Filter {
                 start.as_ref().map(|s| Box::new(s.substitute(var, arg))),
                 end.as_ref().map(|e| Box::new(e.substitute(var, arg))),
             ),
+            Filter::TryCatch(body, handler) => Filter::TryCatch(
+                Box::new(body.substitute(var, arg)),
+                handler
+                    .as_ref()
+                    .map(|h| Box::new(h.substitute(var, arg))),
+            ),
 
             Filter::Hole => todo!(),
         }
@@ -1243,6 +1371,97 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    /// Like `run`, but keeps the error/value distinction: returns `Ok` values
+    /// as `Some(json)` and errors as `None`, in stream order. Lets tests assert
+    /// on error propagation and empty streams.
+    fn run_raw(src: &str, input: &str) -> Vec<Option<Json>> {
+        let f = filter(src);
+        Filter::filter(&json(input), &f, &builtin_filters(), &mut Default::default())
+            .into_iter()
+            .map(|r| r.ok())
+            .collect()
+    }
+
+    #[test]
+    fn test_pipe_propagates_errors() {
+        // Regression: a left-operand error must not be silently dropped.
+        assert_eq!(run_raw("error | 5", "null"), vec![None]);
+        assert_eq!(run_raw(".x | 0.25", "0"), vec![None]);
+        // A clean pipe still passes values through.
+        assert_eq!(run_raw("1 | . + 1", "null"), vec![Some(json("2.0"))]);
+    }
+
+    #[test]
+    fn test_generic_index() {
+        // `.[expr]` dispatches on input and index type.
+        assert_eq!(run_raw(".[\"a\"]", "{\"a\":1}"), vec![Some(json("1.0"))]);
+        assert_eq!(run_raw(".[1]", "[10,20,30]"), vec![Some(json("20.0"))]);
+        assert_eq!(run_raw(".[-1]", "[10,20,30]"), vec![Some(json("30.0"))]);
+        // Type mismatches error rather than returning the index.
+        assert_eq!(run_raw(".[\"k\"]", "[1]"), vec![None]);
+        assert_eq!(run_raw(".[0]", "{\"a\":1}"), vec![None]);
+        // null indexes to null.
+        assert_eq!(run_raw(".[0]", "null"), vec![Some(json("null"))]);
+    }
+
+    #[test]
+    fn test_object_construction_propagates_errors() {
+        // Regression: a field whose value errors must surface the error, not
+        // some other field's value. `reverse` errors on a non-empty string.
+        assert_eq!(run_raw("{b: 5, k: reverse}", "\"a\""), vec![None]);
+        // No error: the object is built.
+        assert_eq!(
+            run_raw("{b: 5}", "\"a\""),
+            vec![Some(json("{\"b\":5}"))]
+        );
+    }
+
+    #[test]
+    fn test_reverse_length_zero() {
+        // Any length-0 input reverses to []; only the number 0 qualifies.
+        assert_eq!(run_raw("reverse", "0"), vec![Some(json("[]"))]);
+        assert_eq!(run_raw("reverse", "\"\""), vec![Some(json("[]"))]);
+        assert_eq!(run_raw("reverse", "5"), vec![None]); // errors
+    }
+
+    #[test]
+    fn test_try_catch_optional() {
+        // `f?` suppresses errors (empty stream); `try f catch g` runs g.
+        assert_eq!(run_raw(".a?", "5"), Vec::<Option<Json>>::new());
+        assert_eq!(run_raw(".a?", "{\"a\":1}"), vec![Some(json("1.0"))]);
+        assert_eq!(
+            run_raw("try error catch \"c\"", "null"),
+            vec![Some(json("\"c\""))]
+        );
+        // Stream stops at the first error, keeping earlier outputs.
+        assert_eq!(
+            run_raw("[try (1,2,error,3) catch \"c\"]", "null"),
+            vec![Some(json("[1,2,\"c\"]"))]
+        );
+    }
+
+    #[test]
+    fn test_if_propagates_condition_error() {
+        // Regression: an error in the condition must propagate, not vanish.
+        assert_eq!(run_raw("if error then 1 else 2 end", "null"), vec![None]);
+        // `flatten` errors on null; wrapped in try, the error is caught.
+        assert_eq!(
+            run_raw("try (if flatten then 1 else 2 end) catch \"c\"", "null"),
+            vec![Some(json("\"c\""))]
+        );
+    }
+
+    #[test]
+    fn test_catch_does_not_panic_on_any_error() {
+        // Regression: `catch` stringifies the error via Display, which must be
+        // total (no `todo!()`). Indexing an object with a number raises
+        // NonStringObjectKey, whose Display was previously unimplemented.
+        assert_eq!(
+            run_raw("try .[0] catch \"c\"", "{\"a\":1}"),
+            vec![Some(json("\"c\""))]
+        );
     }
 
     #[test]

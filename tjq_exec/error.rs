@@ -32,7 +32,9 @@ impl Display for JQError {
             JQError::ArrIteratorForNonIterable(json) => {
                 write!(f, "Cannot iterate over {}", json.debug())
             }
-            JQError::NonStringObjectKey(json) => todo!(),
+            JQError::NonStringObjectKey(json) => {
+                write!(f, "Cannot index object with {}", json.debug())
+            }
             JQError::BinOpTypeError(json, bin_op, json1) => {
                 write!(
                     f,

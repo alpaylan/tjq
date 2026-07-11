@@ -300,6 +300,7 @@ impl Compiler {
             Filter::ReduceExpression(var, generator, init, update) => todo!(),
             Filter::Hole => todo!(),
             Filter::SliceExpression(_, _) => todo!(),
+            Filter::TryCatch(_, _) => todo!(),
         }
     }
 }

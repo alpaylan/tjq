@@ -17,7 +17,7 @@ pub fn gen_filter(rng: &mut Rng, depth: usize) -> Filter {
     if depth == 0 {
         return gen_leaf(rng);
     }
-    match rng.below(25) {
+    match rng.below(27) {
         // Leaves stay likely at every depth so programs end
         0..=5 => gen_leaf(rng),
         6..=9 => Filter::Pipe(
@@ -84,6 +84,22 @@ pub fn gen_filter(rng: &mut Rng, depth: usize) -> Filter {
                 Some(vec![gen_filter(rng, depth - 1)]),
             )
         }
+        24 => {
+            // `f?` — postfix error suppression. Lights up the VM's
+            // FORK_OPT / backtrack-on-error opcodes.
+            Filter::TryCatch(Box::new(gen_filter(rng, depth - 1)), None)
+        }
+        25 => {
+            // `try f catch g`. The handler must NOT observe the error value:
+            // tjq's error *messages* differ from jq's, so a handler that reads
+            // its input (`.`, `length`, …) would diverge on message text
+            // without being a real bug. A constant leaf keeps it comparable
+            // while still exercising the TRY_BEGIN/END + catch path.
+            Filter::TryCatch(
+                Box::new(gen_filter(rng, depth - 1)),
+                Some(Box::new(gen_const_leaf(rng))),
+            )
+        }
         _ => {
             // Object construction with 1-2 literal keys
             let len = 1 + rng.below(2);
@@ -115,6 +131,18 @@ fn gen_access(rng: &mut Rng) -> Filter {
             Filter::Pipe(Box::new(first), Box::new(second))
         }
         _ => Filter::ArrayIterator,
+    }
+}
+
+/// A constant leaf that ignores its input entirely (a literal). Used for
+/// `catch` handlers, whose input is the error value — which we must not
+/// observe (see the `try f catch g` generator arm).
+fn gen_const_leaf(rng: &mut Rng) -> Filter {
+    match rng.below(5) {
+        0 => Filter::Null,
+        1 => Filter::Boolean(rng.chance(1, 2)),
+        2 | 3 => Filter::Number(*rng.pick(&NUMBER_POOL)),
+        _ => Filter::String(rng.pick(&STRING_POOL).to_string()),
     }
 }
 
@@ -206,6 +234,11 @@ pub fn to_jq_source(f: &Filter) -> String {
             to_jq_source(t),
             to_jq_source(e)
         ),
+        // `f?` postfix; wrap the body so precedence is unambiguous.
+        Filter::TryCatch(body, None) => format!("{}?", atom(body)),
+        Filter::TryCatch(body, Some(handler)) => {
+            format!("try {} catch {}", atom(body), atom(handler))
+        }
         Filter::Call(name, None) => name.clone(),
         Filter::Call(name, Some(args)) => {
             let inner: Vec<String> = args.iter().map(to_jq_source).collect();

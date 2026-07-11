@@ -2863,6 +2863,10 @@ pub fn cannot_fail(f: &Filter) -> bool {
         Filter::Array(items) => items.iter().all(cannot_fail),
         Filter::Object(items) => items.iter().all(|(_, v)| cannot_fail(v)),
         Filter::IfThenElse(c, t, e) => cannot_fail(c) && cannot_fail(t) && cannot_fail(e),
+        // `f?` / bare `try f` swallow every error the body raises, so they
+        // never fail. `try f catch g` fails only if the handler g can.
+        Filter::TryCatch(_body, None) => true,
+        Filter::TryCatch(_body, Some(handler)) => cannot_fail(handler),
         Filter::BinOp(l, op, r) => {
             cannot_fail(l)
                 && cannot_fail(r)
@@ -4142,6 +4146,16 @@ fn compute_shape_internal(
             vec![]
         }
         Filter::ReduceExpression(var_name, init, generator, update) => todo!(),
+        Filter::TryCatch(_body, _handler) => {
+            // `try f [catch g]` suppresses f's failures, so f's *input*
+            // constraints must not narrow the outer input (e.g. `try .a` does
+            // not require an object). We type it soundly as `any -> any`:
+            // leaving input and output unconstrained never claims a false
+            // domain restriction nor a false codomain. Precision (unioning
+            // f's and g's output shapes) is left for later; `cannot_fail`
+            // already captures the failure-effect side precisely.
+            vec![]
+        }
         Filter::Hole => todo!(),
         Filter::SliceExpression(start, end) => {
             // Slicing an array returns an array of the same element type
