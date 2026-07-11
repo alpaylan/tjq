@@ -5,7 +5,7 @@
 //! (Ok values by JSON equality, errors kind-agnostically). Reports any
 //! divergence with a reproducer. Usage: bytecheck [seed] [iters] [depth]
 use std::collections::HashMap;
-use tjq_exec::bytecode::{compile, run};
+use tjq_exec::bytecode::{compile, compile_typed, run, Ty};
 use tjq_exec::{builtin_filters, Filter, Json};
 use tjq_testing::filtergen::{gen_filter, to_jq_source};
 use tjq_testing::jsongen::gen_json;
@@ -45,15 +45,29 @@ fn main() {
             Ok(c) => c,
             Err(_) => continue, // outside the supported core
         };
+        // Type-directed compilation with an arbitrary (possibly wrong) input
+        // hint must be semantics-preserving — every specialization has a
+        // runtime fallback. Compile it and check it against the untyped code.
+        let typed = compile_typed(&filter, Ty::Arr(Box::new(Ty::Num))).unwrap();
         compiled += 1;
 
         let mut irng = Rng::new(seed.wrapping_add(i).wrapping_mul(2654435761));
         for _ in 0..12 {
             let input = gen_json(&mut irng, 3);
             let vm_out = run(&code, input.clone());
+            let typed_out = run(&typed, input.clone());
             let mut ctx: HashMap<String, Filter> = HashMap::new();
             let tree_out = Filter::filter(&input, &filter, &builtins, &mut ctx);
             checked += 1;
+            // The typed (specialized) VM must match the untyped VM exactly.
+            if !stream_eq(&typed_out, &vm_out) {
+                diverged += 1;
+                if diverged <= 20 {
+                    println!("TYPED-DIVERGE prog: {}", to_jq_source(&filter));
+                    println!("  input: {}", input.to_compact_string());
+                }
+                continue;
+            }
             if !stream_eq(&vm_out, &tree_out) {
                 diverged += 1;
                 if diverged <= 20 {

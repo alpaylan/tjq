@@ -473,3 +473,25 @@ fragment, and `is_empty`/`subtype` agreeing with brute-force ground truth.
 Container-recursive atoms (products/records carrying sub-types) that full
 semantic subtyping needs, and swapping the constraint solver's ad-hoc
 `included_in`/`disjoint_with` over to the BDD, are the next steps.
+
+## Round 12: type-directed compilation (first data point)
+
+`compile_typed(filter, input: Ty)` propagates a coarse static type through the
+same core and emits specialized instructions where a proof is available —
+currently `NumBinop`, which does arithmetic directly on `f64` when both
+operands are provably numbers, skipping the general operator dispatch. Every
+specialization keeps a runtime fallback, so it is correct for *any* input; a
+precise `Ty` only makes it faster. bytecheck confirms this: the typed VM
+(compiled with an arbitrary, possibly-wrong hint) matches the untyped VM on
+all ~39k checks.
+
+Measured speedup (`bytebench`, input hinted "array of number") is **modest —
+3–14%**, largest on arithmetic-heavy programs (`.[] | if .%2==0 then . else
+-. end`: 14%) and flat where a single op is dominated by other work (object
+construction). So the answer to "can type information improve speed?" is a
+**qualified yes**: the operator dispatch is not the dominant cost, so
+specializing it alone is bounded. The larger prizes the profile points to —
+eliminating `Json` clones (an unboxed numeric array when the element type is
+known) and skipping fork snapshots for provably single-output subterms —
+need the same static-type machinery pushed further, now that the plumbing and
+a soundness harness exist.

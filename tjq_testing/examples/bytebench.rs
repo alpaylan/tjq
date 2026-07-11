@@ -5,7 +5,7 @@
 //! run `jq` yourself on the printed programs for a rough external point.
 use std::collections::HashMap;
 use std::time::Instant;
-use tjq_exec::bytecode::{compile, run};
+use tjq_exec::bytecode::{compile, compile_typed, run, Ty};
 use tjq_exec::{builtin_filters, Filter, Json};
 
 fn parse_filter(src: &str) -> Filter {
@@ -31,32 +31,42 @@ fn main() {
         ".[] | {v: (. + 1)}",
     ];
 
+    // The input is an array of numbers; a real inference pass would derive this.
+    let input_ty = Ty::Arr(Box::new(Ty::Num));
+
+    let bench = |code: &[tjq_exec::bytecode::Inst]| {
+        let t = Instant::now();
+        for _ in 0..reps {
+            std::hint::black_box(run(code, input.clone()));
+        }
+        t.elapsed().as_secs_f64() * 1e3
+    };
+
     println!(
-        "reps={reps} input=[0..{n}]\n{:<40} {:>12} {:>12} {:>8}",
-        "program", "vm (ms)", "tree (ms)", "vm/tree"
+        "reps={reps} input=[0..{n}] (typed hint: array of number)\n{:<38} {:>10} {:>10} {:>10} {:>9}",
+        "program", "tree ms", "vm ms", "typed ms", "typed/vm"
     );
     for src in progs {
         let filter = parse_filter(src);
         let code = match compile(&filter) {
             Ok(c) => c,
             Err(_) => {
-                println!("{src:<40} (unsupported)");
+                println!("{src:<38} (unsupported)");
                 continue;
             }
         };
+        let typed = compile_typed(&filter, input_ty.clone()).unwrap();
 
-        // Warm up and sanity-check both engines agree on output length.
+        // Sanity: all three agree on output length.
         let vm_n = run(&code, input.clone()).len();
+        let ty_n = run(&typed, input.clone()).len();
         let mut ctx: HashMap<String, Filter> = HashMap::new();
         let tree_n = Filter::filter(&input, &filter, &builtins, &mut ctx).len();
         assert_eq!(vm_n, tree_n, "length mismatch for {src}");
+        assert_eq!(ty_n, vm_n, "typed length mismatch for {src}");
 
-        let t0 = Instant::now();
-        for _ in 0..reps {
-            std::hint::black_box(run(&code, input.clone()));
-        }
-        let vm_ms = t0.elapsed().as_secs_f64() * 1e3;
-
+        let vm_ms = bench(&code);
+        let typed_ms = bench(&typed);
         let t1 = Instant::now();
         for _ in 0..reps {
             let mut ctx: HashMap<String, Filter> = HashMap::new();
@@ -65,8 +75,8 @@ fn main() {
         let tree_ms = t1.elapsed().as_secs_f64() * 1e3;
 
         println!(
-            "{src:<40} {vm_ms:>12.1} {tree_ms:>12.1} {:>8.2}",
-            vm_ms / tree_ms
+            "{src:<38} {tree_ms:>10.1} {vm_ms:>10.1} {typed_ms:>10.1} {:>9.2}",
+            typed_ms / vm_ms
         );
     }
 }

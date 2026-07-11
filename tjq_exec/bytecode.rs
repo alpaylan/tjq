@@ -15,7 +15,7 @@
 //! `Err(Unsupported)` for them, and the differential harness skips those.
 
 use crate::error::JQError;
-use crate::filter::{apply_binop, Filter};
+use crate::filter::{apply_binop, clamp_number, Filter};
 use crate::json::Json;
 use crate::{BinOp, UnOp};
 
@@ -47,6 +47,11 @@ pub enum Inst {
     Iterate,
     /// Pop right then left, push `apply_binop(left, right, op)`.
     Binop(BinOp),
+    /// Type-specialized arithmetic: when the compiler proves both operands are
+    /// numbers, this skips the general operator dispatch and does the `f64`
+    /// operation directly (falling back to `apply_binop` if the proof was
+    /// wrong, so it stays sound under an incorrect type hint).
+    NumBinop(BinOp),
     /// Unary negation of the current value.
     Neg,
     /// Push a choice point resuming at `target` with the stack restored.
@@ -72,6 +77,39 @@ pub enum Inst {
 /// A filter that the core compiler does not yet handle.
 #[derive(Debug, Clone)]
 pub struct Unsupported;
+
+/// A coarse static type, propagated during type-directed compilation to decide
+/// where a specialized instruction is provably safe. It is an *approximation*:
+/// `Any` means "unknown", and every specialization also has a runtime fallback,
+/// so an imprecise or wrong `Ty` only costs speed, never correctness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ty {
+    Num,
+    Bool,
+    Str,
+    Null,
+    Arr(Box<Ty>),
+    Obj,
+    Any,
+}
+
+impl Ty {
+    /// The least upper bound of two static types (`Any` on disagreement).
+    fn join(&self, other: &Ty) -> Ty {
+        if self == other {
+            self.clone()
+        } else {
+            Ty::Any
+        }
+    }
+    /// The element type produced by `.[]`.
+    fn elem(&self) -> Ty {
+        match self {
+            Ty::Arr(t) => (**t).clone(),
+            _ => Ty::Any,
+        }
+    }
+}
 
 /// Compile a filter into a flat instruction vector, or report that it uses a
 /// construct outside the supported core.
@@ -229,6 +267,158 @@ fn emit(f: &Filter, code: &mut Vec<Inst>) -> Result<(), Unsupported> {
         _ => return Err(Unsupported),
     }
     Ok(())
+}
+
+/// Type-directed compilation: like `compile`, but given a static type for the
+/// input it propagates types and emits specialized instructions (currently
+/// `NumBinop` for arithmetic on proven numbers). Every specialization keeps a
+/// runtime fallback, so the result is correct for *any* input; a precise
+/// `input` type just makes it faster.
+pub fn compile_typed(f: &Filter, input: Ty) -> Result<Vec<Inst>, Unsupported> {
+    let mut code = Vec::new();
+    emit_typed(f, &mut code, &input)?;
+    Ok(code)
+}
+
+fn is_arith(op: BinOp) -> bool {
+    matches!(
+        op,
+        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
+    )
+}
+
+fn emit_typed(f: &Filter, code: &mut Vec<Inst>, in_ty: &Ty) -> Result<Ty, Unsupported> {
+    Ok(match f {
+        Filter::Dot => {
+            code.push(Inst::Dot);
+            in_ty.clone()
+        }
+        Filter::Null => {
+            code.push(Inst::Push(Json::Null));
+            Ty::Null
+        }
+        Filter::Boolean(b) => {
+            code.push(Inst::Push(Json::Boolean(*b)));
+            Ty::Bool
+        }
+        Filter::Number(n) => {
+            code.push(Inst::Push(Json::Number(*n)));
+            Ty::Num
+        }
+        Filter::String(s) => {
+            code.push(Inst::Push(Json::String(s.clone())));
+            Ty::Str
+        }
+        Filter::Empty => {
+            code.push(Inst::Backtrack);
+            Ty::Any
+        }
+        Filter::Error => {
+            code.push(Inst::Error);
+            Ty::Any
+        }
+        Filter::Pipe(a, b) => {
+            let ta = emit_typed(a, code, in_ty)?;
+            emit_typed(b, code, &ta)?
+        }
+        Filter::Comma(a, b) => {
+            let fork_at = code.len();
+            code.push(Inst::Fork(0));
+            let ta = emit_typed(a, code, in_ty)?;
+            let jump_at = code.len();
+            code.push(Inst::Jump(0));
+            let lb = code.len();
+            code[fork_at] = Inst::Fork(lb);
+            let tb = emit_typed(b, code, in_ty)?;
+            let lend = code.len();
+            code[jump_at] = Inst::Jump(lend);
+            ta.join(&tb)
+        }
+        Filter::ObjIndex(inner) => match inner.as_ref() {
+            Filter::String(s) => {
+                code.push(Inst::IndexField(s.clone()));
+                Ty::Any // object field types are not tracked here
+            }
+            _ => return Err(Unsupported),
+        },
+        Filter::ArrayIndex(idx) => {
+            code.push(Inst::Dup);
+            emit_typed(idx, code, in_ty)?;
+            code.push(Inst::IndexGeneric);
+            in_ty.elem()
+        }
+        Filter::ArrayIterator => {
+            code.push(Inst::Iterate);
+            in_ty.elem()
+        }
+        Filter::UnOp(UnOp::Neg, inner) => {
+            emit_typed(inner, code, in_ty)?;
+            code.push(Inst::Neg);
+            Ty::Num
+        }
+        Filter::BinOp(l, BinOp::Or, _) | Filter::BinOp(l, BinOp::And, _) => {
+            // Reuse the untyped compilation for the short-circuit forms; the
+            // result is always a boolean. (The `l` binding is only to reach the
+            // whole node below.)
+            let _ = l;
+            emit(f, code)?;
+            Ty::Bool
+        }
+        Filter::BinOp(l, op, r) => {
+            code.push(Inst::Dup);
+            let tr = emit_typed(r, code, in_ty)?;
+            code.push(Inst::Swap);
+            let tl = emit_typed(l, code, in_ty)?;
+            if is_arith(*op) && tl == Ty::Num && tr == Ty::Num {
+                code.push(Inst::NumBinop(*op));
+                Ty::Num
+            } else {
+                code.push(Inst::Binop(*op));
+                if is_arith(*op) {
+                    Ty::Any
+                } else {
+                    Ty::Bool
+                }
+            }
+        }
+        Filter::IfThenElse(c, t, e) => {
+            code.push(Inst::Dup);
+            emit_typed(c, code, in_ty)?;
+            let jin_at = code.len();
+            code.push(Inst::JumpIfNot(0));
+            let tt = emit_typed(t, code, in_ty)?;
+            let jump_at = code.len();
+            code.push(Inst::Jump(0));
+            let le = code.len();
+            code[jin_at] = Inst::JumpIfNot(le);
+            let te = emit_typed(e, code, in_ty)?;
+            let lend = code.len();
+            code[jump_at] = Inst::Jump(lend);
+            tt.join(&te)
+        }
+        Filter::Array(items) => {
+            let mut sub = Vec::new();
+            let elem = match items.split_first() {
+                None => {
+                    sub.push(Inst::Backtrack);
+                    Ty::Any
+                }
+                Some((first, rest)) => {
+                    let inner = rest.iter().fold((*first).clone(), |acc, f| {
+                        Filter::Comma(Box::new(acc), Box::new(f.clone()))
+                    });
+                    emit_typed(&inner, &mut sub, in_ty)?
+                }
+            };
+            code.push(Inst::Collect(sub));
+            Ty::Arr(Box::new(elem))
+        }
+        // Objects and the rest: fall back to the untyped core (still correct).
+        _ => {
+            emit(f, code)?;
+            Ty::Any
+        }
+    })
 }
 
 /// Conservative check that a filter yields at most one output per input (never
@@ -443,6 +633,55 @@ pub fn run(code: &[Inst], input: Json) -> Vec<Result<Json, JQError>> {
                 let l = stack.pop().unwrap_or(Json::Null);
                 let r = stack.pop().unwrap_or(Json::Null);
                 match apply_binop(l, r, *op) {
+                    Ok(v) => {
+                        stack.push(v);
+                        pc += 1;
+                    }
+                    Err(e) => {
+                        out.push(Err(e));
+                        if !backtrack(&mut forks, &mut stack, &mut pc) {
+                            return out;
+                        }
+                    }
+                }
+            }
+            Inst::NumBinop(op) => {
+                let l = stack.pop().unwrap_or(Json::Null);
+                let r = stack.pop().unwrap_or(Json::Null);
+                // Fast path: both proven numbers. Matches apply_binop's numeric
+                // cases exactly; anything else falls back (soundness under a
+                // wrong hint).
+                let result = match (&l, &r) {
+                    (Json::Number(a), Json::Number(b)) => match op {
+                        BinOp::Add => Ok(Json::Number(clamp_number(a + b))),
+                        BinOp::Sub => Ok(Json::Number(clamp_number(a - b))),
+                        BinOp::Mul => Ok(Json::Number(clamp_number(a * b))),
+                        BinOp::Div => {
+                            if *b == 0.0 {
+                                Err(JQError::DivisionByZero(
+                                    Json::Number(*a),
+                                    Json::Number(*b),
+                                ))
+                            } else {
+                                Ok(Json::Number(clamp_number(a / b)))
+                            }
+                        }
+                        BinOp::Mod => {
+                            let (ai, bi) = (a.trunc() as i64, b.trunc() as i64);
+                            if bi == 0 {
+                                Err(JQError::DivisionByZero(
+                                    Json::Number(*a),
+                                    Json::Number(*b),
+                                ))
+                            } else {
+                                Ok(Json::Number((ai % bi) as f64))
+                            }
+                        }
+                        _ => apply_binop(l.clone(), r.clone(), *op),
+                    },
+                    _ => apply_binop(l, r, *op),
+                };
+                match result {
                     Ok(v) => {
                         stack.push(v);
                         pc += 1;

@@ -305,7 +305,7 @@ impl Filter {
 
 /// jq clamps infinite arithmetic results to the largest finite double
 /// (`1e308 * 10` prints `1.7976931348623157e+308`, not an error).
-fn clamp_number(n: f64) -> f64 {
+pub(crate) fn clamp_number(n: f64) -> f64 {
     if n.is_infinite() {
         if n > 0.0 {
             f64::MAX
