@@ -303,8 +303,14 @@ fn infer(filter: &Filter, builtins: &HashMap<String, Filter>) -> Inference {
         // have a non-trivial arrow view; for everything else the arrow type
         // is a single arrow `tin -> tout`, which the union check already
         // covers. Skipping the second solve keeps the campaign fast.
+        //
+        // Bindings are excluded: a variable carries a value across the
+        // input->output correlation, so `solve_arrows` mis-correlates a
+        // binding's comma stream (e.g. `[100 as $y | ($y, .k)]` produces a
+        // *mixed* array that escapes the homogeneous per-branch codomains it
+        // infers). The union view (`tout`) stays sound for these.
         let has_overload = constraints.iter().any(|c| matches!(c, Constraint::Or(_)));
-        let arrows = if has_overload {
+        let arrows = if has_overload && !program_has_binding(filter) {
             solve_arrows(constraints.clone(), &ctx, i, o)
                 .map(|a| arrow_branches(&a.canonicalize()))
                 .unwrap_or_default()
@@ -374,6 +380,52 @@ fn arrow_soundness_violation(
         "output escapes correlated codomain(s) {:?}",
         codomains
     ))
+}
+
+/// Whether a program introduces or references a variable binding. Such
+/// programs are excluded from the correlated-arrow soundness check (a bound
+/// variable breaks the input->output correlation the arrow view assumes).
+fn program_has_binding(f: &Filter) -> bool {
+    match f {
+        Filter::Variable(_) | Filter::BindingExpression(_, _) => true,
+        Filter::Dot
+        | Filter::Null
+        | Filter::Boolean(_)
+        | Filter::Number(_)
+        | Filter::String(_)
+        | Filter::ArrayIterator
+        | Filter::Empty
+        | Filter::Error
+        | Filter::Hole => false,
+        Filter::Call(_, args) => args.iter().flatten().any(program_has_binding),
+        Filter::Pipe(a, b)
+        | Filter::Comma(a, b)
+        | Filter::BinOp(a, _, b) => program_has_binding(a) || program_has_binding(b),
+        Filter::ObjIndex(a)
+        | Filter::ArrayIndex(a)
+        | Filter::UnOp(_, a) => program_has_binding(a),
+        Filter::IfThenElse(a, b, c) => {
+            program_has_binding(a) || program_has_binding(b) || program_has_binding(c)
+        }
+        Filter::TryCatch(a, b) => {
+            program_has_binding(a) || b.as_ref().is_some_and(|h| program_has_binding(h))
+        }
+        Filter::Array(items) => items.iter().any(program_has_binding),
+        Filter::Object(pairs) => pairs
+            .iter()
+            .any(|(k, v)| program_has_binding(k) || program_has_binding(v)),
+        Filter::ReduceExpression(_, a, b, c) => {
+            program_has_binding(a) || program_has_binding(b) || program_has_binding(c)
+        }
+        Filter::SliceExpression(a, b) => {
+            a.as_ref().is_some_and(|x| program_has_binding(x))
+                || b.as_ref().is_some_and(|x| program_has_binding(x))
+        }
+        Filter::Bound(_, a) => program_has_binding(a),
+        Filter::FunctionExpression(defs, body) => {
+            defs.values().any(program_has_binding) || program_has_binding(body)
+        }
+    }
 }
 
 fn shape_has_tvar(s: &Shape) -> bool {

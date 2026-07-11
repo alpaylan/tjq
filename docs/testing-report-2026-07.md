@@ -335,3 +335,44 @@ product-size pre-check), such programs are slow-but-finite rather than
 hanging; the remaining cost falls on the minority of large/deep input
 profiles. A per-evaluation wall-clock budget in the harness is the cleaner
 long-term bound.
+
+## Round 8: `as $x` bindings, and three more interpreter/oracle bugs
+
+Variable binding — `EXP as $pat | BODY` — added end to end (interpreter,
+generator, printer, arrow gate). The binding scopes `BODY` per bound value
+with proper save/restore, which is only expressible where both the binding
+and its body are visible, so it is handled as a specialized `Pipe` arm (a
+bare `EXP as $pat` is `EXP as $pat | .`). Destructuring patterns
+(`[$a,$b]`, `{a:$x}`) bind by position/key. The generator emits
+`VALUES as $v | BODY` where `BODY` references `$v`, and `$v` only ever
+appears inside its own binding, so there are never free (compile-rejected)
+variables.
+
+Bindings did *not* move `jq_next` branch coverage (holds at 75.5%): the
+`STOREV`/`LOADV` opcodes are already exercised by `map`/`select` in
+`defs.jq`, which bind internally. The payoff was correctness — the existing
+binding code was badly broken, and the differential campaign found three
+more bugs:
+
+1. **`destructure_pattern` panicked** binding `$x` to an array or object
+   (`todo!()`); and the stream binding `(1,2,3) as $x | $x` returned the
+   *last* value three times, because a shared context leaked (the
+   `Pipe(Bind, body)` decomposition never scoped the body per value). Both
+   fixed; bindings now match jq for streams, composite values, and nesting.
+2. **Binops dropped the right operand's error under an empty left stream.**
+   jq iterates the right operand in the outer loop, so `.[] * (type-null)`
+   on `[]` raises `type-null`'s error even though `.[]` is empty; tjq's
+   `iproduct!` had no pair to carry it. Fixed.
+3. **Object construction discarded valid objects when a later combination
+   errored.** `{k:(1,error,3)}` should stream `{k:1}` then raise (so
+   `{k:(1,error,3)}?` keeps `{k:1}`); tjq returned only the error. Rewritten
+   to emit objects in product order, stopping at the first errored
+   combination.
+
+One oracle fix: the correlated-arrow soundness check (`solve_arrows`)
+mis-correlates a binding's comma stream — `[100 as $y | ($y, .k)]` yields a
+*mixed* array that escapes the homogeneous per-branch codomains it infers —
+so programs containing a binding are now excluded from that check (the union
+`tout` stays sound for them). All interpreter fixes have regression tests;
+runs with bindings live are clean across seeds (0 divergences / soundness /
+arrow / effect / panics).

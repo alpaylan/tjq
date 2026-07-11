@@ -203,21 +203,47 @@ impl Display for UnOp {
 
 fn destructure_pattern(val: &Json, pat: &Filter, variable_ctx: &mut HashMap<String, Filter>) {
     match pat {
+        // `$x` binds the whole value (any JSON type, held as a const filter).
         Filter::Variable(name) => {
-            let lit = match val {
-                Json::Null => Filter::Null,
-                Json::Boolean(b) => Filter::Boolean(*b),
-                Json::Number(n) => Filter::Number(*n),
-                Json::String(s) => Filter::String(s.clone()),
-                Json::Array(_) => todo!(),
-                Json::Object(_) => todo!(),
-            };
-            variable_ctx.insert(name.clone(), lit);
+            variable_ctx.insert(name.clone(), Filter::from_json_const(val));
         }
-        Filter::Array(pats) => todo!(), //match these patterns
+        // `[$a, $b, …]` binds each position; missing elements bind null.
+        Filter::Array(pats) => {
+            for (i, p) in pats.iter().enumerate() {
+                let elem = match val {
+                    Json::Array(arr) => arr.get(i).cloned().unwrap_or(Json::Null),
+                    _ => Json::Null,
+                };
+                destructure_pattern(&elem, p, variable_ctx);
+            }
+        }
+        // `{a: $x, …}` binds each field's value pattern; missing keys bind null.
+        Filter::Object(pairs) => {
+            for (key_pat, value_pat) in pairs {
+                let field = match (key_pat, val) {
+                    (Filter::String(k), Json::Object(obj)) => obj
+                        .iter()
+                        .find(|(kk, _)| kk == k)
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or(Json::Null),
+                    _ => Json::Null,
+                };
+                destructure_pattern(&field, value_pat, variable_ctx);
+            }
+        }
+        _ => {}
+    }
+}
 
-        Filter::Object(pairs) => todo!(),
-
+/// Collect the variable names a binding pattern introduces, so a caller can
+/// save and restore the enclosing scope around the binding.
+fn collect_pattern_vars(pat: &Filter, out: &mut Vec<String>) {
+    match pat {
+        Filter::Variable(name) => out.push(name.clone()),
+        Filter::Array(pats) => pats.iter().for_each(|p| collect_pattern_vars(p, out)),
+        Filter::Object(pairs) => pairs
+            .iter()
+            .for_each(|(_, v)| collect_pattern_vars(v, out)),
         _ => {}
     }
 }
@@ -338,6 +364,45 @@ impl Filter {
         tracing::trace!("JSON: {}", json);
         match filter {
             Filter::Dot => vec![Ok(json.clone())],
+            // `EXP as $pat | BODY`: for each output of EXP, bind $pat and
+            // evaluate BODY on the *original* input with that binding in
+            // scope. The binding must scope BODY per value (jq semantics),
+            // which is only possible where both the binding and its body are
+            // visible — here, at the pipe. A bare `EXP as $pat` (no pipe) is
+            // handled by the BindingExpression arm as `EXP as $pat | .`.
+            Filter::Pipe(f1, f2) if matches!(f1.as_ref(), Filter::BindingExpression(_, _)) => {
+                let Filter::BindingExpression(values, pat) = f1.as_ref() else {
+                    unreachable!()
+                };
+                let mut vars = Vec::new();
+                collect_pattern_vars(pat, &mut vars);
+                let mut out = Vec::new();
+                for result in Filter::filter(json, values, global_definitions, variable_ctx) {
+                    match result {
+                        Ok(v) => {
+                            let saved: Vec<_> =
+                                vars.iter().map(|n| variable_ctx.get(n).cloned()).collect();
+                            destructure_pattern(&v, pat, variable_ctx);
+                            out.extend(Filter::filter(json, f2, global_definitions, variable_ctx));
+                            for (n, old) in vars.iter().zip(saved) {
+                                match old {
+                                    Some(f) => {
+                                        variable_ctx.insert(n.clone(), f);
+                                    }
+                                    None => {
+                                        variable_ctx.remove(n);
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => out.push(Err(e)),
+                    }
+                    if out.len() > MAX_STREAM_LEN {
+                        return vec![Err(JQError::AllocationTooLarge)];
+                    }
+                }
+                out
+            }
             Filter::Pipe(f1, f2) => {
                 // Feed each of f1's outputs into f2. Errors from f1 must
                 // propagate (not be silently dropped): `error | f` is an error,
@@ -496,64 +561,37 @@ impl Filter {
                     return vec![Err(JQError::AllocationTooLarge)];
                 }
 
-                let (results, errs): (Vec<_>, Vec<_>) = results
-                    .into_iter()
-                    .partition(|results| results.iter().all(|(k, v)| k.is_ok() && v.is_ok()));
-
-                if errs.is_empty() {
-                    let objs: Vec<Vec<(Json, Json)>> = results
-                        .into_iter()
-                        .map(|results| {
-                            results
-                                .into_iter()
-                                .map(|(k, v)| (k.unwrap(), v.unwrap()))
-                                .collect()
-                        })
-                        .collect();
-
-                    let err = objs
-                        .iter()
-                        .find(|obj| obj.iter().any(|(k, _)| !matches!(k, Json::String(_))));
-
-                    if let Some(obj) = err {
-                        vec![Err(JQError::NonStringObjectKey(obj[0].0.clone()))]
-                    } else {
-                        objs.into_iter()
-                            .map(|obj| {
-                                Ok(Json::Object(
-                                    obj.into_iter()
-                                        .map(|(k, v)| {
-                                            // Keys are verified strings above;
-                                            // Display would add quotes around
-                                            // the key text
-                                            let key = match k {
-                                                Json::String(s) => s,
-                                                _ => unreachable!("checked above"),
-                                            };
-                                            (key, v)
-                                        })
-                                        .collect(),
-                                ))
-                            })
-                            .collect()
-                    }
-                } else {
-                    // Some combination contains an error. Surface the first
-                    // actual error (scanning the combination's pairs
-                    // left-to-right, key before value) rather than an
-                    // arbitrary pair's value.
-                    let combo = &errs[0];
-                    let first_err = combo.iter().find_map(|(k, v)| {
-                        if k.is_err() {
-                            Some(k.clone())
-                        } else if v.is_err() {
-                            Some(v.clone())
-                        } else {
-                            None
+                // Emit one object per combination in cartesian-product order,
+                // stopping at the first combination that errors (jq raises it
+                // there, so any valid objects produced *before* it survive —
+                // e.g. under `?`). Within a combination, scan left-to-right;
+                // a non-string key is itself an error.
+                let mut out = Vec::with_capacity(results.len());
+                'combos: for combo in results {
+                    let mut fields: Vec<(String, Json)> = Vec::with_capacity(combo.len());
+                    for (k, v) in combo {
+                        let key = match k {
+                            Err(e) => {
+                                out.push(Err(e));
+                                break 'combos;
+                            }
+                            Ok(Json::String(s)) => s,
+                            Ok(other) => {
+                                out.push(Err(JQError::NonStringObjectKey(other)));
+                                break 'combos;
+                            }
+                        };
+                        match v {
+                            Err(e) => {
+                                out.push(Err(e));
+                                break 'combos;
+                            }
+                            Ok(value) => fields.push((key, value)),
                         }
-                    });
-                    vec![first_err.unwrap_or(Err(JQError::Unknown))]
+                    }
+                    out.push(Ok(Json::Object(fields)));
                 }
+                out
             }
             Filter::UnOp(un_op, f) => {
                 let results = Filter::filter(json, f, global_definitions, variable_ctx);
@@ -615,6 +653,16 @@ impl Filter {
                 // materializing it (this check is O(1)).
                 if ls.len().saturating_mul(rs.len()) > MAX_STREAM_LEN {
                     return vec![Err(JQError::AllocationTooLarge)];
+                }
+
+                // jq iterates the right operand in the outer loop, the left in
+                // the inner one. With an empty left stream the inner loop never
+                // runs, so the right operand's Ok values produce nothing — but
+                // its *errors* still surface (they are raised as the outer loop
+                // pulls each value). `iproduct!` would drop them (no pair to
+                // carry them), so handle the empty-left case explicitly.
+                if ls.is_empty() {
+                    return rs.into_iter().filter(Result::is_err).collect();
                 }
 
                 // jq iterates the right operand's stream in the outer loop:
@@ -957,18 +1005,36 @@ impl Filter {
                 Filter::filter(json, expr, &scoped_filters, variable_ctx)
             }
             Filter::BindingExpression(lhs, pat) => {
+                // A binding with no continuation is `lhs as $pat | .`: yield
+                // the original input once per bound value. The binding scopes
+                // nothing observable here, so restore the shadowed vars after
+                // (a piped binding is handled by the specialized Pipe arm).
                 let bind_vals = Filter::filter(json, lhs, global_definitions, variable_ctx);
-                let orig = json.clone();
-                bind_vals
-                    .into_iter()
-                    .map(|res| match res {
+                let mut vars = Vec::new();
+                collect_pattern_vars(pat, &mut vars);
+                let mut out = Vec::new();
+                for res in bind_vals {
+                    match res {
                         Ok(j) => {
+                            let saved: Vec<_> =
+                                vars.iter().map(|n| variable_ctx.get(n).cloned()).collect();
                             destructure_pattern(&j, pat, variable_ctx);
-                            Ok(orig.clone())
+                            out.push(Ok(json.clone()));
+                            for (n, old) in vars.iter().zip(saved) {
+                                match old {
+                                    Some(f) => {
+                                        variable_ctx.insert(n.clone(), f);
+                                    }
+                                    None => {
+                                        variable_ctx.remove(n);
+                                    }
+                                }
+                            }
                         }
-                        Err(e) => Err(e),
-                    })
-                    .collect()
+                        Err(e) => out.push(Err(e)),
+                    }
+                }
+                out
             }
             Filter::Variable(name) => {
                 if let Some(bound_f) = variable_ctx.get(name) {
@@ -1462,6 +1528,58 @@ mod tests {
             run_raw("try .[0] catch \"c\"", "{\"a\":1}"),
             vec![Some(json("\"c\""))]
         );
+    }
+
+    #[test]
+    fn test_binding_scopes_per_value() {
+        // Regression: a stream binding must evaluate the body once per bound
+        // value (previously a shared ctx leaked the last value to all).
+        assert_eq!(
+            run_raw("(1,2,3) as $x | $x", "null"),
+            vec![Some(json("1")), Some(json("2")), Some(json("3"))]
+        );
+        // Binding a composite value must not panic (was todo!()).
+        assert_eq!(run_raw(". as $x | $x", "[1,2]"), vec![Some(json("[1,2]"))]);
+        // Nested bindings.
+        assert_eq!(
+            run_raw("(1,2) as $x | (10,20) as $y | $x + $y", "null"),
+            vec![
+                Some(json("11")),
+                Some(json("21")),
+                Some(json("12")),
+                Some(json("22"))
+            ]
+        );
+    }
+
+    #[test]
+    fn test_object_stream_keeps_values_before_error() {
+        // Object construction produces one object per combination; jq raises a
+        // field error at that combination, so valid objects produced *before*
+        // it survive (visible under `?`).
+        assert_eq!(
+            run_raw("[{k:(1,error,3)}?]", "null"),
+            vec![Some(json("[{\"k\":1}]"))]
+        );
+        // The full product order is preserved.
+        assert_eq!(
+            run_raw("{a:(1,2), b:(3,4)}", "null"),
+            vec![
+                Some(json("{\"a\":1,\"b\":3}")),
+                Some(json("{\"a\":1,\"b\":4}")),
+                Some(json("{\"a\":2,\"b\":3}")),
+                Some(json("{\"a\":2,\"b\":4}")),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_binop_empty_left_surfaces_right_error() {
+        // jq iterates the right operand outer, so with an empty left stream the
+        // right operand's error still surfaces (`iproduct` would drop it).
+        assert_eq!(run_raw(".[] * (1 + \"a\")", "[]"), vec![None]);
+        // But an empty *right* stream never evaluates the left: no output.
+        assert_eq!(run_raw("(1 + \"a\") * .[]", "[]"), Vec::<Option<Json>>::new());
     }
 
     #[test]

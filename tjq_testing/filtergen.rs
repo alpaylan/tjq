@@ -17,7 +17,7 @@ pub fn gen_filter(rng: &mut Rng, depth: usize) -> Filter {
     if depth == 0 {
         return gen_leaf(rng);
     }
-    match rng.below(27) {
+    match rng.below(28) {
         // Leaves stay likely at every depth so programs end
         0..=5 => gen_leaf(rng),
         6..=9 => Filter::Pipe(
@@ -98,6 +98,28 @@ pub fn gen_filter(rng: &mut Rng, depth: usize) -> Filter {
             Filter::TryCatch(
                 Box::new(gen_filter(rng, depth - 1)),
                 Some(Box::new(gen_const_leaf(rng))),
+            )
+        }
+        26 => {
+            // `VALUES as $v | BODY` — variable binding, exercising the VM's
+            // STOREV/LOADV opcodes. The body references `$v` so the binding is
+            // meaningful; `$v` only ever appears inside its own binding's body,
+            // so there are no free (compile-rejected) variables.
+            let var = (*rng.pick(&["x", "y", "v"])).to_string();
+            let values = gen_filter(rng, depth - 1);
+            let vref = || Filter::Variable(var.clone());
+            let body = match rng.below(3) {
+                0 => vref(),
+                1 => Filter::BinOp(
+                    Box::new(vref()),
+                    *rng.pick(&[BinOp::Add, BinOp::Sub, BinOp::Eq, BinOp::Gt]),
+                    Box::new(gen_filter(rng, depth - 1)),
+                ),
+                _ => Filter::Comma(Box::new(vref()), Box::new(gen_filter(rng, depth - 1))),
+            };
+            Filter::Pipe(
+                Box::new(Filter::BindingExpression(Box::new(values), Box::new(vref()))),
+                Box::new(body),
             )
         }
         _ => {
@@ -185,7 +207,22 @@ fn gen_leaf(rng: &mut Rng) -> Filter {
 pub fn to_jq_source(f: &Filter) -> String {
     match f {
         Filter::Dot => ".".to_string(),
+        // `VALUES as $pat | BODY`: the binding must not be parenthesized
+        // apart from its body (`(f as $x) | $x` is a jq compile error — the
+        // binding's scope ends at the paren), so print it as one unit. When
+        // this whole expression is an operand, `atom` wraps it as
+        // `(… as $x | …)`, which jq accepts.
+        Filter::Pipe(f1, f2) if matches!(f1.as_ref(), Filter::BindingExpression(_, _)) => {
+            let Filter::BindingExpression(values, pat) = f1.as_ref() else {
+                unreachable!()
+            };
+            format!("{} as {} | {}", atom(values), to_jq_source(pat), atom(f2))
+        }
         Filter::Pipe(f1, f2) => format!("{} | {}", atom(f1), atom(f2)),
+        Filter::Variable(name) => format!("${}", name),
+        Filter::BindingExpression(values, pat) => {
+            format!("{} as {}", atom(values), to_jq_source(pat))
+        }
         Filter::Comma(f1, f2) => format!("{}, {}", atom(f1), atom(f2)),
         Filter::ObjIndex(inner) => match inner.as_ref() {
             // `.foo` shorthand is only valid for identifier keys; other keys
@@ -277,6 +314,7 @@ fn atomic(f: &Filter) -> bool {
             | Filter::Call(_, None)
             | Filter::Empty
             | Filter::Error
+            | Filter::Variable(_)
     ) || matches!(f, Filter::Number(n) if n.is_sign_positive())
 }
 
