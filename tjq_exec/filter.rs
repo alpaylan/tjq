@@ -327,6 +327,85 @@ fn jqerror_to_json(e: &JQError) -> Json {
     Json::String(e.to_string())
 }
 
+/// Apply a binary operator to a single (left, right) value pair. Shared by the
+/// tree-walking interpreter and the bytecode VM so the two engines cannot
+/// diverge on operator semantics.
+pub(crate) fn apply_binop(l: Json, r: Json, op: BinOp) -> Result<Json, JQError> {
+    match op {
+        BinOp::Add => add_json(l, r),
+        BinOp::Sub => match (l, r) {
+            (Json::Number(l), Json::Number(r)) => Ok(Json::Number(clamp_number(l - r))),
+            (Json::Array(l), Json::Array(r)) => Ok(Json::Array(
+                l.iter().filter(|x| !r.contains(x)).cloned().collect(),
+            )),
+            (l, r) => Err(JQError::BinOpTypeError(l, op, r)),
+        },
+        BinOp::Mul => match (l, r) {
+            (Json::Number(l), Json::Number(r)) => Ok(Json::Number(clamp_number(l * r))),
+            // String repetition (jq 1.7): a negative count yields null;
+            // otherwise the count truncates (0 yields "").
+            (Json::String(s), Json::Number(n)) | (Json::Number(n), Json::String(s)) => {
+                if n < 0.0 {
+                    Ok(Json::Null)
+                } else {
+                    let count = n.trunc() as usize;
+                    // Guard against astronomical repetition.
+                    match count.checked_mul(s.len()) {
+                        Some(bytes) if bytes <= MAX_ALLOC_BYTES => Ok(Json::String(s.repeat(count))),
+                        _ => Err(JQError::AllocationTooLarge),
+                    }
+                }
+            }
+            // Object multiplication is recursive merge.
+            (Json::Object(l), Json::Object(r)) => Ok(Json::Object(deep_merge(l, r))),
+            (l, r) => Err(JQError::BinOpTypeError(l, op, r)),
+        },
+        BinOp::Div => match (l, r) {
+            (Json::Number(l), Json::Number(r)) => {
+                if r == 0.0 {
+                    Err(JQError::DivisionByZero(Json::Number(l), Json::Number(r)))
+                } else {
+                    Ok(Json::Number(clamp_number(l / r)))
+                }
+            }
+            // Dividing a string by a string splits it; splitting "" yields [].
+            (Json::String(l), Json::String(r)) => {
+                let parts: Vec<Json> = if l.is_empty() {
+                    vec![]
+                } else if r.is_empty() {
+                    l.chars().map(|c| Json::String(c.to_string())).collect()
+                } else {
+                    l.split(r.as_str())
+                        .map(|p| Json::String(p.to_string()))
+                        .collect()
+                };
+                Ok(Json::Array(parts))
+            }
+            (l, r) => Err(JQError::BinOpTypeError(l, op, r)),
+        },
+        BinOp::Mod => match (l, r) {
+            // jq truncates both operands to integers.
+            (Json::Number(l), Json::Number(r)) => {
+                let (li, ri) = (l.trunc() as i64, r.trunc() as i64);
+                if ri == 0 {
+                    Err(JQError::DivisionByZero(Json::Number(l), Json::Number(r)))
+                } else {
+                    Ok(Json::Number((li % ri) as f64))
+                }
+            }
+            (l, r) => Err(JQError::BinOpTypeError(l, op, r)),
+        },
+        BinOp::Eq => Ok(Json::Boolean(l == r)),
+        BinOp::Ne => Ok(Json::Boolean(l != r)),
+        BinOp::Gt => Ok(Json::Boolean(l > r)),
+        BinOp::Ge => Ok(Json::Boolean(l >= r)),
+        BinOp::Lt => Ok(Json::Boolean(l < r)),
+        BinOp::Le => Ok(Json::Boolean(l <= r)),
+        BinOp::And => Ok(Json::Boolean(l.boolify() && r.boolify())),
+        BinOp::Or => Ok(Json::Boolean(l.boolify() || r.boolify())),
+    }
+}
+
 /// and the `add` builtin.
 fn add_json(l: Json, r: Json) -> Result<Json, JQError> {
     match (l, r) {
@@ -686,106 +765,7 @@ impl Filter {
                 itertools::iproduct!(rs, ls)
                     .map(|(r, l)| match (l, r) {
                         (Err(err), _) | (_, Err(err)) => Err(err),
-                        (Ok(l), Ok(r)) => match bin_op {
-                            BinOp::Add => add_json(l, r),
-                            BinOp::Sub => match (l, r) {
-                                (Json::Number(l), Json::Number(r)) => {
-                                    Ok(Json::Number(clamp_number(l - r)))
-                                }
-                                (Json::Array(l), Json::Array(r)) => Ok(Json::Array(
-                                    l.iter().filter(|x| !r.contains(x)).cloned().collect(),
-                                )),
-                                (l, r) => Err(JQError::BinOpTypeError(l, *bin_op, r)),
-                            },
-                            BinOp::Mul => match (l, r) {
-                                (Json::Number(l), Json::Number(r)) => {
-                                    Ok(Json::Number(clamp_number(l * r)))
-                                }
-                                // String repetition (jq 1.7): a negative count
-                                // yields null; otherwise the count truncates
-                                // (0 yields "")
-                                (Json::String(s), Json::Number(n))
-                                | (Json::Number(n), Json::String(s)) => {
-                                    if n < 0.0 {
-                                        Ok(Json::Null)
-                                    } else {
-                                        let count = n.trunc() as usize;
-                                        // Guard against astronomical repetition
-                                        // (an extreme count from data would
-                                        // otherwise attempt a petabyte
-                                        // allocation and abort the process,
-                                        // uncatchable by catch_unwind). jq
-                                        // effectively hangs on such inputs and
-                                        // is killed by the harness timeout, so
-                                        // it never produces one to compare
-                                        // against.
-                                        match count.checked_mul(s.len()) {
-                                            Some(bytes) if bytes <= MAX_ALLOC_BYTES => {
-                                                Ok(Json::String(s.repeat(count)))
-                                            }
-                                            _ => Err(JQError::AllocationTooLarge),
-                                        }
-                                    }
-                                }
-                                // Object multiplication is recursive merge
-                                (Json::Object(l), Json::Object(r)) => {
-                                    Ok(Json::Object(deep_merge(l, r)))
-                                }
-                                // jq has no array repetition: `[1] * 2` is a
-                                // type error
-                                (l, r) => Err(JQError::BinOpTypeError(l, *bin_op, r)),
-                            },
-                            BinOp::Div => match (l, r) {
-                                (Json::Number(l), Json::Number(r)) => {
-                                    if r == 0.0 {
-                                        Err(JQError::DivisionByZero(
-                                            Json::Number(l),
-                                            Json::Number(r),
-                                        ))
-                                    } else {
-                                        Ok(Json::Number(clamp_number(l / r)))
-                                    }
-                                }
-                                // Dividing a string by a string splits it;
-                                // splitting the empty string yields [] in jq
-                                (Json::String(l), Json::String(r)) => {
-                                    let parts: Vec<Json> = if l.is_empty() {
-                                        vec![]
-                                    } else if r.is_empty() {
-                                        l.chars().map(|c| Json::String(c.to_string())).collect()
-                                    } else {
-                                        l.split(r.as_str())
-                                            .map(|p| Json::String(p.to_string()))
-                                            .collect()
-                                    };
-                                    Ok(Json::Array(parts))
-                                }
-                                (l, r) => Err(JQError::BinOpTypeError(l, *bin_op, r)),
-                            },
-                            BinOp::Mod => match (l, r) {
-                                // jq truncates both operands to integers
-                                (Json::Number(l), Json::Number(r)) => {
-                                    let (li, ri) = (l.trunc() as i64, r.trunc() as i64);
-                                    if ri == 0 {
-                                        Err(JQError::DivisionByZero(
-                                            Json::Number(l),
-                                            Json::Number(r),
-                                        ))
-                                    } else {
-                                        Ok(Json::Number((li % ri) as f64))
-                                    }
-                                }
-                                (l, r) => Err(JQError::BinOpTypeError(l, *bin_op, r)),
-                            },
-                            BinOp::Eq => Ok(Json::Boolean(l == r)),
-                            BinOp::Ne => Ok(Json::Boolean(l != r)),
-                            BinOp::Gt => Ok(Json::Boolean(l > r)),
-                            BinOp::Ge => Ok(Json::Boolean(l >= r)),
-                            BinOp::Lt => Ok(Json::Boolean(l < r)),
-                            BinOp::Le => Ok(Json::Boolean(l <= r)),
-                            BinOp::And => Ok(Json::Boolean(l.boolify() && r.boolify())),
-                            BinOp::Or => Ok(Json::Boolean(l.boolify() || r.boolify())),
-                        },
+                        (Ok(l), Ok(r)) => apply_binop(l, r, *bin_op),
                     })
                     .collect::<Vec<_>>()
             }

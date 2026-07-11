@@ -403,3 +403,33 @@ soundness / arrow / effect / panics). Timeouts tick up slightly (foreach can
 emit a large stream that jq materializes past its budget); these are the
 harness-skipped non-findings, and tjq's `MAX_STREAM_LEN` guard bounds its
 side.
+
+## Round 10: a bytecode compiler + backtracking VM
+
+First working `tjq_exec::bytecode`: a compiler from `Filter` to a flat
+instruction vector and a stack VM that backtracks over `Fork` choice points
+(a value threads as the top of an operand stack; forks snapshot it and are
+resumed to yield a filter's successive outputs). This is the substrate for
+the eventual type-directed compilation/speed comparison against jq's own
+bytecode engine.
+
+Operator semantics are *shared* with the tree interpreter — `apply_binop`
+was extracted so both engines evaluate binops through the same code and
+cannot drift. The supported core is generator control flow: identity,
+literals, pipe, comma, `.foo`/`.[expr]` indexing, `.[]` iteration,
+arithmetic/comparison, short-circuiting `and`/`or` (compiled with
+`JumpIf`/`ToBool`, not as cartesian binops), negation, and if/then/else;
+unsupported constructs return `Err(Unsupported)` and are skipped.
+
+Validation is a new differential harness (`examples/bytecheck`) comparing
+the VM against the interpreter on generated programs: **0 divergences across
+4 seeds × ~34k checks each** (~19% of programs compile to the core). Getting
+there surfaced two engine facts worth recording:
+
+- The **binop operand order** is right-outer/left-inner
+  (`(1,2)+(10,20)` → `11,12,21,22`), so the VM emits the right operand first
+  (making the left backtrack innermost).
+- The eager interpreter over-produces *errors* relative to the lazy VM
+  (`(a,b) % error` is `[ERR,ERR]` eagerly but `[ERR]` lazily, matching jq) —
+  masked in the jq oracle by array-wrapping. The bytecheck comparison
+  therefore compares Ok-value sequences exactly and only error *presence*.
