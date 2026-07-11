@@ -34,6 +34,14 @@ pub enum Filter {
     BindingExpression(Box<Filter>, Box<Filter>),       //
     Variable(String),                                  // $var
     ReduceExpression(String, Box<Filter>, Box<Filter>, Box<Filter>), // reduce <f> as $<s> (<init>, <update>)
+    // foreach <gen> as $<s> (<init>; <update>[; <extract>])
+    ForeachExpression(
+        String,
+        Box<Filter>,
+        Box<Filter>,
+        Box<Filter>,
+        Option<Box<Filter>>,
+    ),
     SliceExpression(Option<Box<Filter>>, Option<Box<Filter>>), // .[start:end], .[start:], .[:end]
     TryCatch(Box<Filter>, Option<Box<Filter>>),                // try <f> [catch <g>]; `f?` is try <f>
     Hole, // Placeholder for a missing value in the AST
@@ -153,6 +161,14 @@ impl Display for Filter {
             Filter::ReduceExpression(var, gen, init, upd) => {
                 write!(f, "reduce {} as ${} ({}; {})", gen, var, init, upd)
             }
+            Filter::ForeachExpression(var, gen, init, upd, extract) => match extract {
+                Some(ex) => write!(
+                    f,
+                    "foreach {} as ${} ({}; {}; {})",
+                    gen, var, init, upd, ex
+                ),
+                None => write!(f, "foreach {} as ${} ({}; {})", gen, var, init, upd),
+            },
             Filter::SliceExpression(start, end) => {
                 write!(f, ".[")?;
                 if let Some(s) = start {
@@ -1061,43 +1077,102 @@ impl Filter {
                 };
 
                 let old_binding = variable_ctx.get(var).cloned();
+                let restore = |ctx: &mut HashMap<String, Filter>| match &old_binding {
+                    Some(prev) => {
+                        ctx.insert(var.clone(), prev.clone());
+                    }
+                    None => {
+                        ctx.remove(var);
+                    }
+                };
 
                 let mut acc = acc0;
                 for item in gen_items {
                     // bind $var to the generated item
                     variable_ctx.insert(var.clone(), Filter::from_json_const(&item));
 
+                    // jq folds with the *last* value of the update stream; an
+                    // error propagates, and an empty update makes the
+                    // accumulator null (jq 1.7).
                     let upd_results =
                         Filter::filter(&acc, update, global_definitions, variable_ctx);
-                    match upd_results.into_iter().find(|r| r.is_ok()) {
-                        Some(Ok(next)) => acc = next,
-                        Some(Err(e)) => {
-                            // restore binding
-                            if let Some(prev) = old_binding {
-                                variable_ctx.insert(var.clone(), prev);
-                            } else {
-                                variable_ctx.remove(var);
+                    let mut next = Json::Null;
+                    for r in upd_results {
+                        match r {
+                            Ok(v) => next = v,
+                            Err(e) => {
+                                restore(variable_ctx);
+                                return vec![Err(e)];
                             }
-                            return vec![Err(e)];
                         }
-                        None => {
-                            if let Some(prev) = old_binding {
-                                variable_ctx.insert(var.clone(), prev);
-                            } else {
-                                variable_ctx.remove(var);
+                    }
+                    acc = next;
+                }
+
+                restore(variable_ctx);
+                vec![Ok(acc)]
+            }
+
+            Filter::ForeachExpression(var, gen, init, update, extract) => {
+                // Like reduce, but emits at each step: for each generated $var,
+                // the update stream advances the state, and for every update
+                // output the extract (identity if omitted) is emitted. The
+                // state threads as the last update output.
+                let mut gen_items = Vec::new();
+                for r in Filter::filter(json, gen, global_definitions, variable_ctx) {
+                    match r {
+                        Ok(j) => gen_items.push(j),
+                        Err(e) => return vec![Err(e)],
+                    }
+                }
+                let init_results = Filter::filter(json, init, global_definitions, variable_ctx);
+                let mut acc = match init_results.into_iter().find(|r| r.is_ok()) {
+                    Some(Ok(v)) => v,
+                    Some(Err(e)) => return vec![Err(e)],
+                    None => return vec![Err(JQError::Unknown)],
+                };
+
+                let old_binding = variable_ctx.get(var).cloned();
+                let restore = |ctx: &mut HashMap<String, Filter>| match &old_binding {
+                    Some(prev) => {
+                        ctx.insert(var.clone(), prev.clone());
+                    }
+                    None => {
+                        ctx.remove(var);
+                    }
+                };
+
+                let mut out = Vec::new();
+                for item in gen_items {
+                    variable_ctx.insert(var.clone(), Filter::from_json_const(&item));
+                    for r in Filter::filter(&acc, update, global_definitions, variable_ctx) {
+                        match r {
+                            Err(e) => {
+                                restore(variable_ctx);
+                                out.push(Err(e));
+                                return out;
                             }
-                            return vec![Err(JQError::Unknown)];
+                            Ok(state) => {
+                                acc = state.clone();
+                                match extract {
+                                    Some(ex) => out.extend(Filter::filter(
+                                        &state,
+                                        ex,
+                                        global_definitions,
+                                        variable_ctx,
+                                    )),
+                                    None => out.push(Ok(state)),
+                                }
+                            }
+                        }
+                        if out.len() > MAX_STREAM_LEN {
+                            restore(variable_ctx);
+                            return vec![Err(JQError::AllocationTooLarge)];
                         }
                     }
                 }
-
-                if let Some(prev) = old_binding {
-                    variable_ctx.insert(var.clone(), prev);
-                } else {
-                    variable_ctx.remove(var);
-                }
-
-                vec![Ok(acc)]
+                restore(variable_ctx);
+                out
             }
 
             Filter::TryCatch(body, handler) => {
@@ -1307,6 +1382,17 @@ impl Filter {
                 Box::new(init.substitute(var, arg)),
                 Box::new(upd.substitute(var, arg)),
             ),
+            // `fvar` is the foreach's bind variable ($var namespace); the
+            // substituted `var` is a function parameter, a different namespace.
+            Filter::ForeachExpression(fvar, gen, init, upd, extract) => {
+                Filter::ForeachExpression(
+                    fvar.clone(),
+                    Box::new(gen.substitute(var, arg)),
+                    Box::new(init.substitute(var, arg)),
+                    Box::new(upd.substitute(var, arg)),
+                    extract.as_ref().map(|e| Box::new(e.substitute(var, arg))),
+                )
+            }
             Filter::SliceExpression(start, end) => Filter::SliceExpression(
                 start.as_ref().map(|s| Box::new(s.substitute(var, arg))),
                 end.as_ref().map(|e| Box::new(e.substitute(var, arg))),
@@ -1580,6 +1666,38 @@ mod tests {
         assert_eq!(run_raw(".[] * (1 + \"a\")", "[]"), vec![None]);
         // But an empty *right* stream never evaluates the left: no output.
         assert_eq!(run_raw("(1 + \"a\") * .[]", "[]"), Vec::<Option<Json>>::new());
+    }
+
+    #[test]
+    fn test_reduce_semantics() {
+        // Folds with the *last* update value (regression: was first).
+        assert_eq!(
+            run_raw("reduce .[] as $x (0; . + $x, . - $x)", "[1,2,3]"),
+            vec![Some(json("-6"))]
+        );
+        // Empty update makes the accumulator null (jq 1.7), not an error.
+        assert_eq!(
+            run_raw("reduce .[] as $x (0; empty)", "[1,2,3]"),
+            vec![Some(json("null"))]
+        );
+        assert_eq!(
+            run_raw("reduce .[] as $x (0; . + $x)", "[1,2,3]"),
+            vec![Some(json("6"))]
+        );
+    }
+
+    #[test]
+    fn test_foreach_semantics() {
+        // Emits at each step (running sum); extract defaults to identity.
+        assert_eq!(
+            run_raw("foreach .[] as $x (0; . + $x)", "[1,2,3]"),
+            vec![Some(json("1")), Some(json("3")), Some(json("6"))]
+        );
+        // With an explicit extract.
+        assert_eq!(
+            run_raw("foreach .[] as $x (0; . + $x; . * 2)", "[1,2,3]"),
+            vec![Some(json("2")), Some(json("6")), Some(json("12"))]
+        );
     }
 
     #[test]

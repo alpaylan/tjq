@@ -17,7 +17,7 @@ pub fn gen_filter(rng: &mut Rng, depth: usize) -> Filter {
     if depth == 0 {
         return gen_leaf(rng);
     }
-    match rng.below(28) {
+    match rng.below(29) {
         // Leaves stay likely at every depth so programs end
         0..=5 => gen_leaf(rng),
         6..=9 => Filter::Pipe(
@@ -122,6 +122,55 @@ pub fn gen_filter(rng: &mut Rng, depth: usize) -> Filter {
                 Box::new(body),
             )
         }
+        27 => {
+            // `reduce`/`foreach SOURCE as $v (INIT; UPDATE[; EXTRACT])` — the
+            // fold constructs, exercising the VM's FORK/STOREV/backtrack path.
+            // UPDATE references the accumulator (`.`) and the bound `$v`.
+            let var = (*rng.pick(&["x", "y", "v"])).to_string();
+            let vref = || Filter::Variable(var.clone());
+            let source = match rng.below(2) {
+                0 => Filter::ArrayIterator,
+                _ => Filter::Comma(
+                    Box::new(gen_filter(rng, depth - 1)),
+                    Box::new(gen_filter(rng, depth - 1)),
+                ),
+            };
+            let init = gen_const_leaf(rng);
+            let update = match rng.below(3) {
+                0 => Filter::BinOp(
+                    Box::new(Filter::Dot),
+                    *rng.pick(&[BinOp::Add, BinOp::Sub, BinOp::Mul]),
+                    Box::new(vref()),
+                ),
+                1 => vref(),
+                _ => Filter::BinOp(
+                    Box::new(Filter::Dot),
+                    BinOp::Add,
+                    Box::new(Filter::Array(vec![vref()])),
+                ),
+            };
+            if rng.chance(1, 2) {
+                Filter::ReduceExpression(
+                    var,
+                    Box::new(source),
+                    Box::new(init),
+                    Box::new(update),
+                )
+            } else {
+                let extract = if rng.chance(1, 2) {
+                    Some(Box::new(gen_filter(rng, depth - 1)))
+                } else {
+                    None
+                };
+                Filter::ForeachExpression(
+                    var,
+                    Box::new(source),
+                    Box::new(init),
+                    Box::new(update),
+                    extract,
+                )
+            }
+        }
         _ => {
             // Object construction with 1-2 literal keys
             let len = 1 + rng.below(2);
@@ -223,6 +272,30 @@ pub fn to_jq_source(f: &Filter) -> String {
         Filter::BindingExpression(values, pat) => {
             format!("{} as {}", atom(values), to_jq_source(pat))
         }
+        Filter::ReduceExpression(var, gen, init, upd) => format!(
+            "reduce {} as ${} ({}; {})",
+            atom(gen),
+            var,
+            to_jq_source(init),
+            to_jq_source(upd)
+        ),
+        Filter::ForeachExpression(var, gen, init, upd, extract) => match extract {
+            Some(ex) => format!(
+                "foreach {} as ${} ({}; {}; {})",
+                atom(gen),
+                var,
+                to_jq_source(init),
+                to_jq_source(upd),
+                to_jq_source(ex)
+            ),
+            None => format!(
+                "foreach {} as ${} ({}; {})",
+                atom(gen),
+                var,
+                to_jq_source(init),
+                to_jq_source(upd)
+            ),
+        },
         Filter::Comma(f1, f2) => format!("{}, {}", atom(f1), atom(f2)),
         Filter::ObjIndex(inner) => match inner.as_ref() {
             // `.foo` shorthand is only valid for identifier keys; other keys

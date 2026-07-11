@@ -4145,7 +4145,14 @@ fn compute_shape_internal(
             // Return empty constraints (permissive) - the variable could be any type.
             vec![]
         }
-        Filter::ReduceExpression(var_name, init, generator, update) => todo!(),
+        // `reduce`/`foreach` fold with a bound variable and an accumulator.
+        // Precisely typing the fixpoint of the update is out of scope; we type
+        // them soundly as `any -> any` (an unconstrained input never claims a
+        // false domain restriction, an unconstrained output never a false
+        // codomain). `cannot_fail` stays conservative (both can fail).
+        Filter::ReduceExpression(_, _, _, _) | Filter::ForeachExpression(_, _, _, _, _) => {
+            vec![]
+        }
         Filter::TryCatch(_body, _handler) => {
             // `try f [catch g]` suppresses f's failures, so f's *input*
             // constraints must not narrow the outer input (e.g. `try .a` does

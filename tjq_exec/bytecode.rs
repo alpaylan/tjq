@@ -298,6 +298,7 @@ impl Compiler {
             Filter::BindingExpression(filter, filter1) => todo!(),
             Filter::Variable(_) => todo!(),
             Filter::ReduceExpression(var, generator, init, update) => todo!(),
+            Filter::ForeachExpression(_, _, _, _, _) => todo!(),
             Filter::Hole => todo!(),
             Filter::SliceExpression(_, _) => todo!(),
             Filter::TryCatch(_, _) => todo!(),

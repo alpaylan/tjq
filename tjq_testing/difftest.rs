@@ -417,6 +417,12 @@ fn program_has_binding(f: &Filter) -> bool {
         Filter::ReduceExpression(_, a, b, c) => {
             program_has_binding(a) || program_has_binding(b) || program_has_binding(c)
         }
+        Filter::ForeachExpression(_, a, b, c, d) => {
+            program_has_binding(a)
+                || program_has_binding(b)
+                || program_has_binding(c)
+                || d.as_ref().is_some_and(|e| program_has_binding(e))
+        }
         Filter::SliceExpression(a, b) => {
             a.as_ref().is_some_and(|x| program_has_binding(x))
                 || b.as_ref().is_some_and(|x| program_has_binding(x))

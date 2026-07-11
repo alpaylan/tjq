@@ -376,3 +376,30 @@ so programs containing a binding are now excluded from that check (the union
 `tout` stays sound for them). All interpreter fixes have regression tests;
 runs with bindings live are clean across seeds (0 divergences / soundness /
 arrow / effect / panics).
+
+## Round 9: `reduce` and `foreach`
+
+The fold constructs, completing the execution-engine parity arc.
+`foreach EXP as $x (INIT; UPDATE; EXTRACT)` was newly added end to end
+(Filter variant, parser, interpreter, printer, generator, sound `any -> any`
+inference); `reduce` existed but was wrong on two counts:
+
+- **`reduce` folded with the *first* update value, not the last.**
+  `reduce .[] as $x (0; .+$x, .-$x)` is `-6` in jq (last branch wins), not
+  `6`. Fixed to thread the last update output.
+- **An empty update errored instead of nulling the accumulator.** jq 1.7
+  makes `reduce .[] as $x (0; empty)` yield `null`; tjq raised. Fixed.
+
+`foreach` emits `EXTRACT` (identity if omitted) at each step, threading the
+state as the last update output — so `foreach .[] as $x (0; .+$x)` is the
+running sum `1, 3, 6`. Both match jq across streams, scans, and array
+accumulation, with regression tests. Inference types both soundly as
+`any -> any` (a precise fold fixpoint is out of scope), and since the update
+references the bound `$x`, these programs are already excluded from the
+correlated-arrow check.
+
+Differential runs with `reduce`/`foreach` live are clean (0 divergences /
+soundness / arrow / effect / panics). Timeouts tick up slightly (foreach can
+emit a large stream that jq materializes past its budget); these are the
+harness-skipped non-findings, and tjq's `MAX_STREAM_LEN` guard bounds its
+side.

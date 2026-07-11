@@ -129,6 +129,7 @@ pub enum FilterKind {
     IfThenElse,
     Bound,
     ReduceExpression,
+    ForeachExpression,
     SliceExpression,
     TryCatch,
     Hole,
@@ -289,6 +290,18 @@ impl From<&Cst<'_>> for Filter {
                         Box::new(update),
                     )
                 }
+                FilterKind::ForeachExpression => {
+                    assert!(cst.children.len() >= 4);
+                    let var_name = cst.children[0].value.to_string();
+                    let generator = Box::new((&cst.children[1]).into());
+                    let init = Box::new((&cst.children[2]).into());
+                    let update = Box::new((&cst.children[3]).into());
+                    let extract = cst
+                        .children
+                        .get(4)
+                        .map(|c| Box::new(c.into()));
+                    Filter::ForeachExpression(var_name, generator, init, update, extract)
+                }
                 FilterKind::TryCatch => {
                     assert!(!cst.children.is_empty());
                     let body = Box::new((&cst.children[0]).into());
@@ -391,6 +404,7 @@ impl Display for FilterKind {
             FilterKind::IfThenElse => write!(f, "if"),
             FilterKind::Bound => write!(f, "bound"),
             FilterKind::ReduceExpression => write!(f, "reduce"),
+            FilterKind::ForeachExpression => write!(f, "foreach"),
             FilterKind::Pipe => write!(f, "|"),
             FilterKind::Comma => write!(f, ","),
             FilterKind::ObjIndex => write!(f, ".field"),
@@ -685,6 +699,29 @@ impl<'a> Cst<'a> {
         Self {
             kind: NodeKind::FilterKind(FilterKind::ReduceExpression),
             children: vec![var_cst, generator, init, update],
+            range,
+            value,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn foreach_expression(
+        range: Range,
+        value: &'a str,
+        var_cst: Cst<'a>,
+        generator: Cst<'a>,
+        init: Cst<'a>,
+        update: Cst<'a>,
+        extract: Option<Cst<'a>>,
+    ) -> Self {
+        // children = [var, gen, init, update] plus [extract] if present.
+        let mut children = vec![var_cst, generator, init, update];
+        if let Some(ex) = extract {
+            children.push(ex);
+        }
+        Self {
+            kind: NodeKind::FilterKind(FilterKind::ForeachExpression),
+            children,
             range,
             value,
         }
@@ -1289,7 +1326,60 @@ pub(crate) fn parse_filter<'a>(
         }
         "hole" => (Cst::hole(root.range()), vec![]),
         "assignment_expression" => todo!(),
-        "foreach_expression" => todo!(),
+        "foreach_expression" => {
+            let bind = root
+                .child(1)
+                .expect("foreach: expected binding_expression");
+            let source_node = bind
+                .child(0)
+                .expect("foreach: binding_expression missing source expression");
+            let var_node = bind
+                .child(2)
+                .expect("foreach: binding_expression missing $variable");
+
+            let (generator, vgen) = parse_filter(code, source_node);
+            let var_name_str = code[var_node.range().start_byte..var_node.range().end_byte]
+                .strip_prefix('$')
+                .unwrap_or_else(|| panic!("foreach: expected variable"));
+            let var_cst = Cst::variable(var_node.range(), var_name_str);
+
+            let init_node = root
+                .child_by_field_name("initializer")
+                .expect("foreach: missing initializer");
+            let upd_node = root
+                .child_by_field_name("update")
+                .expect("foreach: missing update");
+            let (init, vinit) = parse_filter(code, init_node);
+            let (update, vupdate) = parse_filter(code, upd_node);
+
+            let (extract, vextract) = match root.child_by_field_name("extract") {
+                Some(ex) => {
+                    let (e, ve) = parse_filter(code, ex);
+                    (Some(e), ve)
+                }
+                None => (None, vec![]),
+            };
+
+            let v = vgen
+                .into_iter()
+                .chain(vinit)
+                .chain(vupdate)
+                .chain(vextract)
+                .collect::<Vec<_>>();
+
+            (
+                Cst::foreach_expression(
+                    root.range(),
+                    &code[root.range().start_byte..root.range().end_byte],
+                    var_cst,
+                    generator,
+                    init,
+                    update,
+                    extract,
+                ),
+                v,
+            )
+        }
         "field_expression" => {
             // primary_expression '.' field
             // This is like `expr.field` which should be `expr | .field`
