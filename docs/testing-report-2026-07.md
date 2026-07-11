@@ -449,3 +449,27 @@ clone per rep. The unoptimized part is the fork mechanism — every choice
 point snapshots the whole operand stack — which is the first target for the
 type-directed-compilation work (skip type checks and forks the inferred type
 proves unnecessary).
+
+## Round 11: a BDD representation for the type algebra
+
+`tjq_semantics::bdd` is a reduced, ordered Binary Decision Diagram over type
+*atoms* — the representation set-theoretic type systems (Frisch–Castagna
+semantic subtyping, as in CDuce and the Elixir checker) use for the boolean
+structure of types. A type is a boolean combination of atoms; the BDD makes
+`union`/`intersection`/`negation` canonical (structural equality is semantic
+equality) and, crucially, gives a **decidable emptiness test** — which is
+what makes subtyping decidable (`a ≤ b` iff `a \ b` is empty).
+
+The atoms are the base-type predicates (`null`, booleans, numbers, strings —
+each "any" or a singleton — plus the coarse array/object kinds); `is_empty`
+is exact over that fragment by testing a *separating* value set (complete for
+the mentioned atoms), so it accounts for atom interdependencies the tree
+`Shape` reasons about ad-hoc — e.g. `Number(1) ∧ ¬Number` reduces to ⊥ even
+though its BDD is not structurally the bottom leaf. Four property tests
+(20k cases each) pin it down: boolean-algebra laws and canonicity on the
+`holds` denotation, `from_shape` agreeing with `Shape::check` on the base
+fragment, and `is_empty`/`subtype` agreeing with brute-force ground truth.
+
+Container-recursive atoms (products/records carrying sub-types) that full
+semantic subtyping needs, and swapping the constraint solver's ad-hoc
+`included_in`/`disjoint_with` over to the BDD, are the next steps.
