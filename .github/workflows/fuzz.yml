@@ -2,11 +2,10 @@ name: Differential Fuzzing
 
 # Runs the tjq_testing differential rig against the real jq binary at scale.
 # The `difftest` runner exits non-zero on any hard finding (soundness,
-# failure-effect, jq/tjq divergence, jq crash, or inference panic), so a
-# genuine bug fails the job. Timeouts (the string-repetition resource-
-# exhaustion shape), the precision/exactness metrics, and arrow-soundness
-# (the experimental correlated-arrow layer, not sound for shared-domain
-# if/then/else or short-circuit or/and) are reported but do not fail.
+# arrow-soundness, failure-effect, jq/tjq divergence, jq crash, or inference
+# panic), so a genuine bug fails the job. Timeouts (the string-repetition
+# resource-exhaustion shape) and the precision/exactness metrics are not
+# bugs and do not fail.
 
 on:
   push:

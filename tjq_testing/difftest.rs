@@ -1005,7 +1005,7 @@ fn main() {
     println!("  outputs checked:       {}", c.outputs_checked);
     println!("  tout vacuous:          {}", c.tout_vacuous);
     println!("  VIOLATIONS:            {}", c.soundness_violations);
-    println!("arrow soundness (metric, experimental):");
+    println!("arrow soundness (hard gate):");
     println!("  ARROW VIOLATIONS:      {}", c.arrow_soundness_violations);
     println!("failure effect (v1):");
     println!("  no-fail programs:      {}", c.no_fail_programs);
@@ -1043,23 +1043,25 @@ fn main() {
     // resource-exhaustion shape) and the metric gaps are not bugs and do not
     // fail. A machine-readable line makes the gate easy to grep in CI logs.
     //
-    // arrow_soundness is deliberately NOT in the hard sum. The correlated
-    // intersection-of-arrows layer (`solve_arrows`) is experimental and models
-    // *disjoint*-domain overloads (`number->number` & `string->string`); it is
-    // not sound for `if/then/else` whose branches share a domain (both reachable
-    // for the same input) nor for short-circuiting `or`/`and` (a dead erroring
-    // operand drops an otherwise-valid branch, unsoundly narrowing the
-    // codomain). Those are known limitations of the arrow model, not of the
-    // core `tout` inference — which stays a hard gate. Arrow violations are
-    // still emitted and counted as a metric for triage. See the fuzzing-gate
-    // notes; fixing the model (union codomains on overlapping domains) is
-    // tracked separately.
+    // arrow_soundness is a hard gate again. It was briefly demoted when fixing
+    // the CI timeouts surfaced a pre-existing arrow-soundness hole (a dead
+    // erroring operand of a short-circuit `or`/`and` dropped an otherwise-valid
+    // branch and unsoundly narrowed the codomain). That hole is now closed (see
+    // the And/Or arm in experimental_type_inference.rs), and a fresh-seed sweep
+    // across depths 3-7 found zero arrow violations, so the correlated
+    // intersection-of-arrows layer is re-gated. The still-noted model
+    // limitation — overlapping-domain branches need a *union* codomain — turned
+    // out to already be handled correctly (`then/else <: output` unions), so it
+    // is not a live soundness gap.
     let hard = c.soundness_violations
+        + c.arrow_soundness_violations
         + c.effect_violations
         + c.diff_diverged
         + c.tjq_exec_panics
         + c.jq_crashes
         + c.inference_panics;
+    // arrow_violations stays broken out in the RESULT line for visibility even
+    // though it now also counts toward hard_findings.
     println!(
         "RESULT hard_findings={hard} arrow_violations={} timeouts={} seed={seed}",
         c.arrow_soundness_violations, c.jq_timeouts
