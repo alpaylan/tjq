@@ -112,3 +112,15 @@ porting an unproven algorithm forfeits the whole point.
 Concrete next actions (small, reviewable): A2 (reference `infer` in Rust +
 differential test) and B1 (`Value_negNNF_disjoint`), since both are
 self-contained and the BDD gives a cross-check for B1.
+
+### Progress (2026-07)
+
+- **B1 largely done.** `Value_negNNF_disjoint` and
+  `ValueShape_NotValueShape_disjoint` are now a `mutual` well-founded recursion
+  on the `Shape`/`Ty` size. `Value_negNNF_disjoint` is **fully proven**; the
+  shape lemma is proven for all cases except the two list-element recursions
+  (`tuple`/`object` `wrong_elem`), where only the *termination* obligation
+  (`sizeOf` of a `List.zip`/`lookup` element) is unmet — the logic is identical
+  to the closed `array` case. Semantics.lean sorries 6 → 4. Finishing those two
+  termination goals unblocks B2 (`TyLE.sound`/`ShapeLE.sound`).
+- The Lean source is now versioned (previously `papers/` was gitignored).
