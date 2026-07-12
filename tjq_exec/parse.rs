@@ -994,16 +994,55 @@ pub(crate) fn parse_filter<'a>(
             (Cst::number(root.range(), value), vec![])
         }
         "string" => {
-            //if it is quoted strip em
-            let raw = &code[root.range().start_byte..root.range().end_byte];
-            let s = if (raw.starts_with('"') && raw.ends_with('"'))
-                || (raw.starts_with('\'') && raw.ends_with('\''))
-            {
-                &raw[1..raw.len() - 1]
+            let value = &code[root.range().start_byte..root.range().end_byte];
+            let named: Vec<Node> = (0..root.named_child_count())
+                .filter_map(|i| root.named_child(i))
+                .collect();
+            let has_interp = named.iter().any(|c| c.kind() == "interpolation");
+            if !has_interp {
+                // Plain literal: strip the surrounding quotes.
+                let s = if (value.starts_with('"') && value.ends_with('"'))
+                    || (value.starts_with('\'') && value.ends_with('\''))
+                {
+                    &value[1..value.len() - 1]
+                } else {
+                    value
+                };
+                (Cst::string(root.range(), s), vec![])
             } else {
-                raw
-            };
-            (Cst::string(root.range(), s), vec![])
+                // Interpolation `"a\(e)b"` desugars to `"a" + (e|tostring) + "b"`
+                // (jq's default interpolation is `tostring`). The `+` gives the
+                // right cartesian-stream and string-concatenation behavior.
+                let mut parts: Vec<Cst<'a>> = vec![];
+                let mut all_defs = vec![];
+                for child in &named {
+                    match child.kind() {
+                        "string_content" => {
+                            let content =
+                                &code[child.range().start_byte..child.range().end_byte];
+                            parts.push(Cst::string(child.range(), content));
+                        }
+                        "interpolation" => {
+                            let expr = child
+                                .named_child(0)
+                                .expect("interpolation should contain an expression");
+                            let (e_cst, e_defs) = parse_filter(code, expr);
+                            all_defs.extend(e_defs);
+                            let tostr = Cst::call(child.range(), "tostring", "tostring", None);
+                            parts.push(Cst::pipe(e_cst, tostr, value, child.range()));
+                        }
+                        _ => {}
+                    }
+                }
+                let mut iter = parts.into_iter();
+                let first = iter
+                    .next()
+                    .unwrap_or_else(|| Cst::string(root.range(), ""));
+                let concat = iter.fold(first, |acc, p| {
+                    Cst::bin_op(root.range(), acc, BinOp::Add, p, value)
+                });
+                (concat, all_defs)
+            }
         }
         "pipeline" => {
             let value = &code[root.range().start_byte..root.range().end_byte];

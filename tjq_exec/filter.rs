@@ -1697,6 +1697,19 @@ mod tests {
     }
 
     #[test]
+    fn test_string_interpolation() {
+        // `"a\(e)b"` desugars to `"a" + (e|tostring) + "b"`.
+        assert_eq!(run_raw("\"x=\\(.x)\"", "{\"x\":5}"), vec![Some(json("\"x=5\""))]);
+        assert_eq!(run_raw("\"\\(1+1)\"", "null"), vec![Some(json("\"2\""))]);
+        assert_eq!(run_raw("\"\\([1,2])\"", "null"), vec![Some(json("\"[1,2]\""))]);
+        // A stream interpolation is cartesian.
+        assert_eq!(
+            run_raw("\"\\(1,2)!\"", "null"),
+            vec![Some(json("\"1!\"")), Some(json("\"2!\""))]
+        );
+    }
+
+    #[test]
     fn test_postfix_iterate() {
         // `EXPR[]` iterates over EXPR's result (`.a[]` == `.a | .[]`).
         assert_eq!(
