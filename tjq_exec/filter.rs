@@ -1266,6 +1266,8 @@ impl Filter {
                             ))]
                         }
                     }
+                    // jq's default semantics: slicing null yields null.
+                    Json::Null => vec![Ok(Json::Null)],
                     _ => vec![Err(JQError::ArrIndexForNonArray(json.clone()))],
                 }
             }
@@ -1698,6 +1700,13 @@ mod tests {
             run_raw("foreach .[] as $x (0; . + $x; . * 2)", "[1,2,3]"),
             vec![Some(json("2")), Some(json("6")), Some(json("12"))]
         );
+    }
+
+    #[test]
+    fn test_slice_null() {
+        // jq: slicing null yields null.
+        assert_eq!(run_raw(".[1:3]", "null"), vec![Some(json("null"))]);
+        assert_eq!(run_raw(".[1:3]", "[1,2,3,4,5]"), vec![Some(json("[2,3]"))]);
     }
 
     #[test]
