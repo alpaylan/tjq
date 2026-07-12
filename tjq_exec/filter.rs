@@ -1681,6 +1681,19 @@ mod tests {
     }
 
     #[test]
+    fn test_object_shorthand() {
+        // `{a}` == `{a: .a}`, `{$x}` == `{x: $x}`, `{"a"}` == `{"a": .a}`.
+        assert_eq!(
+            run_raw("{a,b}", "{\"a\":1,\"b\":2,\"c\":3}"),
+            vec![Some(json("{\"a\":1,\"b\":2}"))]
+        );
+        assert_eq!(
+            run_raw("{\"a\"}", "{\"a\":9}"),
+            vec![Some(json("{\"a\":9}"))]
+        );
+    }
+
+    #[test]
     fn test_plus() {
         let input = json("1.0");
         let f = filter("1 + 2");

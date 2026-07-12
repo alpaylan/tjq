@@ -944,8 +944,36 @@ pub(crate) fn parse_filter<'a>(
                         all_defs.extend(value_defs);
                         pairs.push((key, value));
                     }
+                    // Shorthand members: `{a}` ≡ `{a: .a}`, `{$x}` ≡ `{x: $x}`,
+                    // `{"a"}` ≡ `{"a": .a}`.
+                    "field_id" | "identifier" => {
+                        let name = &code[child.range().start_byte..child.range().end_byte];
+                        pairs.push((
+                            Cst::string(child.range(), name),
+                            Cst::object_index(child.range(), name),
+                        ));
+                    }
+                    "variable" => {
+                        let raw = &code[child.range().start_byte..child.range().end_byte];
+                        let name = raw.strip_prefix('$').unwrap_or(raw);
+                        pairs.push((
+                            Cst::string(child.range(), name),
+                            Cst::variable(child.range(), name),
+                        ));
+                    }
+                    "string" => {
+                        let raw = &code[child.range().start_byte..child.range().end_byte];
+                        let inner = raw
+                            .strip_prefix('"')
+                            .and_then(|s| s.strip_suffix('"'))
+                            .unwrap_or(raw);
+                        pairs.push((
+                            Cst::string(child.range(), inner),
+                            Cst::object_index(child.range(), inner),
+                        ));
+                    }
                     _ => {
-                        // Handle other cases if needed
+                        // Other member kinds are not yet handled.
                     }
                 }
             }
