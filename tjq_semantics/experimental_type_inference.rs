@@ -3887,6 +3887,16 @@ fn compute_shape_internal(
                             t2: out,
                         }];
                     }
+                    // not: total (negated truthiness); always a boolean. The
+                    // defs.jq `if . then false else true end` lets the solver
+                    // over-narrow to a singleton, so pin it here.
+                    "not" => {
+                        return vec![Constraint::Rel {
+                            t1: Shape::TVar(output_type),
+                            rel: Relation::Equality(Equality::Equal),
+                            t2: Shape::Bool(None),
+                        }];
+                    }
                     // keys: sorted key names for objects, indices for arrays
                     "keys" => {
                         let out = Shape::Union(
@@ -3946,8 +3956,18 @@ fn compute_shape_internal(
             }
             if let Some(filter) = filters.get(f) {
                 if let Filter::Bound(params, body) = filter {
-                    // Check if we're already computing this function (recursive call)
-                    if let Some(&recursive_output_type) = function_outputs.get(f) {
+                    // Check if we're already computing this function (recursive
+                    // call). This must be gated on `computing` — the set of
+                    // functions *currently on the call stack* — not merely on
+                    // `function_outputs.get(f)`. Two independent, non-nested
+                    // calls to the same function (e.g. `map(g) | map(h)`) both
+                    // key `function_outputs` by the name `f`; without the
+                    // `computing` gate the second call sees the first's lingering
+                    // entry and is wrongly treated as recursive, inheriting the
+                    // first call's output-type variable (a soundness bug).
+                    if let Some(&recursive_output_type) =
+                        function_outputs.get(f).filter(|_| computing.contains(f))
+                    {
                         // This is a recursive call - create a fixpoint constraint
                         // The output type of this call equals the function's output type variable
                         tracing::trace!(
@@ -4003,9 +4023,13 @@ fn compute_shape_internal(
                         )
                     };
 
-                    // Remove this function from the set of functions being computed
-                    // but keep it in function_outputs in case there are other calls
+                    // Pop this function off the call stack. Also drop its
+                    // fixpoint output-type entry: it is only meaningful while the
+                    // body is being computed (see the `computing`-gated recursion
+                    // check above). Leaving it would let a later independent call
+                    // to the same function reuse this call's output variable.
                     computing.remove(f);
+                    function_outputs.remove(f);
 
                     result
                 } else {
