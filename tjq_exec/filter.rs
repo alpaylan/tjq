@@ -65,6 +65,33 @@ pub const MAX_ALLOC_BYTES: usize = 256 * 1024 * 1024;
 /// blowup becomes a non-finding instead of an unbounded hang.
 pub const MAX_STREAM_LEN: usize = 4_000_000;
 
+thread_local! {
+    /// Set whenever the interpreter refuses a data-driven allocation
+    /// (`AllocationTooLarge`). The differential harness resets this before each
+    /// run and checks it after, so it can recognize a resource-limit artifact
+    /// even when the program's own `?`/`catch` swallowed the guard error into a
+    /// normal (empty or altered) output. Such a run is not a semantic
+    /// divergence from jq, which attempts the (astronomical) allocation instead.
+    static ALLOC_GUARD_TRIPPED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Clear the "allocation guard tripped" flag (call before an evaluation).
+pub fn reset_alloc_guard() {
+    ALLOC_GUARD_TRIPPED.with(|c| c.set(false));
+}
+
+/// Whether the interpreter's allocation guard fired since the last reset —
+/// even if a `?`/`catch` intercepted the resulting error.
+pub fn alloc_guard_tripped() -> bool {
+    ALLOC_GUARD_TRIPPED.with(|c| c.get())
+}
+
+/// Construct an `AllocationTooLarge` error and record that the guard tripped.
+fn alloc_too_large() -> JQError {
+    ALLOC_GUARD_TRIPPED.with(|c| c.set(true));
+    JQError::AllocationTooLarge
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinOp {
     Add, // +
@@ -403,7 +430,7 @@ pub(crate) fn apply_binop(l: Json, r: Json, op: BinOp) -> Result<Json, JQError> 
                     // Guard against astronomical repetition.
                     match count.checked_mul(s.len()) {
                         Some(bytes) if bytes <= MAX_ALLOC_BYTES => Ok(Json::String(s.repeat(count))),
-                        _ => Err(JQError::AllocationTooLarge),
+                        _ => Err(alloc_too_large()),
                     }
                 }
             }
@@ -544,7 +571,7 @@ impl Filter {
                         Err(e) => out.push(Err(e)),
                     }
                     if out.len() > MAX_STREAM_LEN {
-                        return vec![Err(JQError::AllocationTooLarge)];
+                        return vec![Err(alloc_too_large())];
                     }
                 }
                 out
@@ -562,7 +589,7 @@ impl Filter {
                         Err(e) => out.push(Err(e)),
                     }
                     if out.len() > MAX_STREAM_LEN {
-                        return vec![Err(JQError::AllocationTooLarge)];
+                        return vec![Err(alloc_too_large())];
                     }
                 }
                 out
@@ -571,7 +598,7 @@ impl Filter {
                 let mut out = Filter::filter(json, f1, global_definitions, variable_ctx);
                 out.extend(Filter::filter(json, f2, global_definitions, variable_ctx));
                 if out.len() > MAX_STREAM_LEN {
-                    return vec![Err(JQError::AllocationTooLarge)];
+                    return vec![Err(alloc_too_large())];
                 }
                 out
             }
@@ -673,7 +700,7 @@ impl Filter {
                     .take(MAX_STREAM_LEN + 1)
                     .collect::<Vec<_>>();
                 if results.len() > MAX_STREAM_LEN {
-                    return vec![Err(JQError::AllocationTooLarge)];
+                    return vec![Err(alloc_too_large())];
                 }
                 let (results, errs): (Vec<_>, Vec<_>) =
                     results.into_iter().partition(Result::is_ok);
@@ -746,7 +773,7 @@ impl Filter {
                         }
                     }
                     if out.len() > MAX_STREAM_LEN {
-                        return vec![Err(JQError::AllocationTooLarge)];
+                        return vec![Err(alloc_too_large())];
                     }
                 }
                 out
@@ -760,7 +787,7 @@ impl Filter {
                 // binops compound it). Guard the product size before
                 // materializing it (this check is O(1)).
                 if ls.len().saturating_mul(rs.len()) > MAX_STREAM_LEN {
-                    return vec![Err(JQError::AllocationTooLarge)];
+                    return vec![Err(alloc_too_large())];
                 }
 
                 // jq iterates the right operand in the outer loop, the left in
@@ -991,7 +1018,7 @@ impl Filter {
                         Err(e) => out.push(Err(e)),
                     }
                     if out.len() > MAX_STREAM_LEN {
-                        return vec![Err(JQError::AllocationTooLarge)];
+                        return vec![Err(alloc_too_large())];
                     }
                 }
                 out
@@ -1167,7 +1194,7 @@ impl Filter {
                         }
                         if out.len() > MAX_STREAM_LEN {
                             restore(variable_ctx);
-                            return vec![Err(JQError::AllocationTooLarge)];
+                            return vec![Err(alloc_too_large())];
                         }
                     }
                 }

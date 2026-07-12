@@ -19,7 +19,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use tjq_exec::{builtin_filters, Filter, Json};
+use tjq_exec::{alloc_guard_tripped, builtin_filters, reset_alloc_guard, Filter, Json};
 use tjq_semantics::experimental_type_inference::{
     cannot_fail, compute_shape, solve, solve_arrows, Constraint, Context, TypeOptions,
 };
@@ -456,6 +456,10 @@ fn run_tjq(
 ) -> Option<Result<Vec<Json>, String>> {
     // catch_unwind: interpreter todo!()s are findings, not aborts
     catch_unwind(AssertUnwindSafe(|| {
+        // Clear the allocation-guard flag so the caller can tell whether tjq's
+        // memory guard fired during *this* run, even if a `?`/`catch` in the
+        // program later swallowed the resulting error.
+        reset_alloc_guard();
         let mut var_ctx = HashMap::new();
         let results = Filter::filter(input, filter, builtins, &mut var_ctx);
         let mut values = vec![];
@@ -793,6 +797,14 @@ fn main() {
                     }
                     // Differential: tjq_exec must agree
                     match run_tjq(&filter, input, &builtins) {
+                        // The allocation guard fired somewhere during this run,
+                        // but the program's own `?`/`catch` turned the error into
+                        // a normal (empty or altered) output. jq attempts the
+                        // astronomical allocation instead, so any disagreement
+                        // here is a resource-limit artifact, not a semantic
+                        // divergence — skip it exactly as we skip the uncaught
+                        // guard error below.
+                        Some(Ok(_)) if alloc_guard_tripped() => {}
                         Some(Ok(tjq_outputs)) => {
                             c.diff_compared += 1;
                             let agree = tjq_outputs.len() == outputs.len()
@@ -838,8 +850,11 @@ fn main() {
                         }
                         // tjq's own memory guard (a huge string build jq
                         // completes but tjq refuses) is a resource-limit
-                        // artifact, not a semantic divergence.
-                        Some(Err(e)) if e.contains("AllocationTooLarge") => {}
+                        // artifact, not a semantic divergence — whether the
+                        // guard error propagated to the top (string match) or
+                        // tripped in a sub-expression that a `?`/`catch` turned
+                        // into some other error (the flag).
+                        Some(Err(e)) if e.contains("AllocationTooLarge") || alloc_guard_tripped() => {}
                         Some(Err(_)) => {
                             // jq succeeded, tjq_exec errored: divergence
                             c.diff_compared += 1;
