@@ -319,6 +319,55 @@ pub(crate) fn clamp_number(n: f64) -> f64 {
 
 /// jq's `+` on two values: null is the identity, numbers add, strings and
 /// arrays concatenate, objects merge (right-biased). Shared by `BinOp::Add`
+/// Build the stream of objects for `{k1:v1, …}` with jq's exact semantics: the
+/// first field is the outer loop, later fields nested inside, so completed
+/// objects are appended to `out` in order and an error (a raised key/value, or
+/// a non-string key) surfaces at its position — keeping the objects produced
+/// before it, and never hidden by a later empty field. Returns `true` if an
+/// error was appended (the caller stops), mirroring jq raising there.
+fn build_object(
+    fields: &[(Filter, Filter)],
+    json: &Json,
+    partial: Vec<(String, Json)>,
+    globals: &HashMap<String, Filter>,
+    var_ctx: &mut HashMap<String, Filter>,
+    out: &mut Vec<Result<Json, JQError>>,
+) -> bool {
+    let Some(((kf, vf), rest)) = fields.split_first() else {
+        out.push(Ok(Json::Object(partial)));
+        return out.len() > MAX_STREAM_LEN;
+    };
+    for kr in Filter::filter(json, kf, globals, var_ctx) {
+        let key = match kr {
+            Err(e) => {
+                out.push(Err(e));
+                return true;
+            }
+            Ok(Json::String(s)) => s,
+            Ok(other) => {
+                out.push(Err(JQError::NonStringObjectKey(other)));
+                return true;
+            }
+        };
+        for vr in Filter::filter(json, vf, globals, var_ctx) {
+            match vr {
+                Err(e) => {
+                    out.push(Err(e));
+                    return true;
+                }
+                Ok(v) => {
+                    let mut p = partial.clone();
+                    p.push((key.clone(), v));
+                    if build_object(rest, json, p, globals, var_ctx, out) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 /// The value a `catch` clause receives for a raised error. jq passes the
 /// error's payload — a string message for builtin errors, or the raw value
 /// for `error(v)`. We only model message strings today (there is no
@@ -636,56 +685,18 @@ impl Filter {
                 }
             }
             Filter::Object(obj) => {
-                let results: Vec<(Vec<Result<Json, JQError>>, Vec<Result<Json, JQError>>)> = obj
-                    .iter()
-                    .map(|(f1, f2)| {
-                        (
-                            Filter::filter(json, f1, global_definitions, variable_ctx),
-                            Filter::filter(json, f2, global_definitions, variable_ctx),
-                        )
-                    })
-                    .collect();
-
-                let results = results
-                    .into_iter()
-                    .map(|(keys, values)| itertools::iproduct!(keys, values).collect::<Vec<_>>())
-                    .multi_cartesian_product()
-                    .take(MAX_STREAM_LEN + 1)
-                    .collect::<Vec<_>>();
-                if results.len() > MAX_STREAM_LEN {
-                    return vec![Err(JQError::AllocationTooLarge)];
-                }
-
-                // Emit one object per combination in cartesian-product order,
-                // stopping at the first combination that errors (jq raises it
-                // there, so any valid objects produced *before* it survive —
-                // e.g. under `?`). Within a combination, scan left-to-right;
-                // a non-string key is itself an error.
-                let mut out = Vec::with_capacity(results.len());
-                'combos: for combo in results {
-                    let mut fields: Vec<(String, Json)> = Vec::with_capacity(combo.len());
-                    for (k, v) in combo {
-                        let key = match k {
-                            Err(e) => {
-                                out.push(Err(e));
-                                break 'combos;
-                            }
-                            Ok(Json::String(s)) => s,
-                            Ok(other) => {
-                                out.push(Err(JQError::NonStringObjectKey(other)));
-                                break 'combos;
-                            }
-                        };
-                        match v {
-                            Err(e) => {
-                                out.push(Err(e));
-                                break 'combos;
-                            }
-                            Ok(value) => fields.push((key, value)),
-                        }
-                    }
-                    out.push(Ok(Json::Object(fields)));
-                }
+                // jq nests fields left-to-right (first field outermost), so an
+                // error in an earlier field surfaces even when a later field is
+                // an empty stream; `build_object` matches that exactly.
+                let mut out = Vec::new();
+                build_object(
+                    obj,
+                    json,
+                    Vec::new(),
+                    global_definitions,
+                    variable_ctx,
+                    &mut out,
+                );
                 out
             }
             Filter::UnOp(un_op, f) => {
@@ -1677,6 +1688,28 @@ mod tests {
         assert_eq!(
             run_raw("foreach .[] as $x (0; . + $x; . * 2)", "[1,2,3]"),
             vec![Some(json("2")), Some(json("6")), Some(json("12"))]
+        );
+    }
+
+    #[test]
+    fn test_object_field_error_ordering() {
+        // The first field is the outer loop: an error in an earlier field
+        // surfaces even when a later field is an empty stream, and objects
+        // produced before an error survive (jq semantics).
+        assert_eq!(run_raw("{a: error, b: empty}", "null"), vec![None]);
+        assert_eq!(
+            run_raw("{a: empty, b: error}", "null"),
+            Vec::<Option<Json>>::new()
+        );
+        assert_eq!(run_raw("{a: (1,error), b: empty}", "null"), vec![None]);
+        // Objects before the error, then the error.
+        assert_eq!(
+            run_raw("{a: (1,error,2), b: (3,4)}", "null"),
+            vec![
+                Some(json("{\"a\":1,\"b\":3}")),
+                Some(json("{\"a\":1,\"b\":4}")),
+                None
+            ]
         );
     }
 
