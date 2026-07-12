@@ -439,16 +439,19 @@ there surfaced two engine facts worth recording:
 
 **First speed numbers** (`examples/bytebench`, 2000 reps over `[0..1000]`).
 The VM is **5–7× faster than the tree interpreter** (e.g. `.[] | (.*2)+1`:
-155 ms vs 1066 ms), which alone justifies the engine. Against jq 1.7 —
-running the work 2000× inside one jq process to amortize startup — the VM is
-**~3× faster on simple maps** (`[.[]|.+1]`: ~117 ms vs jq's ~380 ms) and
-comparable on object construction. Caveats: the harnesses differ; tjq uses
-`f64` where jq 1.7 uses the slower decNumber library (so part of the gap is
-representation, not engine); and the VM numbers even include a full input
-clone per rep. The unoptimized part is the fork mechanism — every choice
-point snapshots the whole operand stack — which is the first target for the
-type-directed-compilation work (skip type checks and forks the inferred type
-proves unnecessary).
+155 ms vs 1066 ms), which alone justifies the engine.
+
+> **Correction (see `bench/`).** An earlier draft here quoted a flat "~3×
+> faster than jq". A rigorous, parity-checked harness (`bench/run.sh` — every
+> tool a subprocess on the same 1M-element file, output md5-verified identical)
+> tells a more careful story: tjq is fastest on the tested core programs, but
+> **most of jq 1.7's disadvantage is decNumber number-*parsing*, not
+> execution** (a `.` identity baseline is jq 340 ms vs 70–120 ms for the
+> others). Subtracting that baseline, tjq's *compute* leads jaq/gojq/jq by
+> ~1.6–2×, not 3×. And tjq's VM is leaner partly because it compiles only a
+> core subset — a real caveat. See `bench/README.md` for the full table and
+> honest reading. The unoptimized part remains the fork mechanism (whole-stack
+> snapshot per choice point), the first target for type-directed compilation.
 
 ## Round 11: a BDD representation for the type algebra
 
