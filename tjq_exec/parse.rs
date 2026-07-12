@@ -173,8 +173,15 @@ impl From<&Cst<'_>> for Filter {
                     Filter::ArrayIndex(Box::new((&cst.children[1]).into()))
                 }
                 FilterKind::ArrayIterator => {
+                    // `EXPR[]` iterates over EXPR's result: `EXPR | .[]`. For a
+                    // bare `.[]` the lhs is `.`, so keep it as a plain iterator.
                     assert!(cst.children.len() == 1);
-                    Filter::ArrayIterator
+                    let lhs: Filter = (&cst.children[0]).into();
+                    if matches!(lhs, Filter::Dot) {
+                        Filter::ArrayIterator
+                    } else {
+                        Filter::Pipe(Box::new(lhs), Box::new(Filter::ArrayIterator))
+                    }
                 }
                 FilterKind::Null => {
                     assert!(cst.children.is_empty());

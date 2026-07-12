@@ -1697,6 +1697,24 @@ mod tests {
     }
 
     #[test]
+    fn test_postfix_iterate() {
+        // `EXPR[]` iterates over EXPR's result (`.a[]` == `.a | .[]`).
+        assert_eq!(
+            run_raw(".a[]", "{\"a\":[1,2,3]}"),
+            vec![Some(json("1")), Some(json("2")), Some(json("3"))]
+        );
+        assert_eq!(
+            run_raw("[5,5][]", "null"),
+            vec![Some(json("5")), Some(json("5"))]
+        );
+        // Bare `.[]` still iterates the input.
+        assert_eq!(
+            run_raw(".[]", "[7,8]"),
+            vec![Some(json("7")), Some(json("8"))]
+        );
+    }
+
+    #[test]
     fn test_foreach_source_error_incremental() {
         // The source is processed incrementally: `.y` on a number errors, but
         // the earlier `null` still emits its extract before the error.
