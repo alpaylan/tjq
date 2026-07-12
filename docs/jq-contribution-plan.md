@@ -115,12 +115,14 @@ self-contained and the BDD gives a cross-check for B1.
 
 ### Progress (2026-07)
 
-- **B1 largely done.** `Value_negNNF_disjoint` and
-  `ValueShape_NotValueShape_disjoint` are now a `mutual` well-founded recursion
-  on the `Shape`/`Ty` size. `Value_negNNF_disjoint` is **fully proven**; the
-  shape lemma is proven for all cases except the two list-element recursions
-  (`tuple`/`object` `wrong_elem`), where only the *termination* obligation
-  (`sizeOf` of a `List.zip`/`lookup` element) is unmet — the logic is identical
-  to the closed `array` case. Semantics.lean sorries 6 → 4. Finishing those two
-  termination goals unblocks B2 (`TyLE.sound`/`ShapeLE.sound`).
+- **B1 DONE.** `Value_negNNF_disjoint` and `ValueShape_NotValueShape_disjoint`
+  are a `mutual` well-founded recursion on the `Shape`/`Ty` size, now **fully
+  proven (0 `sorry`)**. The two list-element recursions (`tuple`/`object`
+  `wrong_elem`) that previously blocked on termination are discharged in
+  `decreasing_by`: `List.of_mem_zip` / membership gives `p.fst ∈ ts` /
+  `(k,t) ∈ kvs`, `List.sizeOf_lt_of_mem` gives the element is smaller, and the
+  `Shape.tuple/object.sizeOf_spec` + `Prod.mk.sizeOf_spec` unfolds let `omega`
+  close `sizeOf elem < sizeOf shape`. Semantics.lean sorries 6 → 2 (the two
+  remaining are B2: `TyLE.sound`/`ShapeLE.sound`). Full `lake build` is green.
+- **B1 unblocks B2** (subtyping soundness) — next up.
 - The Lean source is now versioned (previously `papers/` was gitignored).

@@ -264,12 +264,10 @@ theorem ValueShape_NotValueShape_disjoint : ∀ {j : Json} {s : Shape},
         | tuple_not_arr h => exact (h xs) rfl
         | tuple_too_short h_short => omega
         | @tuple_wrong_elem _ _ p h_pmem h_pneg =>
-            -- Logic is identical to array/object: `p.1 ∈ ts` (via
-            -- `List.of_mem_zip h_pmem`) and `Value_negNNF_disjoint` on the
-            -- element type. Only the well-founded *termination* goal
-            -- (`sizeOf p.1 < sizeOf (tuple ts)` through `List.zip`) is not yet
-            -- discharged; left as the single remaining sorry.
-            sorry
+            -- `p.1 ∈ ts` (via `List.of_mem_zip`) makes the recursion on the
+            -- element type `p.1` well-founded: `sizeOf p.1 < sizeOf ts <
+            -- sizeOf (tuple ts)` (discharged in `decreasing_by`).
+            exact Value_negNNF_disjoint (h_elem p h_pmem) h_pneg
   | _, .object kvs, hv, hn => by
       cases hv with
       | @object kvObj _ h_match h_present =>
@@ -280,12 +278,27 @@ theorem ValueShape_NotValueShape_disjoint : ∀ {j : Json} {s : Shape},
             rw [h_lookup] at h
             simp at h
         | @object_wrong_value _ _ k t v h_kt_in h_lookup h_neg =>
-            -- As above: `Value v t` (from `h_match`) and `Value v (negNNF t)`
-            -- are disjoint. Only the termination goal through `List.lookup`
-            -- membership is not yet discharged; left as sorry.
-            sorry
+            -- `(k, t) ∈ kvs` (h_kt_in) makes the recursion on the value type
+            -- `t` well-founded: `sizeOf t < sizeOf (k, t) ≤ sizeOf kvs <
+            -- sizeOf (object kvs)` (discharged in `decreasing_by`).
+            exact Value_negNNF_disjoint (h_match k t h_kt_in v h_lookup) h_neg
 termination_by _ s => sizeOf s
-decreasing_by all_goals decreasing_tactic
+decreasing_by
+  -- Atomic/array recursions are structural (`decreasing_tactic`). The two
+  -- list-element recursions reach the element type through `List.zip`
+  -- (tuple) / membership (object), so we discharge them explicitly: the
+  -- element type is a member of the shape's list, hence strictly smaller.
+  all_goals
+    first
+      | decreasing_tactic
+      | -- tuple: `sizeOf p.fst < sizeOf (tuple ts)` via `p.fst ∈ ts`
+        (have h := List.sizeOf_lt_of_mem (List.of_mem_zip h_pmem).1
+         simp only [Shape.tuple.sizeOf_spec]
+         omega)
+      | -- object: `sizeOf t < sizeOf (object kvs)` via `(k, t) ∈ kvs`
+        (have h := List.sizeOf_lt_of_mem h_kt_in
+         simp only [Shape.object.sizeOf_spec, Prod.mk.sizeOf_spec] at h ⊢
+         omega)
 
 /-- Companion lemma: a value can't simultaneously inhabit `t` and its
     NNF negation `negNNF t`. -/
