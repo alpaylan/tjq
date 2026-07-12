@@ -3246,6 +3246,20 @@ fn compute_shape_internal(
                     (cs, output_types)
                 });
 
+            // A const element body that always errors (e.g. `[.[] | (-null)]`
+            // = `map(-null)`) contributes `Constraint::False`. That must not
+            // poison the construction: `[f]` where `f` iterates a possibly-empty
+            // source (`.[]`, `empty`, `select`) yields `[]` when the source is
+            // empty — the body never runs — so the construction can succeed even
+            // when `f` errors on every element. The array type `[elem]` already
+            // includes `[]`, so keeping it and dropping the body's `False` is
+            // sound (inputs on which the body always runs and errors carry no
+            // output, so tin stays sound); leaving the `False` in lets an
+            // enclosing `if/then/else` wrongly conclude the branch is impossible
+            // and drop it, unsoundly narrowing `tout` (a null output escaping an
+            // array-typed branch).
+            cs.retain(|c| !matches!(c, Constraint::False));
+
             // `[f]` collects f's whole output stream. The tuple type is only
             // valid when every element filter produces exactly one value;
             // a stream-valued element (`[.[]]`, `[(1, 2)]`) collects an
