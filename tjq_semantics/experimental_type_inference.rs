@@ -3798,6 +3798,21 @@ fn compute_shape_internal(
                     cs
                 }
                 BinOp::And | BinOp::Or => {
+                    // Short-circuit soundness. `or`/`and` yield a bool whenever
+                    // they *succeed*, and the output type never depends on the
+                    // operand types. An operand may also not be evaluated at all
+                    // (`or` skips the right when the left is truthy, `and` when
+                    // the left is falsy). So a const operand that always errors
+                    // — e.g. `-null` in `length or (-null)` — must NOT inject a
+                    // hard `False` (its whole constraint set) into the system:
+                    // that `False` poisons the branch, and inside an
+                    // `if/then/else` it unsoundly drops this branch's `-> bool`
+                    // arrow, leaving only the other branch's codomain (the
+                    // depth-7 arrow-soundness class). Dropping these `False`s can
+                    // only widen the input type (inputs on which the expression
+                    // in fact always errors carry no output, so tin stays sound),
+                    // never let an output escape.
+                    cs.retain(|c| !matches!(c, Constraint::False));
                     // jq boolifies both operands (ANY type is accepted), so the
                     // operands must NOT be constrained to bool — doing so made
                     // `. or .` wrongly demand a bool input and let the input
