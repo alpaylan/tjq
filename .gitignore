@@ -1,3 +1,7 @@
 /target
-/papers
+# Ignore the papers directory (large PDFs) but version the Lean formalization
+# source (not its .lake build artifacts).
+/papers/*
+!/papers/lean
+/papers/lean/.lake
 /tjq_ext/node_modules
