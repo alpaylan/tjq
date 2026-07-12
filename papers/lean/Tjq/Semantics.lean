@@ -209,6 +209,52 @@ theorem TyLE.union_elim_sound {t₁ t₂ t : Ty}
   | union_l h => exact h₁ j h
   | union_r h => exact h₂ j h
 
+-- ─────── ShapeLE structural witnesses (proved) ───────
+
+/-- `ShapeLE.refl` is sound. -/
+theorem ShapeLE.refl_sound (s : Shape) : ShapeLE_sem s s :=
+  fun _ h => h
+
+/-- `ShapeLE.trans` is sound. -/
+theorem ShapeLE.trans_sound {s₁ s₂ s₃ : Shape}
+    (h₁ : ShapeLE_sem s₁ s₂) (h₂ : ShapeLE_sem s₂ s₃) :
+    ShapeLE_sem s₁ s₃ :=
+  fun j hj => h₂ j (h₁ j hj)
+
+/-- `ShapeLE.top` is sound: every value inhabits `Sh ⊤`. -/
+theorem ShapeLE.top_sound (s : Shape) : ShapeLE_sem s .top :=
+  fun _ _ => Value.sh ValueShape.top
+
+/-- A `some`-refined boolean value also inhabits the unrefined `boo none`. -/
+theorem ShapeLE.boo_some_to_none_sound {b : Bool} :
+    ShapeLE_sem (.boo (some b)) (.boo none) := by
+  intro j h
+  cases h with | sh hs => cases hs with | boo_some => exact Value.sh ValueShape.boo_none
+
+/-- A `some`-refined numeric value also inhabits the unrefined `num none`. -/
+theorem ShapeLE.num_some_to_none_sound {n : Int} :
+    ShapeLE_sem (.num (some n)) (.num none) := by
+  intro j h
+  cases h with | sh hs => cases hs with | num_some => exact Value.sh ValueShape.num_none
+
+/-- A `some`-refined string value also inhabits the unrefined `str none`. -/
+theorem ShapeLE.str_some_to_none_sound {s : String} :
+    ShapeLE_sem (.str (some s)) (.str none) := by
+  intro j h
+  cases h with | sh hs => cases hs with | str_some => exact Value.sh ValueShape.str_none
+
+/-- Every object inhabits the empty open record `{}` — its (vacuous) key
+    obligations hold trivially. -/
+theorem ShapeLE.object_nil_sound {obj : List (String × Ty)} :
+    ShapeLE_sem (.object obj) (.object []) := by
+  intro j h
+  cases h with
+  | sh hs =>
+      cases hs with
+      | @object kvObj _ _ _ =>
+          refine Value.sh (ValueShape.object ?_ ?_) <;>
+            intro k t' hkt <;> simp at hkt
+
 /-! ## Disjointness lemmas
 
     `ValueShape` and `NotValueShape` should be mutually exclusive. The
