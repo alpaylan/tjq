@@ -369,11 +369,13 @@ fn build_object(
 }
 
 /// The value a `catch` clause receives for a raised error. jq passes the
-/// error's payload — a string message for builtin errors, or the raw value
-/// for `error(v)`. We only model message strings today (there is no
-/// value-carrying `error(v)` yet), so this yields the message as a string.
+/// error's payload — the raw value for a user-raised `error`/`error(v)`, or a
+/// string message for builtin (type) errors.
 fn jqerror_to_json(e: &JQError) -> Json {
-    Json::String(e.to_string())
+    match e {
+        JQError::UserError(v) => v.clone(),
+        other => Json::String(other.to_string()),
+    }
 }
 
 /// Apply a binary operator to a single (left, right) value pair. Shared by the
@@ -781,7 +783,9 @@ impl Filter {
                     .collect::<Vec<_>>()
             }
             Filter::Empty => vec![],
-            Filter::Error => vec![Err(JQError::Unknown)],
+            // `error` raises an error carrying the input value; `error(v)` is
+            // `v | error` (defs.jq), so this covers both.
+            Filter::Error => vec![Err(JQError::UserError(json.clone()))],
             Filter::Call(name, filters_) => match filters_ {
                 Some(args) => {
                     tracing::debug!("Calling filter: {name} with args: {:?}", args);
@@ -1693,6 +1697,24 @@ mod tests {
         assert_eq!(
             run_raw("foreach .[] as $x (0; . + $x; . * 2)", "[1,2,3]"),
             vec![Some(json("2")), Some(json("6")), Some(json("12"))]
+        );
+    }
+
+    #[test]
+    fn test_error_carries_value() {
+        // `error` raises an error carrying the input; `catch` receives it.
+        assert_eq!(
+            run_raw("try error catch .", "\"hello\""),
+            vec![Some(json("\"hello\""))]
+        );
+        assert_eq!(
+            run_raw("try error catch .", "{\"a\":1}"),
+            vec![Some(json("{\"a\":1}"))]
+        );
+        // `error(v)` == `v | error`.
+        assert_eq!(
+            run_raw("try error(\"boom\") catch .", "null"),
+            vec![Some(json("\"boom\""))]
         );
     }
 

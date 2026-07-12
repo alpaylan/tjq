@@ -777,7 +777,8 @@ pub fn run(code: &[Inst], input: Json) -> Vec<Result<Json, JQError>> {
                 }
             }
             Inst::Error => {
-                out.push(Err(JQError::Unknown));
+                let v = stack.last().cloned().unwrap_or(Json::Null);
+                out.push(Err(JQError::UserError(v)));
                 if !backtrack(&mut forks, &mut stack, &mut pc) {
                     return out;
                 }

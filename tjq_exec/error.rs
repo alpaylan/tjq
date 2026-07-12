@@ -18,6 +18,9 @@ pub enum JQError {
     /// A data-driven allocation (e.g. string repetition with an extreme
     /// count) would exceed the interpreter's memory guard.
     AllocationTooLarge,
+    /// A user-raised error (`error`/`error(v)`) carrying its value, which a
+    /// `catch` clause receives verbatim (jq: bare `error` uses the input).
+    UserError(Json),
     Unknown,
 }
 
@@ -69,6 +72,8 @@ impl Display for JQError {
             JQError::AllocationTooLarge => {
                 write!(f, "allocation exceeds the interpreter's memory guard")
             }
+            JQError::UserError(Json::String(s)) => write!(f, "{}", s),
+            JQError::UserError(v) => write!(f, "{} (not a string)", v.debug()),
             JQError::Unknown => write!(f, "Unknown error"),
             JQError::FilterNotDefined(name, args) => {
                 write!(f, "{}/{} is not defined", name, args)
