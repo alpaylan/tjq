@@ -15,8 +15,11 @@ on:
   pull_request:
     branches: ["main"]
   schedule:
-    # Nightly large-scale run at 04:17 UTC
-    - cron: "17 4 * * *"
+    # Every 6 hours: 4 runs/day x 10 shards x 2000 programs x 600 inputs =
+    # ~48M input-checks/day, each run on a fresh seed range (SEED_BASE=run_id).
+    # NOTE: GitHub only fires `schedule` from the DEFAULT branch, so this stays
+    # dormant until the workflow lands on `main`.
+    - cron: "17 */6 * * *"
   workflow_dispatch:
     inputs:
       iters:
