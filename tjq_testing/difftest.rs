@@ -624,6 +624,12 @@ fn main() {
     // Inputs are cheap (inference is amortized over them) and evaluated in
     // batched jq processes, so exercise each program with tens of thousands.
     let inputs_per_program: usize = get_arg("--inputs", "20000").parse().expect("--inputs");
+    // Optional wall-clock budget (seconds). 0 = run all `--iters`. A shard that
+    // draws a few pathologically slow programs would otherwise blow past the
+    // CI job's 6-hour hard limit and get *killed* (red, no clean summary). With
+    // a budget it stops generating new programs once the time is up and exits
+    // normally, reporting whatever it found — coverage self-adjusts to the box.
+    let max_seconds: u64 = get_arg("--max-seconds", "0").parse().expect("--max-seconds");
     let findings_path = get_arg("--findings", "target/difftest-findings.jsonl");
     let trace = std::env::var("DIFFTEST_TRACE").is_ok();
     let trace_path = format!("{findings_path}.trace");
@@ -644,7 +650,17 @@ fn main() {
         let _ = writeln!(file, "{line}");
     };
 
+    let campaign_start = Instant::now();
     for i in 0..iters {
+        // Wall-clock budget: stop launching new programs once it is spent, so
+        // the shard finishes cleanly instead of being killed at the job limit.
+        if max_seconds > 0 && campaign_start.elapsed().as_secs() >= max_seconds {
+            println!(
+                "time budget {max_seconds}s reached after {} programs; stopping early",
+                c.programs
+            );
+            break;
+        }
         let case_seed = seed.wrapping_add(i as u64);
         let mut rng = Rng::new(case_seed);
         let filter = gen_filter(&mut rng, depth);

@@ -46,6 +46,12 @@ env:
   INPUTS: ${{ github.event_name == 'pull_request' && '1000' || (github.event.inputs.inputs || '600') }}
   # Fresh seed range each run so the campaign keeps exploring; overridable.
   SEED_BASE: ${{ github.event.inputs.seed_base || github.run_id }}
+  # Per-shard wall-clock budget (seconds). Deep shards occasionally draw
+  # pathologically slow programs that pushed whole runs past GitHub's 6h job
+  # limit, killing them before findings could report. difftest now stops
+  # launching new programs once this is spent and exits cleanly, so coverage
+  # self-adjusts and every shard finishes green (unless it finds a real bug).
+  MAX_SECONDS: "5400"
   # Leave the culprit program on disk if a shard hits an uncatchable abort.
   DIFFTEST_TRACE: "1"
 
@@ -76,6 +82,11 @@ jobs:
         run: cargo build --release -p tjq_testing --bin difftest
 
       - name: Run differential fuzzing shard ${{ matrix.shard }}
+        # Hard backstop just above the in-process budget: if a single program
+        # stalls past the budget check (the check only fires between programs),
+        # the step still ends well short of GitHub's 6h job limit, and the
+        # upload step below (if: always()) still runs.
+        timeout-minutes: 100
         run: |
           SHARD=${{ matrix.shard }}
           SEED=$(( SEED_BASE % 1000000 * 100000000 + SHARD * 10000000 ))
@@ -88,9 +99,10 @@ jobs:
             8)       DEPTH=6 ;;
             9)       DEPTH=7 ;;
           esac
-          echo "shard=$SHARD seed=$SEED iters=$ITERS inputs=$INPUTS depth=$DEPTH"
+          echo "shard=$SHARD seed=$SEED iters=$ITERS inputs=$INPUTS depth=$DEPTH budget=${MAX_SECONDS}s"
           ./target/release/difftest \
             --iters "$ITERS" --seed "$SEED" --depth "$DEPTH" --inputs "$INPUTS" \
+            --max-seconds "$MAX_SECONDS" \
             --findings "target/findings-shard-$SHARD.jsonl"
 
       - name: Upload findings and abort trace
