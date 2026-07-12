@@ -1108,20 +1108,17 @@ impl Filter {
                 // Like reduce, but emits at each step: for each generated $var,
                 // the update stream advances the state, and for every update
                 // output the extract (identity if omitted) is emitted. The
-                // state threads as the last update output.
-                let mut gen_items = Vec::new();
-                for r in Filter::filter(json, gen, global_definitions, variable_ctx) {
-                    match r {
-                        Ok(j) => gen_items.push(j),
-                        Err(e) => return vec![Err(e)],
-                    }
-                }
+                // state threads as the last update output. The source is
+                // processed *incrementally* — a source error surfaces after
+                // the earlier items' emissions (jq raises it there), so it must
+                // not be collected up front.
                 let init_results = Filter::filter(json, init, global_definitions, variable_ctx);
                 let mut acc = match init_results.into_iter().find(|r| r.is_ok()) {
                     Some(Ok(v)) => v,
                     Some(Err(e)) => return vec![Err(e)],
                     None => return vec![Err(JQError::Unknown)],
                 };
+                let gen_results = Filter::filter(json, gen, global_definitions, variable_ctx);
 
                 let old_binding = variable_ctx.get(var).cloned();
                 let restore = |ctx: &mut HashMap<String, Filter>| match &old_binding {
@@ -1134,7 +1131,15 @@ impl Filter {
                 };
 
                 let mut out = Vec::new();
-                for item in gen_items {
+                for src in gen_results {
+                    let item = match src {
+                        Err(e) => {
+                            restore(variable_ctx);
+                            out.push(Err(e));
+                            return out;
+                        }
+                        Ok(j) => j,
+                    };
                     variable_ctx.insert(var.clone(), Filter::from_json_const(&item));
                     for r in Filter::filter(&acc, update, global_definitions, variable_ctx) {
                         match r {
@@ -1688,6 +1693,16 @@ mod tests {
         assert_eq!(
             run_raw("foreach .[] as $x (0; . + $x; . * 2)", "[1,2,3]"),
             vec![Some(json("2")), Some(json("6")), Some(json("12"))]
+        );
+    }
+
+    #[test]
+    fn test_foreach_source_error_incremental() {
+        // The source is processed incrementally: `.y` on a number errors, but
+        // the earlier `null` still emits its extract before the error.
+        assert_eq!(
+            run_raw("foreach (null, .y) as $y (-2; $y; length)", "0"),
+            vec![Some(json("0")), None]
         );
     }
 
