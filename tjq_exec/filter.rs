@@ -103,6 +103,39 @@ fn alloc_too_large() -> JQError {
     JQError::AllocationTooLarge
 }
 
+/// Cap on interpreter recursion depth. A non-terminating recursive definition
+/// (`def rec: f, rec;`, `repeat`, unbounded `recurse`) would otherwise
+/// overflow the native stack (an uncatchable abort); exceeding the cap yields
+/// a normal `JQError` that `try`/`?`/`//` can handle. Well below the native
+/// frame budget for the interpreter's large per-call frame.
+const MAX_RECURSION_DEPTH: usize = 900;
+
+thread_local! {
+    static RECURSION_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// RAII guard: bump the recursion counter on entry, restore on drop.
+/// `enter()` is `None` once the cap is hit.
+struct DepthGuard;
+impl DepthGuard {
+    fn enter() -> Option<Self> {
+        RECURSION_DEPTH.with(|d| {
+            let cur = d.get();
+            if cur >= MAX_RECURSION_DEPTH {
+                None
+            } else {
+                d.set(cur + 1);
+                Some(DepthGuard)
+            }
+        })
+    }
+}
+impl Drop for DepthGuard {
+    fn drop(&mut self) {
+        RECURSION_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
 /// Apply a 1-argument native string/collection builtin to `input` with the
 /// already-evaluated argument value `arg`. These are jq natives (no jq-level
 /// definition). Error conditions match jq (only *whether* it errors matters
@@ -985,6 +1018,11 @@ impl Filter {
     ) -> Vec<Result<Json, JQError>> {
         tracing::debug!("Filtering with: {}", filter);
         tracing::trace!("JSON: {}", json);
+        // Bound recursion so a non-terminating program errors instead of
+        // overflowing the stack. Guard held for this call's lifetime.
+        let Some(_depth_guard) = DepthGuard::enter() else {
+            return vec![Err(JQError::AllocationTooLarge)];
+        };
         match filter {
             Filter::Dot => vec![Ok(json.clone())],
             // `EXP as $pat | BODY`: for each output of EXP, bind $pat and

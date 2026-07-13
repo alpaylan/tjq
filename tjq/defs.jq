@@ -78,6 +78,7 @@ def tostring: "\(.)";
 def range(from; to): range(from; to; 1);
 def range(to): range(0; to);
 def repeat(f): def rec: f, rec; rec;
+def recurse: recurse(.[]?);
 def recurse(f): def rec: ., (f | rec); rec;
 # todo(optional field access) def recurse: recurse(.[]?);
 def recurse(f; cond): recurse(f | select(cond));
