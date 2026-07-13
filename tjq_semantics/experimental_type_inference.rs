@@ -3043,6 +3043,13 @@ fn compute_shape_internal(
 
             cs
         }
+        Filter::Assign(_, _, _) => {
+            // Update-assignments (`= |= += …`) return a modified copy of the
+            // input. Leaving the output type unconstrained (a free tvar) keeps
+            // `tout` vacuous, so the soundness gate skips these rather than
+            // making an unsound claim. (The fuzzer doesn't generate them.)
+            vec![]
+        }
         Filter::Alternative(f1, f2) => {
             // `f // g` emits f's truthy outputs, else g's outputs — both fed
             // the same input. The value type is soundly over-approximated by

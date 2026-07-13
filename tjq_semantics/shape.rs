@@ -869,9 +869,10 @@ impl Shape {
     ) -> Vec<Shape> {
         match f {
             Filter::Dot => shapes,
-            // The `//` operator postdates this (deprecated) shape engine; the
-            // constraint solver handles it. See tjq-inference-migration.
+            // `//` and update-assignments postdate this (deprecated) shape
+            // engine; the constraint solver handles them.
             Filter::Alternative(_, _) => todo!("`//` unsupported in the old shape engine"),
+            Filter::Assign(_, _, _) => todo!("assignment unsupported in the old shape engine"),
             Filter::Pipe(f1, f2) => {
                 let shapes = Shape::build_shape(f1, shapes, ctx, filters);
                 Shape::build_shape(f2, shapes, ctx, filters)

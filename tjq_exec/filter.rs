@@ -45,7 +45,17 @@ pub enum Filter {
     SliceExpression(Option<Box<Filter>>, Option<Box<Filter>>), // .[start:end], .[start:], .[:end]
     TryCatch(Box<Filter>, Option<Box<Filter>>),                // try <f> [catch <g>]; `f?` is try <f>
     Alternative(Box<Filter>, Box<Filter>),                     // <f> // <g>
+    Assign(Box<Filter>, AssignOp, Box<Filter>),                // <path> <op>= <f>
     Hole, // Placeholder for a missing value in the AST
+}
+
+/// The update-assignment operators. `path <op> value`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssignOp {
+    Set,          // =
+    Update,       // |=
+    Arith(BinOp), // += -= *= /= %=
+    Alt,          // //=
 }
 
 pub fn builtin_filters() -> HashMap<String, Filter> {
@@ -192,6 +202,19 @@ impl Display for Filter {
             Filter::Dot => write!(f, "."),
             Filter::Pipe(f1, f2) => write!(f, "{} | {}", f1, f2),
             Filter::Alternative(f1, f2) => write!(f, "{} // {}", f1, f2),
+            Filter::Assign(l, op, r) => {
+                let s = match op {
+                    AssignOp::Set => "=",
+                    AssignOp::Update => "|=",
+                    AssignOp::Alt => "//=",
+                    AssignOp::Arith(BinOp::Add) => "+=",
+                    AssignOp::Arith(BinOp::Sub) => "-=",
+                    AssignOp::Arith(BinOp::Mul) => "*=",
+                    AssignOp::Arith(BinOp::Div) => "/=",
+                    AssignOp::Arith(_) => "%=",
+                };
+                write!(f, "{} {} {}", l, s, r)
+            }
             Filter::Comma(f1, f2) => write!(f, "{}, {}", f1, f2),
             Filter::ObjIndex(s) => write!(f, ".{}", s),
             Filter::ArrayIndex(i) => write!(f, ".[{}]", i),
@@ -649,6 +672,11 @@ fn json_setpath(cur: Json, path: &[Json], val: Json) -> Result<Json, JQError> {
             if idx < 0.0 {
                 return Err(JQError::InvalidArrayIndex(Json::Array(arr), key.clone()));
             }
+            // jq refuses to grow an array to an astronomical index ("Array
+            // index too large") rather than allocate; guard the null-padding.
+            if idx >= MAX_STREAM_LEN as f64 {
+                return Err(alloc_too_large());
+            }
             let idx = idx as usize;
             while arr.len() <= idx {
                 arr.push(Json::Null);
@@ -866,6 +894,30 @@ fn eval_paths(
             .into_iter()
             .filter(|r| r.is_ok())
             .collect(),
+        Filter::Alternative(a, b) => {
+            // `path(a // b)`: paths of `a` whose value is truthy; if there are
+            // none, the paths of `b` (mirrors the value-level `//`).
+            let mut out = vec![];
+            let mut any_truthy = false;
+            for r in eval_paths(cur, a, prefix.clone(), globals, var_ctx) {
+                match r {
+                    Err(e) => {
+                        out.push(Err(e));
+                        return out;
+                    }
+                    Ok((p, v)) => {
+                        if v.boolify() {
+                            any_truthy = true;
+                            out.push(Ok((p, v)));
+                        }
+                    }
+                }
+            }
+            if !any_truthy {
+                out.extend(eval_paths(cur, b, prefix, globals, var_ctx));
+            }
+            out
+        }
         Filter::Empty => vec![],
         Filter::Call(name, args) => match (name.as_str(), args) {
             ("select", Some(a)) if a.len() == 1 => {
@@ -1590,6 +1642,144 @@ impl Filter {
                 }
                 out
             }
+            Filter::Assign(lhs, op, rhs) => {
+                // Path list is computed once on the input; updates fold left.
+                let paths = eval_paths(json, lhs, vec![], global_definitions, variable_ctx);
+                // Extract the paths (propagating any path-expression error).
+                let mut plist: Vec<Vec<Json>> = Vec::with_capacity(paths.len());
+                for pr in paths {
+                    match pr {
+                        Ok((p, _)) => plist.push(p),
+                        Err(e) => return vec![Err(e)],
+                    }
+                }
+                match op {
+                    AssignOp::Set => {
+                        // `l = r`: r is evaluated on the ORIGINAL input; one
+                        // output per r-value, each setting every path to it.
+                        let mut out = vec![];
+                        'rv: for rv in Filter::filter(json, rhs, global_definitions, variable_ctx)
+                        {
+                            let v = match rv {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    out.push(Err(e));
+                                    continue;
+                                }
+                            };
+                            let mut cur = json.clone();
+                            for p in &plist {
+                                match json_setpath(cur, p, v.clone()) {
+                                    Ok(nc) => cur = nc,
+                                    Err(e) => {
+                                        out.push(Err(e));
+                                        continue 'rv;
+                                    }
+                                }
+                            }
+                            out.push(Ok(cur));
+                        }
+                        out
+                    }
+                    AssignOp::Update => {
+                        // `l |= f`: at each path, replace by the FIRST output of
+                        // `getpath | f`; if f yields nothing, DELETE the path.
+                        let mut cur = json.clone();
+                        for p in &plist {
+                            let pv = match json_getpath(&cur, p) {
+                                Ok(v) => v,
+                                Err(e) => return vec![Err(e)],
+                            };
+                            let mut results =
+                                Filter::filter(&pv, rhs, global_definitions, variable_ctx)
+                                    .into_iter();
+                            match results.next() {
+                                Some(Ok(nv)) => match json_setpath(cur, p, nv) {
+                                    Ok(nc) => cur = nc,
+                                    Err(e) => return vec![Err(e)],
+                                },
+                                Some(Err(e)) => return vec![Err(e)],
+                                None => match json_delpath(cur, p) {
+                                    Ok(nc) => cur = nc,
+                                    Err(e) => return vec![Err(e)],
+                                },
+                            }
+                        }
+                        vec![Ok(cur)]
+                    }
+                    AssignOp::Arith(binop) => {
+                        // `l op= r`: getpath(p) `op` (r on the ORIGINAL, first
+                        // value); r empty ⇒ delete (jq: `. op empty` = empty).
+                        let mut rvals =
+                            Filter::filter(json, rhs, global_definitions, variable_ctx).into_iter();
+                        let rv = match rvals.next() {
+                            Some(Ok(v)) => Some(v),
+                            Some(Err(e)) => return vec![Err(e)],
+                            None => None,
+                        };
+                        let mut cur = json.clone();
+                        for p in &plist {
+                            match &rv {
+                                None => match json_delpath(cur, p) {
+                                    Ok(nc) => cur = nc,
+                                    Err(e) => return vec![Err(e)],
+                                },
+                                Some(rv) => {
+                                    let pv = match json_getpath(&cur, p) {
+                                        Ok(v) => v,
+                                        Err(e) => return vec![Err(e)],
+                                    };
+                                    match apply_binop(pv, rv.clone(), *binop) {
+                                        Ok(nv) => match json_setpath(cur, p, nv) {
+                                            Ok(nc) => cur = nc,
+                                            Err(e) => return vec![Err(e)],
+                                        },
+                                        Err(e) => return vec![Err(e)],
+                                    }
+                                }
+                            }
+                        }
+                        vec![Ok(cur)]
+                    }
+                    AssignOp::Alt => {
+                        // `l //= r`: keep getpath(p) if truthy, else the first
+                        // r-value (on ORIGINAL); if falsy and r empty, delete.
+                        let mut cur = json.clone();
+                        let mut rv_cache: Option<Option<Json>> = None;
+                        for p in &plist {
+                            let pv = match json_getpath(&cur, p) {
+                                Ok(v) => v,
+                                Err(e) => return vec![Err(e)],
+                            };
+                            if pv.boolify() {
+                                continue; // already truthy: unchanged
+                            }
+                            // Evaluate r (once) on the original input.
+                            if rv_cache.is_none() {
+                                let mut it =
+                                    Filter::filter(json, rhs, global_definitions, variable_ctx)
+                                        .into_iter();
+                                rv_cache = Some(match it.next() {
+                                    Some(Ok(v)) => Some(v),
+                                    Some(Err(e)) => return vec![Err(e)],
+                                    None => None,
+                                });
+                            }
+                            match rv_cache.as_ref().unwrap() {
+                                Some(rv) => match json_setpath(cur, p, rv.clone()) {
+                                    Ok(nc) => cur = nc,
+                                    Err(e) => return vec![Err(e)],
+                                },
+                                None => match json_delpath(cur, p) {
+                                    Ok(nc) => cur = nc,
+                                    Err(e) => return vec![Err(e)],
+                                },
+                            }
+                        }
+                        vec![Ok(cur)]
+                    }
+                }
+            }
             Filter::Bound(items, filter) => {
                 // for item in items {
                 //     todo!()
@@ -1889,6 +2079,11 @@ impl Filter {
             Filter::Alternative(filter, filter1) => Filter::Alternative(
                 Box::new(filter.substitute(var, arg)),
                 Box::new(filter1.substitute(var, arg)),
+            ),
+            Filter::Assign(lhs, op, rhs) => Filter::Assign(
+                Box::new(lhs.substitute(var, arg)),
+                *op,
+                Box::new(rhs.substitute(var, arg)),
             ),
             Filter::Comma(filter, filter1) => Filter::Comma(
                 Box::new(filter.substitute(var, arg)),

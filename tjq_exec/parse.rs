@@ -4,7 +4,7 @@ use std::{collections::HashMap, vec};
 use itertools::Itertools;
 use tree_sitter::{Node, Range};
 
-use crate::{BinOp, Filter, UnOp};
+use crate::{AssignOp, BinOp, Filter, UnOp};
 
 /// Decode the JSON/jq escape sequences in the (already quote-stripped) body of
 /// a double-quoted string literal, so the stored value holds the real
@@ -133,6 +133,7 @@ pub enum FilterKind {
     SliceExpression,
     TryCatch,
     Alternative,
+    Assign(AssignOp),
     Hole,
     Empty,
     Error,
@@ -169,6 +170,14 @@ impl From<&Cst<'_>> for Filter {
                     assert!(cst.children.len() == 2);
                     Filter::Alternative(
                         Box::new((&cst.children[0]).into()),
+                        Box::new((&cst.children[1]).into()),
+                    )
+                }
+                FilterKind::Assign(op) => {
+                    assert!(cst.children.len() == 2);
+                    Filter::Assign(
+                        Box::new((&cst.children[0]).into()),
+                        *op,
                         Box::new((&cst.children[1]).into()),
                     )
                 }
@@ -431,6 +440,7 @@ impl Display for FilterKind {
             FilterKind::Array => write!(f, "array"),
             FilterKind::BinOp(bin_op) => write!(f, "bin op {}", bin_op),
             FilterKind::Alternative => write!(f, "//"),
+            FilterKind::Assign(_) => write!(f, "assign"),
             FilterKind::UnOp(un_op) => write!(f, "un op {}", un_op),
             FilterKind::Variable => write!(f, "variable"),
             FilterKind::Empty => write!(f, "empty"),
@@ -484,6 +494,21 @@ impl<'a> Cst<'a> {
     pub(crate) fn alternative(lhs: Cst<'a>, rhs: Cst<'a>, value: &'a str, range: Range) -> Self {
         Self {
             kind: NodeKind::FilterKind(FilterKind::Alternative),
+            children: vec![lhs, rhs],
+            range,
+            value,
+        }
+    }
+
+    pub(crate) fn assign(
+        lhs: Cst<'a>,
+        op: AssignOp,
+        rhs: Cst<'a>,
+        value: &'a str,
+        range: Range,
+    ) -> Self {
+        Self {
+            kind: NodeKind::FilterKind(FilterKind::Assign(op)),
             children: vec![lhs, rhs],
             range,
             value,
@@ -1434,7 +1459,32 @@ pub(crate) fn parse_filter<'a>(
             )
         }
         "hole" => (Cst::hole(root.range()), vec![]),
-        "assignment_expression" => todo!(),
+        "assignment_expression" => {
+            let value = &code[root.range().start_byte..root.range().end_byte];
+            let (lhs, vl) = parse_filter(
+                code,
+                root.child(0).expect("assignment should have a lhs"),
+            );
+            let (rhs, vr) = parse_filter(
+                code,
+                root.child(2).expect("assignment should have a rhs"),
+            );
+            let op = match &code
+                [root.child(1).unwrap().range().start_byte..root.child(1).unwrap().range().end_byte]
+            {
+                "=" => AssignOp::Set,
+                "|=" => AssignOp::Update,
+                "+=" => AssignOp::Arith(BinOp::Add),
+                "-=" => AssignOp::Arith(BinOp::Sub),
+                "*=" => AssignOp::Arith(BinOp::Mul),
+                "/=" => AssignOp::Arith(BinOp::Div),
+                "%=" => AssignOp::Arith(BinOp::Mod),
+                "//=" => AssignOp::Alt,
+                other => panic!("unknown assignment operator {other}"),
+            };
+            let v = vl.into_iter().chain(vr).collect();
+            (Cst::assign(lhs, op, rhs, value, root.range()), v)
+        }
         "foreach_expression" => {
             let bind = root
                 .child(1)

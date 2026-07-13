@@ -401,6 +401,7 @@ fn program_has_binding(f: &Filter) -> bool {
         Filter::Pipe(a, b)
         | Filter::Comma(a, b)
         | Filter::Alternative(a, b)
+        | Filter::Assign(a, _, b)
         | Filter::BinOp(a, _, b) => program_has_binding(a) || program_has_binding(b),
         Filter::ObjIndex(a)
         | Filter::ArrayIndex(a)
