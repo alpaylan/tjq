@@ -141,6 +141,25 @@ fn apply_one_arg_string(name: &str, input: &Json, arg: &Json) -> Result<Json, JQ
             }
             _ => Ok(input.clone()),
         },
+        // `getpath(p)`: navigate; `p` must be an array of keys/indices.
+        "getpath" => match arg {
+            Json::Array(path) => json_getpath(input, path),
+            other => Err(JQError::ArrIndexForNonArray(other.clone())),
+        },
+        // `delpaths(ps)`: delete each path; `ps` must be an array of arrays.
+        "delpaths" => match arg {
+            Json::Array(paths) => {
+                let mut ps: Vec<Vec<Json>> = Vec::with_capacity(paths.len());
+                for p in paths {
+                    match p {
+                        Json::Array(elems) => ps.push(elems.clone()),
+                        other => return Err(JQError::ArrIndexForNonArray(other.clone())),
+                    }
+                }
+                json_delpaths(input.clone(), ps)
+            }
+            other => Err(JQError::ArrIndexForNonArray(other.clone())),
+        },
         _ => unreachable!("apply_one_arg_string called with non-native {name}"),
     }
 }
@@ -561,6 +580,155 @@ fn add_json(l: Json, r: Json) -> Result<Json, JQError> {
     }
 }
 
+/// Normalize a (possibly negative) array index against `len`, returning the
+/// in-bounds `usize` or `None` if out of range (jq: out-of-range read → null).
+fn norm_index(len: usize, n: f64) -> Option<usize> {
+    let i = n.trunc();
+    let idx = if i < 0.0 { i + len as f64 } else { i };
+    if idx < 0.0 || idx >= len as f64 {
+        None
+    } else {
+        Some(idx as usize)
+    }
+}
+
+/// `getpath(path)`: navigate `cur` by the array of keys/indices. Missing keys
+/// / out-of-range indices yield null; indexing the wrong kind errors (jq).
+fn json_getpath(cur: &Json, path: &[Json]) -> Result<Json, JQError> {
+    let Some((key, rest)) = path.split_first() else {
+        return Ok(cur.clone());
+    };
+    let next = match (cur, key) {
+        (Json::Null, _) => Json::Null,
+        (Json::Object(o), Json::String(k)) => {
+            o.iter().find(|(kk, _)| kk == k).map_or(Json::Null, |(_, v)| v.clone())
+        }
+        (Json::Array(a), Json::Number(n)) => {
+            norm_index(a.len(), *n).map_or(Json::Null, |i| a[i].clone())
+        }
+        (Json::Object(_), _) => return Err(JQError::NonStringObjectKey(key.clone())),
+        (Json::Array(_), _) => return Err(JQError::ArrIndexForNonArray(cur.clone())),
+        (other, _) => return Err(JQError::ObjIndexForNonObject(other.clone())),
+    };
+    json_getpath(&next, rest)
+}
+
+/// `setpath(path; value)`: set `value` at `path` in `cur`, creating
+/// intermediate objects (string key) / arrays (numeric index, null-padded).
+fn json_setpath(cur: Json, path: &[Json], val: Json) -> Result<Json, JQError> {
+    let Some((key, rest)) = path.split_first() else {
+        return Ok(val);
+    };
+    match key {
+        Json::String(k) => {
+            let mut obj = match cur {
+                Json::Object(o) => o,
+                Json::Null => vec![],
+                other => return Err(JQError::ObjIndexForNonObject(other)),
+            };
+            let child = obj
+                .iter()
+                .find(|(kk, _)| kk == k)
+                .map_or(Json::Null, |(_, v)| v.clone());
+            let new_child = json_setpath(child, rest, val)?;
+            if let Some(slot) = obj.iter_mut().find(|(kk, _)| kk == k) {
+                slot.1 = new_child;
+            } else {
+                obj.push((k.clone(), new_child));
+            }
+            Ok(Json::Object(obj))
+        }
+        Json::Number(n) => {
+            let mut arr = match cur {
+                Json::Array(a) => a,
+                Json::Null => vec![],
+                other => return Err(JQError::ArrIndexForNonArray(other)),
+            };
+            let i = n.trunc();
+            let idx = if i < 0.0 { i + arr.len() as f64 } else { i };
+            if idx < 0.0 {
+                return Err(JQError::InvalidArrayIndex(Json::Array(arr), key.clone()));
+            }
+            let idx = idx as usize;
+            while arr.len() <= idx {
+                arr.push(Json::Null);
+            }
+            let child = arr[idx].clone();
+            arr[idx] = json_setpath(child, rest, val)?;
+            Ok(Json::Array(arr))
+        }
+        other => Err(JQError::NonStringObjectKey(other.clone())),
+    }
+}
+
+/// Delete a single path from `cur` (helper for `delpaths`). Missing
+/// intermediate keys make it a no-op; the final step removes the key/index.
+fn json_delpath(cur: Json, path: &[Json]) -> Result<Json, JQError> {
+    let Some((key, rest)) = path.split_first() else {
+        // Deleting the empty path is a no-op at this level (jq deletes nothing
+        // for `delpaths([[]])` — it returns the input unchanged).
+        return Ok(cur);
+    };
+    match (cur, key) {
+        (Json::Null, _) => Ok(Json::Null),
+        (Json::Object(mut o), Json::String(k)) => {
+            if rest.is_empty() {
+                o.retain(|(kk, _)| kk != k);
+            } else if let Some(slot) = o.iter_mut().find(|(kk, _)| kk == k) {
+                slot.1 = json_delpath(std::mem::replace(&mut slot.1, Json::Null), rest)?;
+            }
+            Ok(Json::Object(o))
+        }
+        (Json::Array(mut a), Json::Number(n)) => {
+            if let Some(idx) = norm_index(a.len(), *n) {
+                if rest.is_empty() {
+                    a.remove(idx);
+                } else {
+                    a[idx] = json_delpath(std::mem::replace(&mut a[idx], Json::Null), rest)?;
+                }
+            }
+            Ok(Json::Array(a))
+        }
+        (Json::Object(_), _) => Err(JQError::NonStringObjectKey(key.clone())),
+        (other, _) => Err(JQError::ObjIndexForNonObject(other)),
+    }
+}
+
+/// `delpaths(paths)`: delete each path, longest/greatest first so earlier
+/// deletions don't shift later ones (jq sorts the paths and deletes in
+/// reverse order).
+fn json_delpaths(cur: Json, mut paths: Vec<Vec<Json>>) -> Result<Json, JQError> {
+    // Sort ascending by jq's path ordering, then delete in reverse.
+    paths.sort_by(|a, b| json_path_cmp(a, b));
+    paths.dedup();
+    let mut out = cur;
+    for p in paths.into_iter().rev() {
+        out = json_delpath(out, &p)?;
+    }
+    Ok(out)
+}
+
+/// Lexicographic comparison of two paths by their JSON elements (numbers
+/// before strings, matching jq's total order well enough for delete order).
+fn json_path_cmp(a: &[Json], b: &[Json]) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    for (x, y) in a.iter().zip(b.iter()) {
+        let ord = match (x, y) {
+            (Json::Number(m), Json::Number(n)) => {
+                m.partial_cmp(n).unwrap_or(Ordering::Equal)
+            }
+            (Json::String(m), Json::String(n)) => m.cmp(n),
+            (Json::Number(_), _) => Ordering::Less,
+            (_, Json::Number(_)) => Ordering::Greater,
+            _ => Ordering::Equal,
+        };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
 /// Recursive object merge for jq's `*` on objects: right wins, except two
 /// objects merge recursively.
 fn deep_merge(l: Vec<(String, Json)>, r: Vec<(String, Json)>) -> Vec<(String, Json)> {
@@ -876,7 +1044,12 @@ impl Filter {
                     if args.len() == 1
                         && matches!(
                             name.as_str(),
-                            "has" | "startswith" | "endswith" | "ltrimstr" | "rtrimstr"
+                            "has" | "startswith"
+                                | "endswith"
+                                | "ltrimstr"
+                                | "rtrimstr"
+                                | "getpath"
+                                | "delpaths"
                         )
                     {
                         let arg_vals =
@@ -886,6 +1059,35 @@ impl Filter {
                             match av {
                                 Err(e) => out.push(Err(e)),
                                 Ok(v) => out.push(apply_one_arg_string(name, json, &v)),
+                            }
+                        }
+                        return out;
+                    }
+                    // `setpath(pathexpr; valexpr)`: cartesian over the paths and
+                    // values (both evaluated on the input).
+                    if args.len() == 2 && name == "setpath" {
+                        let mut out = vec![];
+                        for pr in Filter::filter(json, &args[0], global_definitions, variable_ctx) {
+                            let path = match pr {
+                                Err(e) => {
+                                    out.push(Err(e));
+                                    continue;
+                                }
+                                Ok(Json::Array(p)) => p,
+                                Ok(other) => {
+                                    out.push(Err(JQError::ArrIndexForNonArray(other)));
+                                    continue;
+                                }
+                            };
+                            for vr in
+                                Filter::filter(json, &args[1], global_definitions, variable_ctx)
+                            {
+                                match vr {
+                                    Err(e) => out.push(Err(e)),
+                                    Ok(v) => {
+                                        out.push(json_setpath(json.clone(), &path, v))
+                                    }
+                                }
                             }
                         }
                         return out;
