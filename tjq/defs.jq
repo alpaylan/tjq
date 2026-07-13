@@ -186,3 +186,19 @@ def in(xs): . as $x | xs | has($x);
 # same-name different-arity def would collide with paths/0.
 def del(f): delpaths([path(f)]);
 def paths: path(recurse) | select(length > 0);
+
+# --- batch: membership, join, map_values, walk, index, feature flags ---
+def IN(s): any(s == .; .);
+def IN(src; s): any(src == s; .);
+def join(sep): sep as $x |
+  reduce .[] as $i (null;
+    (if . == null then "" else . + $x end)
+    + ($i | if . == null then "" elif type == "string" then . else tojson end)) // "";
+def map_values(f): .[] |= f;
+def walk(f):
+  def w: if type == "object" then map_values(w)
+         elif type == "array" then map(w)
+         else . end | f;
+  w;
+def index($i):  indices($i) | .[0];
+def rindex($i): indices($i) | last;

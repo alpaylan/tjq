@@ -191,6 +191,8 @@ fn apply_one_arg_string(name: &str, input: &Json, arg: &Json) -> Result<Json, JQ
         },
         // `contains(x)`: recursive containment.
         "contains" => Ok(Json::Boolean(json_contains(input, arg))),
+        // `indices(x)`: positions of x in the input.
+        "indices" => Ok(json_indices(input, arg)),
         // `delpaths(ps)`: delete each path; `ps` must be an array of arrays.
         "delpaths" => match arg {
             Json::Array(paths) => {
@@ -1134,6 +1136,75 @@ fn sh_quote(v: &Json) -> Result<String, JQError> {
     })
 }
 
+/// Map a jq unary-math builtin name to its `f64` function, if any.
+fn math_fn(name: &str) -> Option<fn(f64) -> f64> {
+    Some(match name {
+        "sqrt" => f64::sqrt,
+        "cbrt" => f64::cbrt,
+        "exp" => f64::exp,
+        "exp2" => f64::exp2,
+        "exp10" => |x: f64| 10f64.powf(x),
+        "log" => f64::ln,
+        "log2" => f64::log2,
+        "log10" => f64::log10,
+        "ceil" => f64::ceil,
+        "round" => f64::round,
+        "trunc" => f64::trunc,
+        "fabs" => f64::abs,
+        "sin" => f64::sin,
+        "cos" => f64::cos,
+        "tan" => f64::tan,
+        "asin" => f64::asin,
+        "acos" => f64::acos,
+        "atan" => f64::atan,
+        "sinh" => f64::sinh,
+        "cosh" => f64::cosh,
+        "tanh" => f64::tanh,
+        _ => return None,
+    })
+}
+
+/// jq's `indices(x)`: positions of `x` in the input. String+string →
+/// substring char offsets; array+array → contiguous-subsequence offsets;
+/// array+scalar → element offsets; null → null.
+fn json_indices(input: &Json, x: &Json) -> Json {
+    match (input, x) {
+        (Json::Null, _) => Json::Null,
+        (Json::String(s), Json::String(sub)) if !sub.is_empty() => {
+            let chars: Vec<char> = s.chars().collect();
+            let subc: Vec<char> = sub.chars().collect();
+            let mut out = vec![];
+            if subc.len() <= chars.len() {
+                for i in 0..=chars.len() - subc.len() {
+                    if chars[i..i + subc.len()] == subc[..] {
+                        out.push(Json::Number(i as f64));
+                    }
+                }
+            }
+            Json::Array(out)
+        }
+        (Json::Array(arr), Json::Array(sub)) if !sub.is_empty() => {
+            let mut out = vec![];
+            if sub.len() <= arr.len() {
+                for i in 0..=arr.len() - sub.len() {
+                    if arr[i..i + sub.len()] == sub[..] {
+                        out.push(Json::Number(i as f64));
+                    }
+                }
+            }
+            Json::Array(out)
+        }
+        (Json::Array(arr), other) => Json::Array(
+            arr.iter()
+                .enumerate()
+                .filter(|(_, e)| *e == other)
+                .map(|(i, _)| Json::Number(i as f64))
+                .collect(),
+        ),
+        _ => Json::Array(vec![]),
+    }
+}
+
 /// jq's recursive `contains`: strings by substring, objects by key/value
 /// containment, arrays by element containment, scalars by equality.
 fn json_contains(a: &Json, b: &Json) -> bool {
@@ -1498,6 +1569,7 @@ impl Filter {
                                 | "getpath"
                                 | "delpaths"
                                 | "contains"
+                                | "indices"
                         )
                     {
                         let arg_vals =
@@ -1913,6 +1985,13 @@ impl Filter {
                     // the input.
                     if name.starts_with('@') {
                         return vec![apply_format(name, json)];
+                    }
+                    // Unary math functions (jq's libm builtins).
+                    if let Some(g) = math_fn(name) {
+                        return vec![match json {
+                            Json::Number(n) => Ok(Json::Number(g(*n))),
+                            other => Err(JQError::UnOpTypeError(other.clone(), UnOp::Neg)),
+                        }];
                     }
                     if name == "explode" {
                         // String → array of Unicode codepoints; errors otherwise.
@@ -2573,8 +2652,12 @@ impl Filter {
                     self.clone()
                 }
             }
-            Filter::ReduceExpression(var, gen, init, upd) => Filter::ReduceExpression(
-                var.clone(),
+            // `rvar` is the reduce's bind variable ($var namespace); the
+            // substituted `var` is the function parameter (a different
+            // namespace). NB: naming the pattern `var` here shadowed the
+            // function param and substituted the wrong name into gen/init/upd.
+            Filter::ReduceExpression(rvar, gen, init, upd) => Filter::ReduceExpression(
+                rvar.clone(),
                 Box::new(gen.substitute(var, arg)),
                 Box::new(init.substitute(var, arg)),
                 Box::new(upd.substitute(var, arg)),
