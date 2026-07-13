@@ -309,6 +309,63 @@ theorem ShapeLE.object_cons_sound {obj rest : List (String × Ty)}
                       exact h_present k t hmem
                     · exact h_present_rest k' t' hin
 
+/-- Tuple → tuple: `us` is a prefix of `ts` (`hlen`) and refines it
+    pointwise (`helem`). The array underlying the value is at least as long
+    as `ts`, hence as `us`, and each `us`-position is covered by the
+    corresponding `ts`-position through `helem`. -/
+theorem ShapeLE.tuple_tuple_sound {ts us : List Ty}
+    (hlen : ts.length ≥ us.length)
+    (helem : ∀ i (h : i < us.length),
+        TyLE_sem (ts[i]'(by omega)) (us[i]'h)) :
+    ShapeLE_sem (.tuple ts) (.tuple us) := by
+  intro j hv
+  cases hv with
+  | sh hs =>
+      cases hs with
+      | @tuple xs _ h_len_ts h_elem =>
+          refine Value.sh (ValueShape.tuple ?_ ?_)
+          · omega
+          · intro q hq
+            obtain ⟨i, hi, hqi⟩ := List.mem_iff_getElem.mp hq
+            rw [List.length_zip] at hi
+            have hi_us : i < us.length := by omega
+            have hi_xs : i < xs.length := by omega
+            have hi_ts : i < ts.length := by omega
+            rw [List.getElem_zip] at hqi
+            have hmem_ts : (ts[i], xs[i]) ∈ ts.zip xs := by
+              rw [List.mem_iff_getElem]
+              exact ⟨i, by rw [List.length_zip]; omega, by rw [List.getElem_zip]⟩
+            have hval : Value xs[i] ts[i] := h_elem _ hmem_ts
+            have hconv : Value xs[i] us[i] := helem i hi_us xs[i] hval
+            rw [← hqi]
+            exact hconv
+
+/-- Array → tuple: an array `t`-typed and at least `n ≥ ts.length` long is
+    below the (open, prefix) tuple `ts` — its first `ts.length` elements are
+    each `t ≤ ts[i]` (`helem`), and there are enough of them (`hge`). -/
+theorem ShapeLE.array_tuple_sound {t : Ty} {ts : List Ty} {n : Nat}
+    (hge : n ≥ ts.length)
+    (helem : ∀ i (h : i < ts.length), TyLE_sem t (ts[i]'h)) :
+    ShapeLE_sem (.array t (some n)) (.tuple ts) := by
+  intro j hv
+  cases hv with
+  | sh hs =>
+      cases hs with
+      | @array xs _ _ h_elem h_len =>
+          have hxn : xs.length ≥ n := h_len
+          refine Value.sh (ValueShape.tuple ?_ ?_)
+          · omega
+          · intro q hq
+            obtain ⟨i, hi, hqi⟩ := List.mem_iff_getElem.mp hq
+            rw [List.length_zip] at hi
+            have hi_ts : i < ts.length := by omega
+            have hi_xs : i < xs.length := by omega
+            rw [List.getElem_zip] at hqi
+            have hval : Value xs[i] t := h_elem _ (List.getElem_mem _)
+            have hconv : Value xs[i] ts[i] := helem i hi_ts xs[i] hval
+            rw [← hqi]
+            exact hconv
+
 /-! ## Disjointness lemmas
 
     `ValueShape` and `NotValueShape` should be mutually exclusive. The
@@ -1018,13 +1075,59 @@ theorem ShapeLE.sound {s₁ s₂ : Shape} (h : ShapeLE s₁ s₂) : ShapeLE_sem 
   | .num_some_to_none => ShapeLE.num_some_to_none_sound
   | .str_some_to_none => ShapeLE.str_some_to_none_sound
   | .array ht hn => ShapeLE.array_sound (TyLE.sound ht) hn
-  | .tuple_tuple _ _ => sorry  -- positional prefix (list-index; unproved)
-  | .tuple_array _ _ => sorry
-  | .array_tuple _ _ _ => sorry
+  | .tuple_tuple hlen helem =>
+      ShapeLE.tuple_tuple_sound hlen (fun i h => TyLE.sound (helem i h))
+  | .tuple_array _ _ => sorry  -- UNSOUND rule (open tuples); see tuple_array_unsound
+  | .array_tuple _ hge helem =>
+      ShapeLE.array_tuple_sound hge (fun i h => TyLE.sound (helem i h))
   | .object_nil => ShapeLE.object_nil_sound
   | .object_cons hmem hu hrest =>
       ShapeLE.object_cons_sound hmem (TyLE.sound hu) (ShapeLE.sound hrest)
 
 end
+
+/-! ## A soundness bug surfaced by the proof: `tuple_array`
+
+    Attempting `ShapeLE.sound` exposes that the `tuple_array` rule is
+    **unsound** under the *open* (prefix) tuple semantics of `ValueShape`
+    (`ValueShape.tuple` only constrains the first `ts.length` elements;
+    `xs` may be longer). The rule claims `tuple ts ≤ array t n`, which
+    requires *every* element to be `t`. The theorem below proves the
+    general soundness statement is false, so the `tuple_array` case of
+    `ShapeLE.sound` is not merely unproved — it is unfillable as stated.
+
+    Resolving it is a design decision for the kernel, not a proof gap:
+      * make tuples *closed* (`ValueShape.tuple` with `ts.length =
+        xs.length`) — then `tuple_array` is sound but `array_tuple`
+        becomes unsound (an over-long array is no longer a tuple); or
+      * drop / restrict `tuple_array` (e.g. only `tuple ts ≤ array t
+        (some ts.length)` with an exactness side-condition).
+    The other ~35 rules are sound (fully proved or, for the two remaining
+    `sorry`s, believed sound). -/
+theorem tuple_array_unsound :
+    ¬ (∀ {s₁ s₂ : Shape}, ShapeLE s₁ s₂ → ShapeLE_sem s₁ s₂) := by
+  intro hsound
+  -- `tuple_array` derives `tuple [num] ≤ array num` …
+  have hle : ShapeLE (.tuple [.sh (.num none)]) (.array (.sh (.num none)) none) :=
+    ShapeLE.tuple_array (n := none) trivial
+      (fun i h => by
+        have : i = 0 := by simp at h; omega
+        subst this; exact TyLE.refl)
+  -- … but `[1, "x"]` inhabits the tuple (first element is a number) …
+  have hin : Value (.arr [.num 1, .str "x"]) (.sh (.tuple [.sh (.num none)])) := by
+    refine Value.sh (ValueShape.tuple (by simp) ?_)
+    intro p hp
+    simp [List.zip, List.zipWith] at hp
+    obtain ⟨rfl, rfl⟩ := hp
+    exact Value.sh ValueShape.num_none
+  -- … so soundness would force `"x" : num`, which is false.
+  have hout := hsound hle _ hin
+  cases hout with
+  | sh hs =>
+      cases hs with
+      | @array _ _ _ h_elem _ =>
+          have hbad : Value (.str "x") (.sh (.num none)) := h_elem (.str "x") (by simp)
+          cases hbad with
+          | sh hs2 => cases hs2
 
 end Tjq

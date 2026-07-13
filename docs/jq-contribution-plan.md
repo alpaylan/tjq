@@ -135,6 +135,18 @@ self-contained and the BDD gives a cross-check for B1.
   and the three `tuple_*`/`array_tuple` positional rules (list-index reasoning
   through `List.zip`). Sorry-bearing declarations in Semantics.lean stay at 2,
   but they are now structured proofs with isolated holes rather than blanket
-  sorries. Nine of the previously-missing witnesses are proved
-  (`ShapeLE.{refl,trans,top,*_some_to_none,object_nil,array,object_cons}`).
+  sorries. Eleven of the previously-missing witnesses are proved
+  (`ShapeLE.{refl,trans,top,*_some_to_none,object_nil,array,object_cons,
+  tuple_tuple,array_tuple}`).
+- **Soundness bug found — `tuple_array` is unsound.** Proving `ShapeLE.sound`
+  surfaced that the `tuple_array` rule (`tuple ts ≤ array t n`) is false under
+  the *open/prefix* tuple semantics (`ValueShape.tuple` uses `ts.length ≤
+  xs.length`, so elements past the prefix are unconstrained). `tuple_array`
+  requires *every* element to be `t`. `Semantics.tuple_array_unsound` **proves**
+  the general soundness statement is false (counterexample `[1,"x"] ∈ tuple
+  [num]` but `∉ array num`), so that one `ShapeLE.sound` case is unfillable as
+  stated — a kernel design fix is needed (close tuples, or drop/restrict
+  `tuple_array`; note the dual rule `array_tuple` *needs* open tuples). The
+  two remaining honest `sorry`s are `neg_sh` (contravariant `NotValueShape`
+  monotonicity — needs a completeness lemma dual to B1) and `neg_array_decomp`.
 - The Lean source is now versioned (previously `papers/` was gitignored).
