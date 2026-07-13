@@ -78,8 +78,9 @@ fn main() {
             let (defs, cst) = parse(&program_owned);
             let filter: Filter = (&cst).into();
             let mut scoped = builtins.clone();
-            for (name, d) in defs {
-                scoped.insert(name, (&d).into());
+            // `defs` is already keyed by name/arity.
+            for (key, d) in defs {
+                scoped.insert(key, (&d).into());
             }
             let mut ctx: HashMap<String, Filter> = HashMap::new();
             Filter::filter(&input, &filter, &scoped, &mut ctx)

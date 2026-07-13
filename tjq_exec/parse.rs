@@ -350,9 +350,9 @@ impl From<&Cst<'_>> for Filter {
                         .chunks(2)
                         .map(|chunk| {
                             assert!(chunk.len() == 2);
-                            let name = chunk[0].value.to_string();
+                            let name = chunk[0].value;
                             let body: Filter = (&chunk[1]).into();
-                            (name, body)
+                            (def_key(name, &body), body)
                         })
                         .collect();
 
@@ -842,7 +842,7 @@ pub fn parse<'a>(code: &'a str) -> (HashMap<String, Cst<'a>>, Cst<'a>) {
             "function_definition" => {
                 let (f, defs_) = parse_filter(code, child);
                 defs_.into_iter().for_each(|(name, def)| {
-                    defs.insert(name.to_string(), def);
+                    defs.insert(cst_def_key(name, &def), def);
                 });
                 tracing::trace!("Parsed function definition: {}", f);
             }
@@ -852,7 +852,7 @@ pub fn parse<'a>(code: &'a str) -> (HashMap<String, Cst<'a>>, Cst<'a>) {
                 // main expression; keep any defs it nests.
                 let (f, defs_) = parse_filter(code, child);
                 defs_.into_iter().for_each(|(name, def)| {
-                    defs.insert(name.to_string(), def);
+                    defs.insert(cst_def_key(name, &def), def);
                 });
                 main = Some(f);
             }
@@ -867,13 +867,33 @@ pub fn parse<'a>(code: &'a str) -> (HashMap<String, Cst<'a>>, Cst<'a>) {
 }
 
 pub fn filters(code: &str) -> HashMap<String, Filter> {
-    let (cst_defs, cst) = parse(code);
+    let (cst_defs, _cst) = parse(code);
     let mut defs = HashMap::new();
-    for (name, cst) in cst_defs {
-        let filter = (&cst).into();
-        defs.insert(name, filter);
+    // `cst_defs` is already keyed by name/arity (see `cst_def_key`).
+    for (key, cst) in cst_defs {
+        defs.insert(key, (&cst).into());
     }
     defs
+}
+
+/// Key a *parsed* definition Cst by `name/arity` — jq allows same-name
+/// functions of different arity (`range/1`, `range/2`, `range/3`). A
+/// definition Cst is a `Bound` whose children are `[params…, body]`.
+pub(crate) fn cst_def_key(name: &str, def: &Cst<'_>) -> String {
+    let arity = match def.kind {
+        NodeKind::FilterKind(FilterKind::Bound) => def.children.len().saturating_sub(1),
+        _ => 0,
+    };
+    format!("{name}/{arity}")
+}
+
+/// Key a definition by `name/arity` given its converted `Filter`.
+pub fn def_key(name: &str, filter: &Filter) -> String {
+    let arity = match filter {
+        Filter::Bound(params, _) => params.len(),
+        _ => 0,
+    };
+    format!("{name}/{arity}")
 }
 
 pub(crate) fn parse_filter<'a>(
@@ -1889,9 +1909,10 @@ mod tests {
         "#;
         let (defs, _) = parse(code);
 
-        assert!(defs.contains_key("double"));
+        // Definitions are keyed by name/arity.
+        assert!(defs.contains_key("double/1"));
 
-        let func_filter: Filter = defs.get("double").unwrap().into();
+        let func_filter: Filter = defs.get("double/1").unwrap().into();
         let expected_func = Filter::Bound(
             vec!["x".to_string()],
             Box::new(Filter::BinOp(

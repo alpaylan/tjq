@@ -13,9 +13,10 @@ fn main() {
     let (defs, cst) = parse(&src);
     let filter: Filter = (&cst).into();
     // Merge the program's own top-level definitions over the builtins.
+    // `defs` is already keyed by name/arity.
     let mut builtins = builtin_filters();
-    for (name, d) in defs {
-        builtins.insert(name, (&d).into());
+    for (key, d) in defs {
+        builtins.insert(key, (&d).into());
     }
     let mut var_ctx = HashMap::new();
     let results = Filter::filter(&input, &filter, &builtins, &mut var_ctx);

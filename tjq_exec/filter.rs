@@ -1291,6 +1291,105 @@ impl Filter {
                         }
                         return out;
                     }
+                    // `first(g)` / `last(g)`: the first / last output of `g`
+                    // (empty if `g` is empty). Eager (no short-circuit yet).
+                    if args.len() == 1 && (name == "first" || name == "last") {
+                        let results =
+                            Filter::filter(json, &args[0], global_definitions, variable_ctx);
+                        return if name == "first" {
+                            results.into_iter().take(1).collect()
+                        } else {
+                            results.into_iter().last().into_iter().collect()
+                        };
+                    }
+                    // `limit(n; g)`: the first `n` outputs of `g` (n≤0 ⇒ none).
+                    if args.len() == 2 && name == "limit" {
+                        let mut out = vec![];
+                        for nr in Filter::filter(json, &args[0], global_definitions, variable_ctx) {
+                            let n = match nr {
+                                Ok(Json::Number(n)) => n,
+                                Ok(other) => {
+                                    out.push(Err(JQError::UnOpTypeError(other, UnOp::Neg)));
+                                    continue;
+                                }
+                                Err(e) => {
+                                    out.push(Err(e));
+                                    continue;
+                                }
+                            };
+                            if n <= 0.0 {
+                                continue;
+                            }
+                            let g =
+                                Filter::filter(json, &args[1], global_definitions, variable_ctx);
+                            out.extend(g.into_iter().take(n as usize));
+                        }
+                        return out;
+                    }
+                    // `range(from; to; step)`: the arithmetic sequence.
+                    if args.len() == 3 && name == "range" {
+                        let mut out = vec![];
+                        let froms =
+                            Filter::filter(json, &args[0], global_definitions, variable_ctx);
+                        for fr in froms {
+                            let from = match fr {
+                                Ok(Json::Number(n)) => n,
+                                Ok(o) => {
+                                    out.push(Err(JQError::UnOpTypeError(o, UnOp::Neg)));
+                                    continue;
+                                }
+                                Err(e) => {
+                                    out.push(Err(e));
+                                    continue;
+                                }
+                            };
+                            for tr in
+                                Filter::filter(json, &args[1], global_definitions, variable_ctx)
+                            {
+                                let to = match tr {
+                                    Ok(Json::Number(n)) => n,
+                                    Ok(o) => {
+                                        out.push(Err(JQError::UnOpTypeError(o, UnOp::Neg)));
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        out.push(Err(e));
+                                        continue;
+                                    }
+                                };
+                                for sr in Filter::filter(
+                                    json,
+                                    &args[2],
+                                    global_definitions,
+                                    variable_ctx,
+                                ) {
+                                    let step = match sr {
+                                        Ok(Json::Number(n)) => n,
+                                        Ok(o) => {
+                                            out.push(Err(JQError::UnOpTypeError(o, UnOp::Neg)));
+                                            continue;
+                                        }
+                                        Err(e) => {
+                                            out.push(Err(e));
+                                            continue;
+                                        }
+                                    };
+                                    let mut v = from;
+                                    let mut count = 0usize;
+                                    while (step > 0.0 && v < to) || (step < 0.0 && v > to) {
+                                        out.push(Ok(Json::Number(v)));
+                                        v += step;
+                                        count += 1;
+                                        if count > MAX_STREAM_LEN {
+                                            out.push(Err(alloc_too_large()));
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        return out;
+                    }
                     // `path(f)`: the paths the path-expression `f` selects.
                     if args.len() == 1 && name == "path" {
                         return eval_paths(json, &args[0], vec![], global_definitions, variable_ctx)
@@ -1327,9 +1426,11 @@ impl Filter {
                         }
                         return out;
                     }
-                    // Find the filter with the given name. Unknown arg'd builtins
-                    // are a graceful error (not a panic).
-                    let Some(filter) = global_definitions.get(name) else {
+                    // Find the filter by name/arity (jq allows same-name
+                    // functions of different arity). Unknown arg'd builtins are
+                    // a graceful error (not a panic).
+                    let key = format!("{name}/{}", args.len());
+                    let Some(filter) = global_definitions.get(&key) else {
                         return vec![Err(JQError::FilterNotDefined(name.clone(), args.len()))];
                     };
                     // The filter should have the same number of arguments as the number of arguments passed
@@ -1575,7 +1676,9 @@ impl Filter {
                             other => Err(JQError::UnOpTypeError(other.clone(), UnOp::Neg)),
                         }];
                     }
-                    let filter = global_definitions.get(name).ok_or_else(|| {
+                    // 0-arity user definition (name/0).
+                    let key = format!("{name}/0");
+                    let filter = global_definitions.get(&key).ok_or_else(|| {
                         JQError::FilterNotDefined(
                             name.to_string(),
                             filters_.as_ref().map_or(0, |f| f.len()),
