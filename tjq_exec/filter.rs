@@ -729,6 +729,182 @@ fn json_path_cmp(a: &[Json], b: &[Json]) -> std::cmp::Ordering {
     a.len().cmp(&b.len())
 }
 
+/// Evaluate `filter` as a *path expression* against `cur` (the value at
+/// `prefix`), yielding each selected `(path, value-at-path)`. Only
+/// path-navigating filters are valid; anything else is an invalid path
+/// expression (jq errors). Backs `path(f)`, `del(f)`, and assignments.
+fn eval_paths(
+    cur: &Json,
+    filter: &Filter,
+    prefix: Vec<Json>,
+    globals: &HashMap<String, Filter>,
+    var_ctx: &mut HashMap<String, Filter>,
+) -> Vec<Result<(Vec<Json>, Json), JQError>> {
+    match filter {
+        Filter::Dot => vec![Ok((prefix, cur.clone()))],
+        Filter::Pipe(f, g) => {
+            let mut out = vec![];
+            for r in eval_paths(cur, f, prefix.clone(), globals, var_ctx) {
+                match r {
+                    Err(e) => out.push(Err(e)),
+                    Ok((pf, vf)) => out.extend(eval_paths(&vf, g, pf, globals, var_ctx)),
+                }
+            }
+            out
+        }
+        Filter::Comma(f, g) => {
+            let mut out = eval_paths(cur, f, prefix.clone(), globals, var_ctx);
+            out.extend(eval_paths(cur, g, prefix, globals, var_ctx));
+            out
+        }
+        Filter::ObjIndex(kf) => {
+            let mut out = vec![];
+            for kr in Filter::filter(cur, kf, globals, var_ctx) {
+                match kr {
+                    Err(e) => out.push(Err(e)),
+                    Ok(Json::String(k)) => {
+                        let val = match cur {
+                            Json::Object(o) => o
+                                .iter()
+                                .find(|(kk, _)| kk == &k)
+                                .map_or(Json::Null, |(_, v)| v.clone()),
+                            Json::Null => Json::Null,
+                            _ => {
+                                out.push(Err(JQError::ObjIndexForNonObject(cur.clone())));
+                                continue;
+                            }
+                        };
+                        let mut p = prefix.clone();
+                        p.push(Json::String(k));
+                        out.push(Ok((p, val)));
+                    }
+                    Ok(other) => out.push(Err(JQError::NonStringObjectKey(other))),
+                }
+            }
+            out
+        }
+        Filter::ArrayIndex(idxf) => {
+            let mut out = vec![];
+            for ir in Filter::filter(cur, idxf, globals, var_ctx) {
+                let idx = match ir {
+                    Err(e) => {
+                        out.push(Err(e));
+                        continue;
+                    }
+                    Ok(v) => v,
+                };
+                match (cur, &idx) {
+                    (Json::Array(a), Json::Number(n)) => {
+                        if n.fract() != 0.0 || n.is_nan() || n.is_infinite() {
+                            out.push(Err(JQError::InvalidArrayIndex(cur.clone(), idx.clone())));
+                            continue;
+                        }
+                        // jq keeps the literal index in the path (negatives and
+                        // all — getpath/setpath/delpaths handle them).
+                        let val = norm_index(a.len(), *n).map_or(Json::Null, |i| a[i].clone());
+                        let mut p = prefix.clone();
+                        p.push(Json::Number(*n));
+                        out.push(Ok((p, val)));
+                    }
+                    (Json::Object(o), Json::String(k)) => {
+                        let val = o
+                            .iter()
+                            .find(|(kk, _)| kk == k)
+                            .map_or(Json::Null, |(_, v)| v.clone());
+                        let mut p = prefix.clone();
+                        p.push(Json::String(k.clone()));
+                        out.push(Ok((p, val)));
+                    }
+                    (Json::Null, Json::Number(_)) | (Json::Null, Json::String(_)) => {
+                        let mut p = prefix.clone();
+                        p.push(idx.clone());
+                        out.push(Ok((p, Json::Null)));
+                    }
+                    (Json::Array(_), _) => {
+                        out.push(Err(JQError::InvalidArrayIndex(cur.clone(), idx.clone())))
+                    }
+                    (Json::Object(_), _) => out.push(Err(JQError::NonStringObjectKey(idx.clone()))),
+                    _ => out.push(Err(JQError::ArrIndexForNonArray(cur.clone()))),
+                }
+            }
+            out
+        }
+        Filter::ArrayIterator => match cur {
+            Json::Array(a) => a
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    let mut p = prefix.clone();
+                    p.push(Json::Number(i as f64));
+                    Ok((p, v.clone()))
+                })
+                .collect(),
+            Json::Object(o) => o
+                .iter()
+                .map(|(k, v)| {
+                    let mut p = prefix.clone();
+                    p.push(Json::String(k.clone()));
+                    Ok((p, v.clone()))
+                })
+                .collect(),
+            _ => vec![Err(JQError::ArrIteratorForNonIterable(cur.clone()))],
+        },
+        Filter::IfThenElse(c, t, e) => {
+            let mut out = vec![];
+            for cr in Filter::filter(cur, c, globals, var_ctx) {
+                match cr {
+                    Err(err) => out.push(Err(err)),
+                    Ok(cond) => {
+                        let branch = if cond.boolify() { t } else { e };
+                        out.extend(eval_paths(cur, branch, prefix.clone(), globals, var_ctx));
+                    }
+                }
+            }
+            out
+        }
+        Filter::TryCatch(f, _) => eval_paths(cur, f, prefix, globals, var_ctx)
+            .into_iter()
+            .filter(|r| r.is_ok())
+            .collect(),
+        Filter::Empty => vec![],
+        Filter::Call(name, args) => match (name.as_str(), args) {
+            ("select", Some(a)) if a.len() == 1 => {
+                let mut out = vec![];
+                for cr in Filter::filter(cur, &a[0], globals, var_ctx) {
+                    match cr {
+                        Err(e) => out.push(Err(e)),
+                        Ok(c) => {
+                            if c.boolify() {
+                                out.push(Ok((prefix.clone(), cur.clone())));
+                            }
+                        }
+                    }
+                }
+                out
+            }
+            ("empty", _) => vec![],
+            ("recurse", None) => {
+                // `path(recurse)`: this node, then all descendant paths.
+                let mut out = vec![Ok((prefix.clone(), cur.clone()))];
+                let children = eval_paths(cur, &Filter::ArrayIterator, prefix, globals, var_ctx);
+                for c in children {
+                    match c {
+                        Ok((cp, cv)) => {
+                            out.extend(eval_paths(&cv, filter, cp, globals, var_ctx))
+                        }
+                        // non-iterable node: no descendants (recurse stops).
+                        Err(_) => {}
+                    }
+                }
+                out
+            }
+            _ => vec![Err(JQError::ObjIndexForNonObject(cur.clone()))],
+        },
+        // Everything else is an invalid path expression.
+        _ => vec![Err(JQError::ObjIndexForNonObject(cur.clone()))],
+    }
+}
+
 /// Recursive object merge for jq's `*` on objects: right wins, except two
 /// objects merge recursively.
 fn deep_merge(l: Vec<(String, Json)>, r: Vec<(String, Json)>) -> Vec<(String, Json)> {
@@ -1062,6 +1238,13 @@ impl Filter {
                             }
                         }
                         return out;
+                    }
+                    // `path(f)`: the paths the path-expression `f` selects.
+                    if args.len() == 1 && name == "path" {
+                        return eval_paths(json, &args[0], vec![], global_definitions, variable_ctx)
+                            .into_iter()
+                            .map(|r| r.map(|(p, _)| Json::Array(p)))
+                            .collect();
                     }
                     // `setpath(pathexpr; valexpr)`: cartesian over the paths and
                     // values (both evaluated on the input).

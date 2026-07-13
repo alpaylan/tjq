@@ -179,3 +179,9 @@ def from_entries:
          (if $x | has("value") then $x.value else $x.Value end)});
 def with_entries(f): to_entries | map(f) | from_entries;
 def in(xs): . as $x | xs | has($x);
+
+# Path family (path/getpath/setpath/delpaths are native).
+# NOTE: paths(f)/leaf_paths omitted — defs are keyed by name only, so a
+# same-name different-arity def would collide with paths/0.
+def del(f): delpaths([path(f)]);
+def paths: path(recurse) | select(length > 0);
