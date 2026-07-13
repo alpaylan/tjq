@@ -1614,6 +1614,65 @@ pub(crate) fn parse_filter<'a>(
             // Ignore comments
             (Cst::dot(root.range()), vec![])
         }
+        // Destructuring patterns bind to `Filter::Array` / `Filter::Object`
+        // patterns, which `destructure_pattern` already understands.
+        "array_pattern" => {
+            let val = &code[root.range().start_byte..root.range().end_byte];
+            let mut pats = vec![];
+            let mut defs = vec![];
+            for i in 0..root.child_count() {
+                let child = root.child(i).unwrap();
+                match child.kind() {
+                    "[" | "]" | "," | "comment" => {}
+                    _ => {
+                        let (p, d) = parse_filter(code, child);
+                        pats.push(p);
+                        defs.extend(d);
+                    }
+                }
+            }
+            (Cst::array(root.range(), pats, val), defs)
+        }
+        "object_pattern" => {
+            let val = &code[root.range().start_byte..root.range().end_byte];
+            let mut pairs: Vec<(Cst<'a>, Cst<'a>)> = vec![];
+            let mut defs = vec![];
+            for i in 0..root.child_count() {
+                let child = root.child(i).unwrap();
+                match child.kind() {
+                    "{" | "}" | "," | ":" | "comment" => {}
+                    // `{$a}` shorthand: bind `$a` to `.a`.
+                    "variable" => {
+                        let raw = &code[child.range().start_byte..child.range().end_byte];
+                        let name = raw.strip_prefix('$').unwrap_or(raw);
+                        pairs.push((
+                            Cst::string(child.range(), name),
+                            Cst::variable(child.range(), name),
+                        ));
+                    }
+                    // `key: <pattern>` — key is an identifier/string/variable;
+                    // the value is a (possibly nested) pattern.
+                    _ => {
+                        let n = child.child_count();
+                        if n >= 3 {
+                            let key_node = child.child(0).unwrap();
+                            let key_raw =
+                                &code[key_node.range().start_byte..key_node.range().end_byte];
+                            let key = key_raw
+                                .strip_prefix('"')
+                                .and_then(|s| s.strip_suffix('"'))
+                                .or_else(|| key_raw.strip_prefix('$'))
+                                .unwrap_or(key_raw);
+                            let (vpat, d) =
+                                parse_filter(code, child.child(n - 1).unwrap());
+                            defs.extend(d);
+                            pairs.push((Cst::string(key_node.range(), key), vpat));
+                        }
+                    }
+                }
+            }
+            (Cst::object(root.range(), pairs, val), defs)
+        }
         "format" => {
             // `@fmt` alone applies the format to the input; `@fmt "…\(e)…"`
             // is string interpolation where each `\(e)` is `e | @fmt` (literal
