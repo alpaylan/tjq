@@ -44,6 +44,7 @@ pub enum Filter {
     ),
     SliceExpression(Option<Box<Filter>>, Option<Box<Filter>>), // .[start:end], .[start:], .[:end]
     TryCatch(Box<Filter>, Option<Box<Filter>>),                // try <f> [catch <g>]; `f?` is try <f>
+    Alternative(Box<Filter>, Box<Filter>),                     // <f> // <g>
     Hole, // Placeholder for a missing value in the AST
 }
 
@@ -171,6 +172,7 @@ impl Display for Filter {
         match self {
             Filter::Dot => write!(f, "."),
             Filter::Pipe(f1, f2) => write!(f, "{} | {}", f1, f2),
+            Filter::Alternative(f1, f2) => write!(f, "{} // {}", f1, f2),
             Filter::Comma(f1, f2) => write!(f, "{}, {}", f1, f2),
             Filter::ObjIndex(s) => write!(f, ".{}", s),
             Filter::ArrayIndex(i) => write!(f, ".[{}]", i),
@@ -1174,6 +1176,35 @@ impl Filter {
                 }
                 out
             }
+            Filter::Alternative(lhs, rhs) => {
+                // jq `l // r`: emit `l`'s truthy outputs (drop null/false); if
+                // `l` errors, the error propagates (// does not catch it),
+                // keeping the truthy outputs emitted before it; only if `l`
+                // finishes without emitting any truthy value do we run `r`.
+                let mut out = Vec::new();
+                let mut any_truthy = false;
+                for result in Filter::filter(json, lhs, global_definitions, variable_ctx) {
+                    match result {
+                        Ok(v) => {
+                            if v.boolify() {
+                                any_truthy = true;
+                                out.push(Ok(v));
+                            }
+                        }
+                        Err(e) => {
+                            out.push(Err(e));
+                            return out;
+                        }
+                    }
+                    if out.len() > MAX_STREAM_LEN {
+                        return vec![Err(alloc_too_large())];
+                    }
+                }
+                if !any_truthy {
+                    out.extend(Filter::filter(json, rhs, global_definitions, variable_ctx));
+                }
+                out
+            }
             Filter::Bound(items, filter) => {
                 // for item in items {
                 //     todo!()
@@ -1467,6 +1498,10 @@ impl Filter {
             | Filter::Empty
             | Filter::Error => self.clone(),
             Filter::Pipe(filter, filter1) => Filter::Pipe(
+                Box::new(filter.substitute(var, arg)),
+                Box::new(filter1.substitute(var, arg)),
+            ),
+            Filter::Alternative(filter, filter1) => Filter::Alternative(
                 Box::new(filter.substitute(var, arg)),
                 Box::new(filter1.substitute(var, arg)),
             ),

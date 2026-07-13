@@ -132,6 +132,7 @@ pub enum FilterKind {
     ForeachExpression,
     SliceExpression,
     TryCatch,
+    Alternative,
     Hole,
     Empty,
     Error,
@@ -160,6 +161,13 @@ impl From<&Cst<'_>> for Filter {
                 FilterKind::Comma => {
                     assert!(cst.children.len() == 2);
                     Filter::Comma(
+                        Box::new((&cst.children[0]).into()),
+                        Box::new((&cst.children[1]).into()),
+                    )
+                }
+                FilterKind::Alternative => {
+                    assert!(cst.children.len() == 2);
+                    Filter::Alternative(
                         Box::new((&cst.children[0]).into()),
                         Box::new((&cst.children[1]).into()),
                     )
@@ -422,6 +430,7 @@ impl Display for FilterKind {
             FilterKind::String => write!(f, "string"),
             FilterKind::Array => write!(f, "array"),
             FilterKind::BinOp(bin_op) => write!(f, "bin op {}", bin_op),
+            FilterKind::Alternative => write!(f, "//"),
             FilterKind::UnOp(un_op) => write!(f, "un op {}", un_op),
             FilterKind::Variable => write!(f, "variable"),
             FilterKind::Empty => write!(f, "empty"),
@@ -469,6 +478,15 @@ impl<'a> Cst<'a> {
             range,
             children: Vec::new(),
             value: "??",
+        }
+    }
+
+    pub(crate) fn alternative(lhs: Cst<'a>, rhs: Cst<'a>, value: &'a str, range: Range) -> Self {
+        Self {
+            kind: NodeKind::FilterKind(FilterKind::Alternative),
+            children: vec![lhs, rhs],
+            range,
+            value,
         }
     }
 
@@ -1073,9 +1091,15 @@ pub(crate) fn parse_filter<'a>(
                 code,
                 root.child(2).expect("binary expression should have a rhs"),
             );
-            let op = match &code
-                [root.child(1).unwrap().range().start_byte..root.child(1).unwrap().range().end_byte]
-            {
+            let op_text = &code
+                [root.child(1).unwrap().range().start_byte..root.child(1).unwrap().range().end_byte];
+            // `//` (alternative/default) is not an element-wise binop — it has
+            // stream-level semantics — so it gets its own node.
+            if op_text == "//" {
+                let v = vl.into_iter().chain(vr).collect();
+                return (Cst::alternative(lhs, rhs, value, root.range()), v);
+            }
+            let op = match op_text {
                 "+" => BinOp::Add,
                 "-" => BinOp::Sub,
                 "*" => BinOp::Mul,

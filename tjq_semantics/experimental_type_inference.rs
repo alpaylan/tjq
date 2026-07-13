@@ -3043,6 +3043,44 @@ fn compute_shape_internal(
 
             cs
         }
+        Filter::Alternative(f1, f2) => {
+            // `f // g` emits f's truthy outputs, else g's outputs — both fed
+            // the same input. The value type is soundly over-approximated by
+            // the union of the two sides (a superset of f's truthy outputs).
+            let left_output_type = ctx.fresh();
+            let right_output_type = ctx.fresh();
+
+            let mut cs = vec![];
+            cs.extend(compute_shape_internal(
+                f1,
+                ctx,
+                input_type,
+                left_output_type,
+                filters,
+                computing,
+                function_outputs,
+            ));
+            cs.extend(compute_shape_internal(
+                f2,
+                ctx,
+                input_type,
+                right_output_type,
+                filters,
+                computing,
+                function_outputs,
+            ));
+
+            cs.push(Constraint::Rel {
+                t1: Shape::TVar(output_type),
+                rel: Relation::Equality(Equality::Equal),
+                t2: Shape::Union(
+                    Box::new(Shape::TVar(left_output_type)),
+                    Box::new(Shape::TVar(right_output_type)),
+                ),
+            });
+
+            cs
+        }
         Filter::ObjIndex(key_filter) => {
             // input_type :> { s: output_type }
             // The input must be an object with field `s` whose type is the output

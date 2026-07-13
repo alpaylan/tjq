@@ -400,6 +400,7 @@ fn program_has_binding(f: &Filter) -> bool {
         Filter::Call(_, args) => args.iter().flatten().any(program_has_binding),
         Filter::Pipe(a, b)
         | Filter::Comma(a, b)
+        | Filter::Alternative(a, b)
         | Filter::BinOp(a, _, b) => program_has_binding(a) || program_has_binding(b),
         Filter::ObjIndex(a)
         | Filter::ArrayIndex(a)

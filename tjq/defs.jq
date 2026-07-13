@@ -170,3 +170,12 @@ def fmt_row(n; s): if . >= "" then s elif . == null then n else "\(.)" end;
 # Object -> entries. keys_unsorted (native) preserves key order.
 # from_entries/with_entries need the `//` operator (not yet parsed).
 def to_entries: [keys_unsorted[] as $k | {key: $k, value: .[$k]}];
+
+# Object <-> entries. keys_unsorted (native) preserves key order.
+def to_entries: [keys_unsorted[] as $k | {key: $k, value: .[$k]}];
+def from_entries:
+  reduce .[] as $x ({};
+    . + {($x.key // $x.name // $x.Name // $x.Key):
+         (if $x | has("value") then $x.value else $x.Value end)});
+def with_entries(f): to_entries | map(f) | from_entries;
+def in(xs): . as $x | xs | has($x);
