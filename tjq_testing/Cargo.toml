@@ -16,4 +16,4 @@ tjq_semantics = { path = "../tjq_semantics" }
 # float_roundtrip: the differential oracle parses jq's number output; the
 # default fast float path is lossy by up to 1 ULP and fabricates
 # divergences
-serde_json = { version = "1.0.139", features = ["float_roundtrip"] }
+serde_json = { version = "1.0.139", features = ["float_roundtrip", "preserve_order"] }
