@@ -1058,11 +1058,23 @@ impl Filter {
                         flat(&values, &mut out);
                         return vec![Ok(Json::Array(out))];
                     }
-                    // NOTE: `keys_unsorted`, `to_entries`, `tojson` etc. are
-                    // deliberately NOT added yet — tjq's object model sorts keys
-                    // (it does not preserve insertion order like jq), so any
-                    // native that exposes key/value *order* would diverge from
-                    // jq. Fixing object-key ordering is the prerequisite.
+                    if name == "keys_unsorted" {
+                        // Object keys in insertion order (objects now preserve
+                        // it); array indices; everything else has no keys.
+                        return vec![match json {
+                            Json::Object(obj) => Ok(Json::Array(
+                                obj.iter().map(|(k, _)| Json::String(k.clone())).collect(),
+                            )),
+                            Json::Array(arr) => Ok(Json::Array(
+                                (0..arr.len()).map(|i| Json::Number(i as f64)).collect(),
+                            )),
+                            other => Err(JQError::ObjIndexForNonObject(other.clone())),
+                        }];
+                    }
+                    if name == "tojson" {
+                        // Compact JSON serialization (objects in insertion order).
+                        return vec![Ok(Json::String(json.to_compact_string()))];
+                    }
                     if name == "explode" {
                         // String → array of Unicode codepoints; errors otherwise.
                         return vec![match json {
