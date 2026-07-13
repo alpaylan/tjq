@@ -167,3 +167,6 @@ def fromdate: fromdateiso8601;
 
 # Formatting
 def fmt_row(n; s): if . >= "" then s elif . == null then n else "\(.)" end;
+# Object -> entries. keys_unsorted (native) preserves key order.
+# from_entries/with_entries need the `//` operator (not yet parsed).
+def to_entries: [keys_unsorted[] as $k | {key: $k, value: .[$k]}];
