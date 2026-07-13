@@ -784,9 +784,17 @@ pub fn parse<'a>(code: &'a str) -> (HashMap<String, Cst<'a>>, Cst<'a>) {
     // print_ast(tree.root_node(), code, 0);
 
     let mut defs: HashMap<String, Cst<'a>> = HashMap::new();
+    let root = tree.root_node();
 
-    for i in 0..tree.root_node().child_count() - 1 {
-        let child = tree.root_node().child(i).unwrap();
+    // Classify *every* top-level child by kind rather than assuming the last
+    // one is the main expression. A program's trailing expression is the
+    // single non-definition child; a pure-definitions file (e.g. defs.jq) has
+    // none — previously the loop stopped at `child_count()-1`, silently
+    // dropping the *last* `def` in such a file (it was parsed as the main
+    // expression and discarded).
+    let mut main: Option<Cst<'a>> = None;
+    for i in 0..root.child_count() {
+        let child = root.child(i).unwrap();
         match child.kind() {
             "function_definition" => {
                 let (f, defs_) = parse_filter(code, child);
@@ -795,19 +803,22 @@ pub fn parse<'a>(code: &'a str) -> (HashMap<String, Cst<'a>>, Cst<'a>) {
                 });
                 tracing::trace!("Parsed function definition: {}", f);
             }
-            "comment" => {}
+            "comment" | "ERROR" => {}
             _ => {
-                // println!("unexpected node in program: {}", child.kind());
+                // The (single) top-level non-definition child is the program's
+                // main expression; keep any defs it nests.
+                let (f, defs_) = parse_filter(code, child);
+                defs_.into_iter().for_each(|(name, def)| {
+                    defs.insert(name.to_string(), def);
+                });
+                main = Some(f);
             }
         }
     }
 
-    let (f, _) = parse_filter(
-        code,
-        tree.root_node()
-            .child(tree.root_node().child_count() - 1)
-            .expect("root should have at one children"),
-    );
+    // A pure-definitions file has no main expression; `.` is a harmless
+    // default (callers such as `filters()` use only `defs` in that case).
+    let f = main.unwrap_or_else(|| Cst::dot(root.range()));
 
     (defs, f)
 }
