@@ -124,5 +124,17 @@ self-contained and the BDD gives a cross-check for B1.
   `Shape.tuple/object.sizeOf_spec` + `Prod.mk.sizeOf_spec` unfolds let `omega`
   close `sizeOf elem < sizeOf shape`. Semantics.lean sorries 6 → 2 (the two
   remaining are B2: `TyLE.sound`/`ShapeLE.sound`). Full `lake build` is green.
-- **B1 unblocks B2** (subtyping soundness) — next up.
+- **B2 in progress.** `TyLE.sound` / `ShapeLE.sound` are now real mutual
+  proofs (term-mode `match` structural recursion — `cases` fails on the
+  self-recursive `trans`/`inter_elim`; `induction` doesn't support mutual
+  inductives). ~30 of the ~38 rules are fully discharged, each dispatching to
+  a proven per-rule witness. `StreamLE` isn't needed: arrow types are
+  uninhabited by `Value`, so `TyLE.arr` is vacuous (`nomatch`). The 5 hard
+  cases remain `sorry` inline: `neg_sh` (contravariant `NotValueShape`
+  monotonicity), `neg_array_decomp` (three-way array-negation decomposition),
+  and the three `tuple_*`/`array_tuple` positional rules (list-index reasoning
+  through `List.zip`). Sorry-bearing declarations in Semantics.lean stay at 2,
+  but they are now structured proofs with isolated holes rather than blanket
+  sorries. Nine of the previously-missing witnesses are proved
+  (`ShapeLE.{refl,trans,top,*_some_to_none,object_nil,array,object_cons}`).
 - The Lean source is now versioned (previously `papers/` was gitignored).

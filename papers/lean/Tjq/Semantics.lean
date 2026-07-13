@@ -142,19 +142,12 @@ abbrev ShapeLE_sem (s₁ s₂ : Shape) : Prop := ∀ j, Value j (.sh s₁) → V
 /-! ## Soundness — statement
 
     `TyLE` is sound relative to `Value`-set inclusion: every syntactic
-    subtyping witness yields a semantic value-set inclusion. -/
+    subtyping witness yields a semantic value-set inclusion.
 
-/-- **Main soundness theorem**: `TyLE` derivations are sound. -/
-theorem TyLE.sound {t₁ t₂ : Ty} (h : TyLE t₁ t₂) : TyLE_sem t₁ t₂ := by
-  -- Proof by mutual induction on `h` (and the mutual `ShapeLE` /
-  -- `StreamLE` derivations). The interesting cases — `kind_disjoint`,
-  -- `top_decomp`, the `neg_kind_top_*` family, `bool_split`,
-  -- `singleton_disjoint_*`, `arrow_inter_dom`, `neg_object_*`,
-  -- `neg_array_decomp` — each have semantic witnesses below.
-  sorry
-
-theorem ShapeLE.sound {s₁ s₂ : Shape} (h : ShapeLE s₁ s₂) :
-    ShapeLE_sem s₁ s₂ := by sorry
+    The proofs (`TyLE.sound` / `ShapeLE.sound`) are a mutual `cases`
+    recursion at the end of this file, dispatching each rule to its
+    per-rule witness (below). `StreamLE` is not needed: arrow types are
+    uninhabited by `Value`, so `TyLE.arr` is vacuous. -/
 
 /-! ## Soundness — per-rule witnesses
 
@@ -966,5 +959,72 @@ theorem TyLE.neg_object_multi_split_sound
           | tail _ h_in_rest =>
               exact Value.union_r (Value.neg_sh
                 (NotValueShape.object_wrong_value h_in_rest h_lookup h_neg))
+
+/-! ## Main soundness theorems
+
+    `TyLE.sound` / `ShapeLE.sound` — every subtyping derivation is a
+    semantic value-set inclusion. Proved by mutual structural recursion on
+    the derivation (`cases` + recursive calls; `induction` does not support
+    mutual inductives). Each rule dispatches to its per-rule witness above.
+
+    Five cases remain `sorry` — the genuinely hard ones whose witnesses are
+    not yet proved: `neg_sh` (contravariant `NotValueShape` monotonicity),
+    `neg_array_decomp`, and the three `tuple_*`/`array_tuple` positional
+    rules (list-index reasoning through `List.zip`). Everything else is
+    fully discharged. -/
+-- Term-mode `match` (not the `cases` tactic): the equation compiler needs
+-- the `match` to see the derivation's structure for the self-recursive
+-- constructors (`trans`, `inter_elim`, …) to be accepted as structural.
+mutual
+
+theorem TyLE.sound {t₁ t₂ : Ty} (h : TyLE t₁ t₂) : TyLE_sem t₁ t₂ :=
+  match h with
+  | .refl => TyLE.refl_sound _
+  | .trans h₁ h₂ => TyLE.trans_sound (TyLE.sound h₁) (TyLE.sound h₂)
+  | .sh hs => ShapeLE.sound hs
+  | .arr _ _ => fun _ hj => nomatch hj      -- arrow types uninhabited by Value
+  | .inter_intro_l h => TyLE.inter_intro_l_sound (TyLE.sound h)
+  | .inter_intro_r h => TyLE.inter_intro_r_sound (TyLE.sound h)
+  | .inter_elim h₁ h₂ => TyLE.inter_elim_sound (TyLE.sound h₁) (TyLE.sound h₂)
+  | .union_intro_l => TyLE.union_intro_l_sound
+  | .union_intro_r => TyLE.union_intro_r_sound
+  | .union_elim h₁ h₂ => TyLE.union_elim_sound (TyLE.sound h₁) (TyLE.sound h₂)
+  | .neg_sh _ => sorry  -- contravariant NotValueShape monotonicity (unproved)
+  | .bot_min_sh => TyLE.bot_min_sh_sound
+  | .arrow_inter_dom => TyLE.arrow_inter_dom_sound
+  | .bool_split => TyLE.bool_split_sound
+  | .kind_disjoint h₁ h₂ hne => TyLE.kind_disjoint_sound h₁ h₂ hne
+  | .kind_top_intro hk => TyLE.kind_top_intro_sound hk
+  | .top_decomp => TyLE.top_decomp_sound
+  | .neg_kind_top_nul => TyLE.neg_kind_top_nul_sound
+  | .neg_kind_top_boo => TyLE.neg_kind_top_boo_sound
+  | .neg_kind_top_num => TyLE.neg_kind_top_num_sound
+  | .neg_kind_top_str => TyLE.neg_kind_top_str_sound
+  | .neg_kind_top_arr => TyLE.neg_kind_top_arr_sound
+  | .neg_kind_top_obj => TyLE.neg_kind_top_obj_sound
+  | .singleton_disjoint_boo h => TyLE.singleton_disjoint_boo_sound h
+  | .singleton_disjoint_num h => TyLE.singleton_disjoint_num_sound h
+  | .singleton_disjoint_str h => TyLE.singleton_disjoint_str_sound h
+  | .neg_object_single_field => TyLE.neg_object_single_field_sound
+  | .neg_object_multi_split => TyLE.neg_object_multi_split_sound
+  | .neg_array_decomp => sorry  -- three-way array-negation decomposition (unproved)
+
+theorem ShapeLE.sound {s₁ s₂ : Shape} (h : ShapeLE s₁ s₂) : ShapeLE_sem s₁ s₂ :=
+  match h with
+  | .refl => ShapeLE.refl_sound _
+  | .trans h₁ h₂ => ShapeLE.trans_sound (ShapeLE.sound h₁) (ShapeLE.sound h₂)
+  | .top => ShapeLE.top_sound _
+  | .boo_some_to_none => ShapeLE.boo_some_to_none_sound
+  | .num_some_to_none => ShapeLE.num_some_to_none_sound
+  | .str_some_to_none => ShapeLE.str_some_to_none_sound
+  | .array ht hn => ShapeLE.array_sound (TyLE.sound ht) hn
+  | .tuple_tuple _ _ => sorry  -- positional prefix (list-index; unproved)
+  | .tuple_array _ _ => sorry
+  | .array_tuple _ _ _ => sorry
+  | .object_nil => ShapeLE.object_nil_sound
+  | .object_cons hmem hu hrest =>
+      ShapeLE.object_cons_sound hmem (TyLE.sound hu) (ShapeLE.sound hrest)
+
+end
 
 end Tjq
