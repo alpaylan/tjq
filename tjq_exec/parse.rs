@@ -896,6 +896,34 @@ pub fn def_key(name: &str, filter: &Filter) -> String {
     format!("{name}/{arity}")
 }
 
+/// For `reduce`/`foreach ... as PATTERN`: if `var_node` is a plain `$x`
+/// return `($x, body)` unchanged; otherwise desugar the destructuring pattern
+/// to a temp loop variable and wrap `body` as `$tmp as PATTERN | body`.
+fn destructure_loop_var<'a>(
+    code: &'a str,
+    var_node: Node<'_>,
+    body: Cst<'a>,
+) -> (Cst<'a>, Cst<'a>) {
+    let vtxt = &code[var_node.range().start_byte..var_node.range().end_byte];
+    if var_node.kind() == "variable" {
+        let name = vtxt
+            .strip_prefix('$')
+            .unwrap_or_else(|| panic!("reduce/foreach: expected variable"));
+        (Cst::variable(var_node.range(), name), body)
+    } else {
+        let temp = "__destructure";
+        let (pattern_cst, _) = parse_filter(code, var_node);
+        let binding = Cst::binding_expression(
+            var_node.range(),
+            vtxt,
+            Cst::variable(var_node.range(), temp),
+            pattern_cst,
+        );
+        let wrapped = Cst::pipe(binding, body, vtxt, var_node.range());
+        (Cst::variable(var_node.range(), temp), wrapped)
+    }
+}
+
 pub(crate) fn parse_filter<'a>(
     code: &'a str,
     root: Node<'_>,
@@ -1445,13 +1473,6 @@ pub(crate) fn parse_filter<'a>(
 
             let (generator, vgen) = parse_filter(code, source_node);
 
-            let vtxt = &code[var_node.range().start_byte..var_node.range().end_byte];
-            let var_name_str = vtxt
-                .strip_prefix("$")
-                .unwrap_or_else(|| panic!("reduce: expected variable"));
-
-            let var_cst = Cst::variable(var_node.range(), var_name_str);
-
             let init_node = root
                 .child(3)
                 .expect("reduce: missing initializer expression");
@@ -1459,6 +1480,11 @@ pub(crate) fn parse_filter<'a>(
 
             let (init, vinit) = parse_filter(code, init_node);
             let (update, vupdate) = parse_filter(code, upd_node);
+
+            // `reduce SRC as PATTERN (…)` — a destructuring pattern desugars to
+            // a temp loop var whose value is destructured at the top of the
+            // update (`$tmp as PATTERN | update`).
+            let (var_cst, update) = destructure_loop_var(code, var_node, update);
 
             let v = vgen
                 .into_iter()
@@ -1517,10 +1543,6 @@ pub(crate) fn parse_filter<'a>(
                 .expect("foreach: binding_expression missing $variable");
 
             let (generator, vgen) = parse_filter(code, source_node);
-            let var_name_str = code[var_node.range().start_byte..var_node.range().end_byte]
-                .strip_prefix('$')
-                .unwrap_or_else(|| panic!("foreach: expected variable"));
-            let var_cst = Cst::variable(var_node.range(), var_name_str);
 
             let init_node = root
                 .child_by_field_name("initializer")
@@ -1531,9 +1553,14 @@ pub(crate) fn parse_filter<'a>(
             let (init, vinit) = parse_filter(code, init_node);
             let (update, vupdate) = parse_filter(code, upd_node);
 
+            // Desugar `as PATTERN` for the update, and (with a fresh pattern
+            // parse) for the extract, both bound from the same temp loop var.
+            let (var_cst, update) = destructure_loop_var(code, var_node, update);
+
             let (extract, vextract) = match root.child_by_field_name("extract") {
                 Some(ex) => {
                     let (e, ve) = parse_filter(code, ex);
+                    let (_, e) = destructure_loop_var(code, var_node, e);
                     (Some(e), ve)
                 }
                 None => (None, vec![]),
