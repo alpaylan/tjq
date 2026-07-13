@@ -92,6 +92,58 @@ fn alloc_too_large() -> JQError {
     JQError::AllocationTooLarge
 }
 
+/// Apply a 1-argument native string/collection builtin to `input` with the
+/// already-evaluated argument value `arg`. These are jq natives (no jq-level
+/// definition). Error conditions match jq (only *whether* it errors matters
+/// for the differential harness, which masks error values via `catch`).
+fn apply_one_arg_string(name: &str, input: &Json, arg: &Json) -> Result<Json, JQError> {
+    match name {
+        // `has`: null → always false; object → key present (arg must be a
+        // string); array → index truncated toward zero then range-checked
+        // `0 ≤ idx < length` (jq: `has(1.5)`/`has(-0.5)` are true, `has(-1)`
+        // false); every other input / arg kind errors.
+        "has" => match input {
+            Json::Null => Ok(Json::Boolean(false)),
+            Json::Object(obj) => match arg {
+                Json::String(k) => Ok(Json::Boolean(obj.iter().any(|(kk, _)| kk == k))),
+                _ => Err(JQError::ObjIndexForNonObject(input.clone())),
+            },
+            Json::Array(arr) => match arg {
+                Json::Number(n) => {
+                    let idx = n.trunc();
+                    Ok(Json::Boolean(idx >= 0.0 && idx < arr.len() as f64))
+                }
+                _ => Err(JQError::ObjIndexForNonObject(input.clone())),
+            },
+            _ => Err(JQError::ObjIndexForNonObject(input.clone())),
+        },
+        // `startswith`/`endswith`: both input and arg must be strings.
+        "startswith" | "endswith" => match (input, arg) {
+            (Json::String(s), Json::String(p)) => Ok(Json::Boolean(if name == "startswith" {
+                s.starts_with(p.as_str())
+            } else {
+                s.ends_with(p.as_str())
+            })),
+            _ => Err(JQError::UnOpTypeError(input.clone(), UnOp::Neg)),
+        },
+        // `ltrimstr`/`rtrimstr`: strip the affix when input and arg are strings
+        // and it matches; otherwise pass the input through unchanged (jq).
+        "ltrimstr" => match (input, arg) {
+            (Json::String(s), Json::String(p)) if s.starts_with(p.as_str()) => {
+                Ok(Json::String(s[p.len()..].to_string()))
+            }
+            _ => Ok(input.clone()),
+        },
+        "rtrimstr" => match (input, arg) {
+            (Json::String(s), Json::String(p)) if s.ends_with(p.as_str()) => {
+                Ok(Json::String(s[..s.len() - p.len()].to_string()))
+            }
+            _ => Ok(input.clone()),
+        },
+        _ => unreachable!("apply_one_arg_string called with non-native {name}"),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinOp {
     Add, // +
@@ -816,10 +868,31 @@ impl Filter {
             Filter::Call(name, filters_) => match filters_ {
                 Some(args) => {
                     tracing::debug!("Calling filter: {name} with args: {:?}", args);
-                    // Find the filter with the given name
-                    let filter = global_definitions
-                        .get(name)
-                        .unwrap_or_else(|| panic!("Filter '{name}' not found"));
+                    // 1-argument native builtins: evaluate the argument on the
+                    // input (jq semantics), then apply, producing one output per
+                    // argument output.
+                    if args.len() == 1
+                        && matches!(
+                            name.as_str(),
+                            "has" | "startswith" | "endswith" | "ltrimstr" | "rtrimstr"
+                        )
+                    {
+                        let arg_vals =
+                            Filter::filter(json, &args[0], global_definitions, variable_ctx);
+                        let mut out = Vec::with_capacity(arg_vals.len());
+                        for av in arg_vals {
+                            match av {
+                                Err(e) => out.push(Err(e)),
+                                Ok(v) => out.push(apply_one_arg_string(name, json, &v)),
+                            }
+                        }
+                        return out;
+                    }
+                    // Find the filter with the given name. Unknown arg'd builtins
+                    // are a graceful error (not a panic).
+                    let Some(filter) = global_definitions.get(name) else {
+                        return vec![Err(JQError::FilterNotDefined(name.clone(), args.len()))];
+                    };
                     // The filter should have the same number of arguments as the number of arguments passed
                     if let Filter::Bound(params, filter) = filter {
                         if params.len() != args.len() {
@@ -984,6 +1057,72 @@ impl Filter {
                         let mut out = vec![];
                         flat(&values, &mut out);
                         return vec![Ok(Json::Array(out))];
+                    }
+                    // NOTE: `keys_unsorted`, `to_entries`, `tojson` etc. are
+                    // deliberately NOT added yet — tjq's object model sorts keys
+                    // (it does not preserve insertion order like jq), so any
+                    // native that exposes key/value *order* would diverge from
+                    // jq. Fixing object-key ordering is the prerequisite.
+                    if name == "explode" {
+                        // String → array of Unicode codepoints; errors otherwise.
+                        return vec![match json {
+                            Json::String(s) => Ok(Json::Array(
+                                s.chars().map(|c| Json::Number(c as u32 as f64)).collect(),
+                            )),
+                            other => Err(JQError::UnOpTypeError(other.clone(), UnOp::Neg)),
+                        }];
+                    }
+                    if name == "implode" {
+                        // Array of codepoints → string; errors on bad element.
+                        return vec![match json {
+                            Json::Array(arr) => {
+                                let mut s = String::new();
+                                for v in arr {
+                                    match v {
+                                        Json::Number(n)
+                                            if *n >= 0.0
+                                                && n.fract() == 0.0
+                                                && *n <= u32::MAX as f64 =>
+                                        {
+                                            match char::from_u32(*n as u32) {
+                                                Some(c) => s.push(c),
+                                                None => {
+                                                    return vec![Err(JQError::UnOpTypeError(
+                                                        json.clone(),
+                                                        UnOp::Neg,
+                                                    ))]
+                                                }
+                                            }
+                                        }
+                                        _ => {
+                                            return vec![Err(JQError::UnOpTypeError(
+                                                json.clone(),
+                                                UnOp::Neg,
+                                            ))]
+                                        }
+                                    }
+                                }
+                                Ok(Json::String(s))
+                            }
+                            other => Err(JQError::UnOpTypeError(other.clone(), UnOp::Neg)),
+                        }];
+                    }
+                    if name == "ascii_downcase" || name == "ascii_upcase" {
+                        let up = name == "ascii_upcase";
+                        return vec![match json {
+                            Json::String(s) => Ok(Json::String(
+                                s.chars()
+                                    .map(|c| {
+                                        if up {
+                                            c.to_ascii_uppercase()
+                                        } else {
+                                            c.to_ascii_lowercase()
+                                        }
+                                    })
+                                    .collect(),
+                            )),
+                            other => Err(JQError::UnOpTypeError(other.clone(), UnOp::Neg)),
+                        }];
                     }
                     let filter = global_definitions.get(name).ok_or_else(|| {
                         JQError::FilterNotDefined(
