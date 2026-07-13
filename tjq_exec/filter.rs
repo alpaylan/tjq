@@ -189,6 +189,8 @@ fn apply_one_arg_string(name: &str, input: &Json, arg: &Json) -> Result<Json, JQ
             Json::Array(path) => json_getpath(input, path),
             other => Err(JQError::ArrIndexForNonArray(other.clone())),
         },
+        // `contains(x)`: recursive containment.
+        "contains" => Ok(Json::Boolean(json_contains(input, arg))),
         // `delpaths(ps)`: delete each path; `ps` must be an array of arrays.
         "delpaths" => match arg {
             Json::Array(paths) => {
@@ -990,6 +992,43 @@ fn eval_paths(
     }
 }
 
+/// jq's recursive `contains`: strings by substring, objects by key/value
+/// containment, arrays by element containment, scalars by equality.
+fn json_contains(a: &Json, b: &Json) -> bool {
+    match (a, b) {
+        (Json::Object(oa), Json::Object(ob)) => ob.iter().all(|(k, vb)| {
+            oa.iter()
+                .find(|(ka, _)| ka == k)
+                .is_some_and(|(_, va)| json_contains(va, vb))
+        }),
+        (Json::Array(aa), Json::Array(ab)) => {
+            ab.iter().all(|vb| aa.iter().any(|va| json_contains(va, vb)))
+        }
+        (Json::String(sa), Json::String(sb)) => sa.contains(sb.as_str()),
+        (x, y) => x == y,
+    }
+}
+
+/// Pair each element of `arr` with its sort key `[f]` (the array of `f`'s
+/// outputs on that element). Errors from `f` propagate. Backs sort_by /
+/// group_by / unique_by / min_by / max_by.
+fn keyed_elements(
+    arr: &[Json],
+    f: &Filter,
+    globals: &HashMap<String, Filter>,
+    var_ctx: &mut HashMap<String, Filter>,
+) -> Result<Vec<(Json, Json)>, JQError> {
+    let mut keyed = Vec::with_capacity(arr.len());
+    for e in arr {
+        let mut key = vec![];
+        for r in Filter::filter(e, f, globals, var_ctx) {
+            key.push(r?);
+        }
+        keyed.push((Json::Array(key), e.clone()));
+    }
+    Ok(keyed)
+}
+
 /// Recursive object merge for jq's `*` on objects: right wins, except two
 /// objects merge recursively.
 fn deep_merge(l: Vec<(String, Json)>, r: Vec<(String, Json)>) -> Vec<(String, Json)> {
@@ -1316,6 +1355,7 @@ impl Filter {
                                 | "rtrimstr"
                                 | "getpath"
                                 | "delpaths"
+                                | "contains"
                         )
                     {
                         let arg_vals =
@@ -1328,6 +1368,80 @@ impl Filter {
                             }
                         }
                         return out;
+                    }
+                    // sort_by / group_by / unique_by / min_by / max_by: sort
+                    // the input array by the key `[f]` per element.
+                    if args.len() == 1
+                        && matches!(
+                            name.as_str(),
+                            "sort_by" | "group_by" | "unique_by" | "min_by" | "max_by"
+                        )
+                    {
+                        let arr = match json {
+                            Json::Array(a) => a,
+                            other => {
+                                return vec![Err(JQError::ArrIndexForNonArray(other.clone()))]
+                            }
+                        };
+                        let mut keyed =
+                            match keyed_elements(arr, &args[0], global_definitions, variable_ctx) {
+                                Ok(k) => k,
+                                Err(e) => return vec![Err(e)],
+                            };
+                        match name.as_str() {
+                            "min_by" | "max_by" => {
+                                if keyed.is_empty() {
+                                    return vec![Ok(Json::Null)];
+                                }
+                                // min: first minimal; max: last maximal (jq).
+                                let best = if name == "min_by" {
+                                    keyed.into_iter().min_by(|a, b| a.0.cmp(&b.0))
+                                } else {
+                                    keyed.into_iter().max_by(|a, b| a.0.cmp(&b.0))
+                                };
+                                return vec![Ok(best.unwrap().1)];
+                            }
+                            _ => {}
+                        }
+                        keyed.sort_by(|a, b| a.0.cmp(&b.0));
+                        let result = match name.as_str() {
+                            "sort_by" => {
+                                Json::Array(keyed.into_iter().map(|(_, e)| e).collect())
+                            }
+                            "group_by" => {
+                                let mut groups: Vec<Json> = vec![];
+                                let mut cur: Vec<Json> = vec![];
+                                let mut cur_key: Option<Json> = None;
+                                for (k, e) in keyed {
+                                    if cur_key.as_ref() == Some(&k) {
+                                        cur.push(e);
+                                    } else {
+                                        if !cur.is_empty() {
+                                            groups.push(Json::Array(std::mem::take(&mut cur)));
+                                        }
+                                        cur_key = Some(k);
+                                        cur.push(e);
+                                    }
+                                }
+                                if !cur.is_empty() {
+                                    groups.push(Json::Array(cur));
+                                }
+                                Json::Array(groups)
+                            }
+                            "unique_by" => {
+                                let mut out: Vec<Json> = vec![];
+                                let mut last_key: Option<Json> = None;
+                                for (k, e) in keyed {
+                                    if last_key.as_ref() != Some(&k) {
+                                        out.push(e);
+                                        last_key = Some(k);
+                                    }
+                                }
+                                Json::Array(out)
+                            }
+                            _ => unreachable!(),
+                        };
+                        return vec![Ok(result)];
                     }
                     // `first(g)` / `last(g)`: the first / last output of `g`
                     // (empty if `g` is empty). Eager (no short-circuit yet).
