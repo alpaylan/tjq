@@ -255,6 +255,67 @@ theorem ShapeLE.object_nil_sound {obj : List (String × Ty)} :
           refine Value.sh (ValueShape.object ?_ ?_) <;>
             intro k t' hkt <;> simp at hkt
 
+/-- Array covariance: elements refine pointwise (`ht`) and the min-length
+    only relaxes (`MinLE`). -/
+theorem ShapeLE.array_sound {t t' : Ty} {n n' : Option Nat}
+    (ht : TyLE_sem t t') (hn : MinLE n n') :
+    ShapeLE_sem (.array t n) (.array t' n') := by
+  intro j h
+  cases h with
+  | sh hs =>
+      cases hs with
+      | @array xs _ _ h_elem h_len =>
+          refine Value.sh (ValueShape.array (fun x hx => ht x (h_elem x hx)) ?_)
+          cases n' with
+          | none => trivial
+          | some m =>
+              cases n with
+              | none => exact hn.elim
+              | some k =>
+                  have hk : k ≥ m := hn
+                  have hxk : xs.length ≥ k := h_len
+                  simp only [Option.elim]
+                  omega
+
+/-- Open-record extension: the head key `(k, u)` is present in `obj` at a
+    subtype `t ≤ u` (`hmem`, `hu`), and the tail `rest` is already covered
+    (`hrest`). -/
+theorem ShapeLE.object_cons_sound {obj rest : List (String × Ty)}
+    {k : String} {t u : Ty}
+    (hmem : (k, t) ∈ obj) (hu : TyLE_sem t u)
+    (hrest : ShapeLE_sem (.object obj) (.object rest)) :
+    ShapeLE_sem (.object obj) (.object ((k, u) :: rest)) := by
+  intro j h
+  cases h with
+  | sh hs =>
+      cases hs with
+      | @object kvObj _ h_match h_present =>
+          have hobj : Value (.obj kvObj) (.sh (.object obj)) :=
+            Value.sh (ValueShape.object h_match h_present)
+          have hr := hrest _ hobj
+          cases hr with
+          | sh hrs =>
+              cases hrs with
+              | @object _ _ h_match_rest h_present_rest =>
+                  refine Value.sh (ValueShape.object ?_ ?_)
+                  · intro k' t' hk't' v hlk
+                    rw [List.mem_cons] at hk't'
+                    rcases hk't' with heq | hin
+                    · simp only [Prod.mk.injEq] at heq
+                      obtain ⟨hk_eq, ht_eq⟩ := heq
+                      rw [ht_eq]
+                      rw [hk_eq] at hlk
+                      exact hu v (h_match k t hmem v hlk)
+                    · exact h_match_rest k' t' hin v hlk
+                  · intro k' t' hk't'
+                    rw [List.mem_cons] at hk't'
+                    rcases hk't' with heq | hin
+                    · simp only [Prod.mk.injEq] at heq
+                      obtain ⟨hk_eq, _⟩ := heq
+                      rw [hk_eq]
+                      exact h_present k t hmem
+                    · exact h_present_rest k' t' hin
+
 /-! ## Disjointness lemmas
 
     `ValueShape` and `NotValueShape` should be mutually exclusive. The
