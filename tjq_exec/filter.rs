@@ -534,7 +534,16 @@ fn build_object(
 fn jqerror_to_json(e: &JQError) -> Json {
     match e {
         JQError::UserError(v) => v.clone(),
-        other => Json::String(other.to_string()),
+        other => {
+            // jq's `catch` receives the bare message, without the
+            // "jq: error(at …): " location prefix used for stderr.
+            let s = other.to_string();
+            let bare = s
+                .strip_prefix("jq: error(at <unknown>): ")
+                .unwrap_or(&s)
+                .to_string();
+            Json::String(bare)
+        }
     }
 }
 
@@ -707,12 +716,12 @@ fn json_setpath(cur: Json, path: &[Json], val: Json) -> Result<Json, JQError> {
             let i = n.trunc();
             let idx = if i < 0.0 { i + arr.len() as f64 } else { i };
             if idx < 0.0 {
-                return Err(JQError::InvalidArrayIndex(Json::Array(arr), key.clone()));
+                return Err(JQError::OutOfBoundsNegative);
             }
             // jq refuses to grow an array to an astronomical index ("Array
             // index too large") rather than allocate; guard the null-padding.
             if idx >= MAX_STREAM_LEN as f64 {
-                return Err(alloc_too_large());
+                return Err(JQError::ArrayIndexTooLarge);
             }
             let idx = idx as usize;
             while arr.len() <= idx {

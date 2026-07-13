@@ -21,6 +21,10 @@ pub enum JQError {
     /// A user-raised error (`error`/`error(v)`) carrying its value, which a
     /// `catch` clause receives verbatim (jq: bare `error` uses the input).
     UserError(Json),
+    /// `setpath`/assignment with a negative index that resolves out of range.
+    OutOfBoundsNegative,
+    /// `setpath`/assignment index too large to allocate (jq guards this).
+    ArrayIndexTooLarge,
     Unknown,
 }
 
@@ -74,6 +78,8 @@ impl Display for JQError {
             }
             JQError::UserError(Json::String(s)) => write!(f, "{}", s),
             JQError::UserError(v) => write!(f, "{} (not a string)", v.debug()),
+            JQError::OutOfBoundsNegative => write!(f, "Out of bounds negative array index"),
+            JQError::ArrayIndexTooLarge => write!(f, "Array index too large"),
             JQError::Unknown => write!(f, "Unknown error"),
             JQError::FilterNotDefined(name, args) => {
                 write!(f, "{}/{} is not defined", name, args)
