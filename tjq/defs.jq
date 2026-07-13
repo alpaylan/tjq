@@ -202,3 +202,6 @@ def walk(f):
   w;
 def index($i):  indices($i) | .[0];
 def rindex($i): indices($i) | last;
+
+# pick: keep only the given path-expression locations (jq 1.7).
+def pick(pathexps): . as $v | reduce path(pathexps) as $p (null; setpath($p; $v | getpath($p)));

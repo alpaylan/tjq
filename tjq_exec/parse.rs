@@ -1700,6 +1700,8 @@ pub(crate) fn parse_filter<'a>(
             }
             (Cst::object(root.range(), pairs, val), defs)
         }
+        // `..` — recursive descent, sugar for `recurse`.
+        "recurse" => (Cst::call(root.range(), "recurse", "recurse", None), vec![]),
         "format" => {
             // `@fmt` alone applies the format to the input; `@fmt "…\(e)…"`
             // is string interpolation where each `\(e)` is `e | @fmt` (literal

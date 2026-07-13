@@ -193,6 +193,20 @@ fn apply_one_arg_string(name: &str, input: &Json, arg: &Json) -> Result<Json, JQ
         "contains" => Ok(Json::Boolean(json_contains(input, arg))),
         // `indices(x)`: positions of x in the input.
         "indices" => Ok(json_indices(input, arg)),
+        // `split(sep)`: split a string on the literal separator. jq gives the
+        // empty array for an empty input string.
+        "split" => match (input, arg) {
+            (Json::String(s), Json::String(_)) if s.is_empty() => Ok(Json::Array(vec![])),
+            (Json::String(s), Json::String(sep)) if !sep.is_empty() => Ok(Json::Array(
+                s.split(sep.as_str())
+                    .map(|p| Json::String(p.to_string()))
+                    .collect(),
+            )),
+            (Json::String(s), Json::String(_)) => Ok(Json::Array(
+                s.chars().map(|c| Json::String(c.to_string())).collect(),
+            )),
+            _ => Err(JQError::UnOpTypeError(input.clone(), UnOp::Neg)),
+        },
         // `delpaths(ps)`: delete each path; `ps` must be an array of arrays.
         "delpaths" => match arg {
             Json::Array(paths) => {
@@ -1579,6 +1593,7 @@ impl Filter {
                                 | "delpaths"
                                 | "contains"
                                 | "indices"
+                                | "split"
                         )
                     {
                         let arg_vals =
@@ -1989,6 +2004,37 @@ impl Filter {
                     if name == "tojson" {
                         // Compact JSON serialization (objects in insertion order).
                         return vec![Ok(Json::String(json.to_compact_string()))];
+                    }
+                    if name == "transpose" {
+                        // Transpose an array of arrays, padding short rows with
+                        // null to the maximum row length.
+                        return vec![match json {
+                            Json::Array(rows) => {
+                                let cols = rows
+                                    .iter()
+                                    .map(|r| match r {
+                                        Json::Array(a) => a.len(),
+                                        _ => 0,
+                                    })
+                                    .max()
+                                    .unwrap_or(0);
+                                let mut out = Vec::with_capacity(cols);
+                                for c in 0..cols {
+                                    let col: Vec<Json> = rows
+                                        .iter()
+                                        .map(|r| match r {
+                                            Json::Array(a) => {
+                                                a.get(c).cloned().unwrap_or(Json::Null)
+                                            }
+                                            _ => Json::Null,
+                                        })
+                                        .collect();
+                                    out.push(Json::Array(col));
+                                }
+                                Ok(Json::Array(out))
+                            }
+                            other => Err(JQError::ArrIndexForNonArray(other.clone())),
+                        }];
                     }
                     // Output formats: `@base64`, `@html`, `@csv`, … applied to
                     // the input.
