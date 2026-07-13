@@ -1614,6 +1614,55 @@ pub(crate) fn parse_filter<'a>(
             // Ignore comments
             (Cst::dot(root.range()), vec![])
         }
+        "format" => {
+            // `@fmt` alone applies the format to the input; `@fmt "…\(e)…"`
+            // is string interpolation where each `\(e)` is `e | @fmt` (literal
+            // parts pass through), like normal interpolation but with the
+            // format in place of `tostring`.
+            let value = &code[root.range().start_byte..root.range().end_byte];
+            // The format name is the leading `@word` of the node text
+            // (`@base64`, `@html`, …); a following string is a child.
+            let fmt_end = value
+                .find(|c: char| !(c.is_alphanumeric() || c == '@'))
+                .unwrap_or(value.len());
+            let fmt = &value[..fmt_end];
+            let str_child = (0..root.child_count())
+                .map(|i| root.child(i).unwrap())
+                .find(|c| c.kind() == "string");
+            match str_child {
+                None => (Cst::call(root.range(), fmt, fmt, None), vec![]),
+                Some(sc) => {
+                    let mut parts: Vec<Cst<'a>> = vec![];
+                    let mut all_defs = vec![];
+                    for i in 0..sc.named_child_count() {
+                        let child = sc.named_child(i).unwrap();
+                        match child.kind() {
+                            "string_content" => {
+                                let content =
+                                    &code[child.range().start_byte..child.range().end_byte];
+                                parts.push(Cst::string(child.range(), content));
+                            }
+                            "interpolation" => {
+                                let expr = child
+                                    .named_child(0)
+                                    .expect("interpolation should contain an expression");
+                                let (e_cst, e_defs) = parse_filter(code, expr);
+                                all_defs.extend(e_defs);
+                                let fmt_call = Cst::call(child.range(), fmt, fmt, None);
+                                parts.push(Cst::pipe(e_cst, fmt_call, value, child.range()));
+                            }
+                            _ => {}
+                        }
+                    }
+                    let mut iter = parts.into_iter();
+                    let first = iter.next().unwrap_or_else(|| Cst::string(root.range(), ""));
+                    let concat = iter.fold(first, |acc, p| {
+                        Cst::bin_op(root.range(), acc, BinOp::Add, p, value)
+                    });
+                    (concat, all_defs)
+                }
+            }
+        }
         _ => {
             tracing::warn!(
                 "unknown filter {} {}",

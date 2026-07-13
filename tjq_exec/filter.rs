@@ -992,6 +992,148 @@ fn eval_paths(
     }
 }
 
+/// `@text`-style string coercion: strings pass through, everything else is
+/// compact JSON.
+fn json_to_text(j: &Json) -> String {
+    match j {
+        Json::String(s) => s.clone(),
+        other => other.to_compact_string(),
+    }
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in data.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
+        out.push(T[(n >> 18 & 63) as usize] as char);
+        out.push(T[(n >> 12 & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { T[(n >> 6 & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+    }
+    out
+}
+
+fn base64_decode(s: &str) -> Vec<u8> {
+    fn val(c: u8) -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some((c - b'A') as u32),
+            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let cs: Vec<u8> = s.bytes().filter_map(|c| val(c).map(|_| c)).collect();
+    let mut out = vec![];
+    for chunk in cs.chunks(4) {
+        let mut n = 0u32;
+        for (i, &c) in chunk.iter().enumerate() {
+            n |= val(c).unwrap() << (18 - 6 * i);
+        }
+        if chunk.len() >= 2 {
+            out.push((n >> 16 & 0xff) as u8);
+        }
+        if chunk.len() >= 3 {
+            out.push((n >> 8 & 0xff) as u8);
+        }
+        if chunk.len() >= 4 {
+            out.push((n & 0xff) as u8);
+        }
+    }
+    out
+}
+
+fn html_escape(s: &str) -> String {
+    let mut o = String::new();
+    for c in s.chars() {
+        match c {
+            '&' => o.push_str("&amp;"),
+            '<' => o.push_str("&lt;"),
+            '>' => o.push_str("&gt;"),
+            '\'' => o.push_str("&#39;"),
+            '"' => o.push_str("&quot;"),
+            _ => o.push(c),
+        }
+    }
+    o
+}
+
+fn uri_escape(s: &str) -> String {
+    let mut o = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => o.push(b as char),
+            _ => o.push_str(&format!("%{b:02X}")),
+        }
+    }
+    o
+}
+
+/// A single `@csv`/`@tsv` cell for one array element (jq semantics).
+fn csv_cell(v: &Json, csv: bool) -> Result<String, JQError> {
+    Ok(match v {
+        Json::Null => String::new(),
+        Json::Number(_) => v.to_compact_string(),
+        Json::Boolean(b) => b.to_string(),
+        Json::String(s) => {
+            if csv {
+                format!("\"{}\"", s.replace('"', "\"\""))
+            } else {
+                s.replace('\\', "\\\\")
+                    .replace('\t', "\\t")
+                    .replace('\n', "\\n")
+                    .replace('\r', "\\r")
+            }
+        }
+        other => return Err(JQError::UnOpTypeError(other.clone(), UnOp::Neg)),
+    })
+}
+
+/// Apply an `@format` (jq output formats) to `input`.
+fn apply_format(fmt: &str, input: &Json) -> Result<Json, JQError> {
+    let s = match fmt {
+        "@text" => json_to_text(input),
+        "@json" => input.to_compact_string(),
+        "@html" => html_escape(&json_to_text(input)),
+        "@uri" => uri_escape(&json_to_text(input)),
+        "@base64" => base64_encode(json_to_text(input).as_bytes()),
+        "@base64d" => {
+            let bytes = base64_decode(&json_to_text(input));
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+        "@csv" | "@tsv" => match input {
+            Json::Array(arr) => {
+                let sep = if fmt == "@csv" { "," } else { "\t" };
+                let cells: Result<Vec<String>, _> =
+                    arr.iter().map(|v| csv_cell(v, fmt == "@csv")).collect();
+                cells?.join(sep)
+            }
+            other => return Err(JQError::ArrIndexForNonArray(other.clone())),
+        },
+        "@sh" => match input {
+            Json::Array(arr) => {
+                let cells: Result<Vec<String>, _> = arr.iter().map(sh_quote).collect();
+                cells?.join(" ")
+            }
+            other => sh_quote(other)?,
+        },
+        _ => return Err(JQError::FilterNotDefined(fmt.to_string(), 0)),
+    };
+    Ok(Json::String(s))
+}
+
+/// jq's `@sh` quoting for a single value.
+fn sh_quote(v: &Json) -> Result<String, JQError> {
+    Ok(match v {
+        Json::String(s) => format!("'{}'", s.replace('\'', "'\\''")),
+        Json::Number(_) | Json::Boolean(_) => v.to_compact_string(),
+        other => return Err(JQError::UnOpTypeError(other.clone(), UnOp::Neg)),
+    })
+}
+
 /// jq's recursive `contains`: strings by substring, objects by key/value
 /// containment, arrays by element containment, scalars by equality.
 fn json_contains(a: &Json, b: &Json) -> bool {
@@ -1766,6 +1908,11 @@ impl Filter {
                     if name == "tojson" {
                         // Compact JSON serialization (objects in insertion order).
                         return vec![Ok(Json::String(json.to_compact_string()))];
+                    }
+                    // Output formats: `@base64`, `@html`, `@csv`, … applied to
+                    // the input.
+                    if name.starts_with('@') {
+                        return vec![apply_format(name, json)];
                     }
                     if name == "explode" {
                         // String → array of Unicode codepoints; errors otherwise.
